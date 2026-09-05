@@ -293,4 +293,4 @@ gets rediscovered the expensive way.
 output is evidence, not proof — and this playbook is worth more than the
 scanners that trigger it.*
 
-— **RothITguy**
+— **IronVeil Systems DevOps**

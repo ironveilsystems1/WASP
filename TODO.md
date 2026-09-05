@@ -89,6 +89,20 @@ certification gate."* That is a fair summary and worth keeping visible here.
 
 ### Still open, with reasoning
 
+**Signed release manifest — CLOSED. In production use since August 2026.**
+
+Releases are signed with minisign, the signature is verified before any file is
+read, and each file is then checked against the signed manifest. Both outcomes
+have been exercised on hardware: signatures validating on a correct release,
+and the manifest check refusing an install where files had been modified after
+signing — reporting correctly that the signature was valid and therefore a
+shipped file had been altered.
+
+The refusal is the more useful of the two. A verification that has only ever
+passed has not been tested.
+
+(original entry below)
+
 **Signed release manifest — MECHANISM NOW IMPLEMENTED, awaiting a key.**
 A maintainer-side tool (not shipped) signs a manifest with minisign; `install.sh`
 verifies signature-then-hashes before sourcing anything;
@@ -637,6 +651,11 @@ Anyone editing the wrong one gets no error, no warning, and no result.
 - *Post-deployment Two Factor loss disables enforcement* — deliberate fail-safe.
   The alternative locks every administrator out of a working site because a
   plugin was removed.
+- ~~*This archive is not a signed Minisign release*~~ — **true of the evaluated
+  archive, not of the platform.** Signed releases have been in use since August;
+  what evaluators receive is a development tarball, which is why it verifies as
+  unsigned. A production install refuses an unverified release outright.
+  (original wording below)
 - *This archive is not a signed Minisign release* — correct. It is a development
   tarball, and production installs refuse unverified releases.
 

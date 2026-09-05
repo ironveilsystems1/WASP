@@ -74,7 +74,7 @@ echo -e "  ${YW}keep somewhere else, or protection against someone specifically$
 echo -e "  ${YW}targeting you. It raises the floor considerably and is honest${CL}"
 echo -e "  ${YW}about the ceiling.${CL}"
 echo ""
-echo -e "  ${BL}                                                  by RothITguy${CL}"
+echo -e "  ${BL}                                                  by IronVeil Systems DevOps${CL}"
 echo ""
 # Closing line. Deliberately says "looks there too" rather than "scans your
 # plugins for CVEs": wp-plugins.sh surfaces what is out of date via the
@@ -133,7 +133,7 @@ echo ""
 #
 # _sec_note prints the attribution so it is clear these are this project's
 # considered judgements rather than generic vendor boilerplate.
-_sec_note() { echo -e "  ${BL}— RothITguy${CL}"; echo ""; }
+_sec_note() { echo -e "  ${BL}— IronVeil Systems DevOps${CL}"; echo ""; }
 _sec_head() { echo -e "  ${BLD}What this does and does not buy you:${CL}"; }
 
 
@@ -825,7 +825,7 @@ read -rp "  Configure outbound email now? [y/N] : " _WANT_SMTP
 case "${_WANT_SMTP}" in
   y|Y|yes|YES)
     # ── Collect, then REVIEW ────────────────────────────────────────────────
-    # Reported from a real install: a typo in the username ("...@rothitguy-pro"
+    # Reported from a real install: a typo in the username ("...@example-com"
     # instead of ".pro") could not be corrected, because a linear prompt flow
     # has no way back and the only escape was to abort the whole installer.
     # This section has the most fields and the most typo-prone ones, so it now
@@ -913,7 +913,7 @@ case "${_WANT_SMTP}" in
       esac
     done
     unset _SFIX _SP _SF _smtp_collect_all
-    # `${SMTP_USER}@${SMTP_HOST}` produced "contact@rothitguy.pro@mail.example.com"
+    # `${SMTP_USER}@${SMTP_HOST}` produced "contact@example.com@mail.example.com"
     # on a real install, because the username IS an email address. The config
     # itself was correct (user and host are separate keys in the msmtp file) --
     # this was display only, but a summary line that looks malformed makes an

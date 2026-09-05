@@ -175,8 +175,8 @@ fi
 # semver would lose the ability to say WHICH 9.3 a VM is running, and this
 # project has already spent a session on exactly that ambiguity.
 WASP_RELEASE="10.0"
-WASP_VERSION="2026.08.14a"
-WASP_VERSION_NOTE="Moved to the IronVeil Systems organisation: repo path, minisign DNS record, seal and attribution all updated"
+WASP_VERSION="2026.08.14f"
+WASP_VERSION_NOTE="Signed releases have been in production use since August; the validation record and TODO said otherwise and now do not"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
@@ -260,7 +260,7 @@ verify_key_dns() {
   echo "  These should be identical. Either the release key was rotated and" >&2
   echo "  this copy of install.sh is stale, or this copy of install.sh did not" >&2
   echo "  come from the project. Do not proceed until you know which." >&2
-  echo "  Check independently: https://rothitguy.pro/wasp-signing-key/" >&2
+  echo "  Check independently: https://ironveil.systems/wasp-signing-key/" >&2
   if [[ "${WASP_REQUIRE_SIGNATURE:-0}" == "1" ]]; then
     echo "  FATAL: WASP_REQUIRE_SIGNATURE=1." >&2; exit 1
   fi

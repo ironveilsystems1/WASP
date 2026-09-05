@@ -11,7 +11,7 @@
 A small, git-cloneable repository (`install.sh` plus `lib/` and `payload/`) that turns a bare Proxmox VE host into a fully provisioned, network-segmented WordPress VM — Alpine Linux, rootful Podman, MariaDB, and CrowdSec — with layered firewalling, SHA256 image digest pinning, optional GeoIP filtering, structurally-verified automated backups (see [Known Limitations](#known-limitations) for exactly what "verified" covers), and a full day-2 update/rollback/self-diagnosis toolchain baked in.
 
 > **"~91% of WordPress vulnerabilities live in plugins — where most hardening never looks. This one does."**
-> — RothITguy *(figure: Patchstack, State of WordPress Security in 2026)*
+> — IronVeil Systems DevOps *(figure: Patchstack, State of WordPress Security in 2026)*
 
 No Ansible, no Terraform, no cloud-init dependency, nothing beyond what a Proxmox host already has. Answer around 16 interactive prompts and roughly 15 minutes later — most of it unattended — you have a WordPress site sitting behind its own firewall, intrusion-prevention engine, vulnerability scanner, and nightly database backups that are integrity-checked on creation.
 
@@ -51,7 +51,7 @@ So this one is opinionated about the boring things, because the boring things ar
 
 It's also honest about where it stops. Every control here states its own limits at the prompt, not buried in documentation — because a control you over-trust is worse than one whose edges you know. If a setting is noise reduction rather than a boundary, it says so before you rely on it.
 
-— **RothITguy**
+— **IronVeil Systems DevOps**
 
 ---
 
@@ -148,7 +148,7 @@ context every design decision was made in: prompts assume you understand the
 trade being offered, and the tooling assumes an operator rather than an
 automated pipeline.
 
-**Current state.** In use across roughly a dozen client sites. Admin MFA,
+**Current state.** In use across roughly a dozen client sites, after two months of development and 96 deploy-test-diagnose cycles on real hardware — see [docs/VALIDATION.md](docs/VALIDATION.md) for what that testing found and what remains unproven. Admin MFA,
 egress filtering, checksum verification, core updates and local restore are all
 proven on real hardware — including **off-site restore**, demonstrated end to
 end on 2026-08-20: an encrypted object pulled from object storage, decrypted
@@ -1355,7 +1355,7 @@ locally — and Technitium's maintainer says so directly on a case like this:
 use the APP record for Split Horizon app here."*
 
 1. **Zones → Add Zone**
-   - Zone: `rothitguy.pro` (your apex, not the subdomain)
+   - Zone: `example.com` (your apex, not the subdomain)
    - Type: **Conditional Forwarder**
    - Forwarder: your normal upstream — `9.9.9.9`, or whatever the VM uses
 2. **Add an A record inside that zone**
@@ -1371,7 +1371,7 @@ your domain keeps resolving publicly. Only the name you override stays local.
 Verify from a LAN client:
 
 ```sh
-nslookup test.rothitguy.pro        # should return 192.168.100.101
+nslookup site.example.com          # should return your proxy's LAN IP
 ```
 
 Then load the site and check the access log shows the workstation's address
@@ -2364,13 +2364,15 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 [MIT](LICENSE) — Copyright © 2026 IronVeil Systems.
 
+Contributions are licensed inbound on the same MIT terms — see [CONTRIBUTING.md](CONTRIBUTING.md), which also explains plainly what that does and does not secure against a relicensed fork.
+
 ---
 
 ---
 
 <div align="center">
 
-**Built and maintained by RothITguy**
+**Built and maintained by IronVeil Systems DevOps**
 
 *"~91% of WordPress vulnerabilities live in plugins — where most hardening never looks. This one does."*
 

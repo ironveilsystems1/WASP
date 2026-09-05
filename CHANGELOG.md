@@ -6,6 +6,209 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.0 / 2026.08.14f — Signed releases are proven, and the record said otherwise
+
+Minisign signing has been in production use throughout August. The validation
+record listed a signed-release install as *not yet demonstrated*, and TODO still
+described the mechanism as "awaiting a key". Both were wrong.
+
+The evidence had already been in front of me, in an install log from a fresh
+machine two days ago:
+
+    Trusted comment: WASP 2026.08.22 | 2026-08-22T21:05:33Z | 71 files
+    payload/bin/wasp-offsite-backup.sh: FAILED
+    FATAL: a file does not match the signed manifest.
+      The signature was valid, so the manifest itself is authentic —
+      which means a shipped file was modified after signing.
+
+I read that as a packaging mistake to explain, which it was, and missed that it
+is also **proof the whole chain works** — a signature validating, a manifest
+authenticating, and the file check refusing an install. Both halves exercised
+on hardware in one run.
+
+That refusal is the more valuable of the two results, and the record now says
+so. A verification that has only ever passed has not been tested. This one has
+been observed to stop an install and to explain correctly why.
+
+The remaining evaluation finding — "this archive is not a signed Minisign
+release" — is accurate about the archive and not about the platform. What
+evaluators receive is a development tarball, which is precisely why it verifies
+as unsigned; a production install refuses an unverified release outright. TODO
+now draws that distinction rather than accepting the finding as a gap.
+
+**Two items remain genuinely unproven**, both needing hardware rather than
+code: a CrowdSec ban triggered by real external logins now that client-IP
+forwarding is correct, and lockout alerting with a genuine client address
+rather than the proxy.
+
+Second correction to this document in two days, both cases of me inferring
+from artefacts instead of asking. The record is only worth having if it is
+right, and it is worth noting that both errors were found by the operator
+reading it rather than by any check here.
+
+---
+
+## 10.0 / 2026.08.14e — The validation record understated the timeline
+
+The first file in this project was written on **23 June 2026**. The record
+published yesterday gave the period as 2026-08-11 to 2026-08-22 — eleven days.
+
+That was my error, and it came from reading the CHANGELOG's own density rather
+than asking. August entries are thick because that is when the platform was
+being hardened against live client deployments and every defect was recorded at
+the point it was found. The two months before that established the architecture
+the hardening was applied to, and left far fewer entries because far less was
+going wrong in a way worth writing down.
+
+Corrected to **2026-06-23 to 2026-08-22**, with the distinction stated in the
+document so the changelog's shape is not misread the same way again.
+
+Worth noting why this mattered enough to fix rather than leave. The record
+exists to support three claims — what an RFP can say, what a licence is
+protecting, and what the human contribution consisted of. An understated
+timeline weakens all three, and a document written to be accurate about what is
+unproven should be accurate about its own dates first.
+
+---
+
+## 10.0 / 2026.08.14d — The validation record
+
+**96 deploy-test-diagnose cycles on real hardware**, 2026-08-11 to 2026-08-22.
+Written down now because the figures are only knowable while the work is fresh,
+and they answer three separate questions at once: what an RFP response can
+truthfully claim, what a licensing decision is actually protecting, and what
+the human contribution to this codebase consisted of.
+
+`docs/VALIDATION.md` records the method and, more usefully, the pattern the
+method exposed. Nine defects are listed that **passed code review, syntax
+checking and the entire static suite, and were broken anyway**:
+
+- Squid omitting CONNECT — config valid, every HTTPS request denied before the
+  allowlist was reached, and every deny probe "passing"
+- CrowdSec reading `error.log` while PHP wrote `php-errors.log` — mu-plugin,
+  parser, scenario and bouncer all correct, chain unable to fire
+- An empty variable making nft reject the whole ruleset — the VM booted with no
+  firewall and the install reported success
+- The SMTP allow rule below the catch-all drop — both rules correct, the allow
+  unreachable, mail silently stopped
+- Proxy constants never reaching wp-config.php — variable passed correctly, but
+  the image only writes that file on first run
+- A checksum anchor declared, commented as authoritative, and never read
+- Forwarding headers scoped to one nginx location — three controls degraded
+  together, none reporting a fault
+
+The pattern is consistent enough to name: **the control was present, correct,
+and inert.** Positive testing proved it existed. Only hardware proved it did
+nothing. That single observation is why the check suite is 16% of the
+executable code and why every check in it was written after a specific defect
+reached a VM.
+
+The document also separates **proven** from **not yet proven**, deliberately.
+Off-site recovery, MFA, mail delivery, the egress boundary and CrowdSec
+remediation are demonstrated. A CrowdSec ban from real external logins, lockout
+alerting with a genuine client address, and a signed-release install are not.
+Claiming the second list would undo the value of the first.
+
+And it records the method's own hardest lesson: diagnosis came from the running
+system, not from re-reading the source. On one plugin-install failure, six
+successive hypotheses reasoned from code were wrong, and the cause was
+identified only from an access log showing the request never left the VM.
+
+Linked from the README's status section and from MSP-RUNBOOK as the evidence an
+RFP response can draw on.
+
+---
+
+## 10.0 / 2026.08.14c — Contribution terms, and what a licence can actually do
+
+Asked to reserve the right to use improvements from forks. Worth recording why
+that was written differently from how it was requested.
+
+**MIT already permits taking improvements back from any fork that remains
+MIT-licensed.** No clause is needed for that, and adding one implying otherwise
+would be misleading — it would suggest the project holds a right it already had
+and dress a no-op as protection.
+
+**The real gap is the opposite of what a clause can fix.** MIT permits
+derivative works to be relicensed. Someone can fork WASP, improve it, and ship
+their version under proprietary or copyleft terms, and no wording added here
+reaches them. A licence grants rights to others; it cannot take rights from
+someone who never agreed to it. Writing a clause that appears to do so is worse
+than writing nothing, because it invites a decision made on a false premise.
+
+What IS enforceable, and is now in place:
+
+- **`CONTRIBUTING.md`** — contributions are licensed inbound on the same MIT
+  terms, to IronVeil Systems and to all recipients. Contributors keep copyright
+  and grant a licence rather than assigning ownership; opening a pull request is
+  the agreement. Standard inbound-equals-outbound, no separate CLA.
+- **A note in `LICENSE`**, below the MIT text and clearly marked as not part of
+  it. The MIT text itself is untouched: editing it would make the project no
+  longer MIT, break licence detection, and create precisely the ambiguity a
+  licence exists to remove.
+
+The document states the limitation as plainly as the grant, and names the
+actual mechanism if it ever matters more — **AGPL-3.0**, which does require
+derivatives to be published under the same terms. That is a real trade rather
+than a free upgrade: copyleft protects the commons and deters commercial
+adoption, and MSPs evaluating a platform frequently rule out AGPL on sight.
+Changing later would need the agreement of every contributor in the tree, which
+is one reason these terms exist now rather than after the first pull request.
+
+`CONTRIBUTING.md` also carries what actually gets merged: fixes with evidence
+(install logs from real hardware have been worth more than patches in this
+project), controls with a negative test proving they refuse, and comments that
+explain reasoning — plus what will not, including any new `source` of an
+operator-editable config, and suggested commands nobody has run.
+
+*Not legal advice, and the file says so.*
+
+---
+
+## 10.0 / 2026.08.14b — The old organisation survived the move in fifteen files
+
+Reported from a real install on a fresh machine:
+
+    curl: (22) The requested URL returned error: 404
+    install.sh is running standalone — fetching RothITguy-jitsi/alpine-vm-wordpress@main...
+    No key record at minisign._wasp.rothitguy.pro — cross-check skipped.
+
+Two failures in three lines, and both were mine. The previous release claimed
+to have moved the project to IronVeil Systems. It had replaced two exact
+strings — `RothITguy-jitsi/WASP` and one DNS name — and the grep that confirmed
+it searched for those same two strings. Fifteen files still carried the old
+name, including `REPO_OWNER` in install.sh, which is what builds the download
+URL when the script runs standalone.
+
+So a fresh install fetched from an organisation the project had left, and
+looked for a signing key at a domain that no longer publishes one. The signing
+lookup fails closed, which is correct and gives an operator nothing to act on.
+
+All of it replaced. Attribution and authorship now read **IronVeil Systems
+DevOps**; the licence holder, the key cross-check URL, and the CrowdSec parser
+and scenario namespaces are updated. The CrowdSec rename was checked for
+cross-references first — the scenario filters on `evt.Meta.log_type` rather
+than the parser's name, and stage 09 refers to files rather than namespaced
+identifiers, so nothing broke. Two comments recording real field incidents were
+genericised rather than deleted; the lesson survives without naming a domain.
+
+**New check: `check-stale-branding.py`.** Any superseded organisation,
+repository or DNS name anywhere in the tree fails the build. It found one more
+instance on its first run that the manual sweep had missed.
+
+Lines that legitimately name the old identifier to EXPLAIN the move are
+exempt — "it was previously alpine-vm-wordpress" is the opposite of drift; it
+tells someone with an old clone what happened. CHANGELOG.md stays exempt as
+append-only history.
+
+**Also visible in that log, and not a defect:** four files failed manifest
+verification because they were updated after the manifest was signed. The
+signature was valid and the check said so precisely — *"the manifest itself is
+authentic, which means a shipped file was modified after signing."* That is the
+control working. Re-sign after any change.
+
+---
+
 ## 10.0 / 2026.08.14a — Moved to IronVeil Systems
 
 The project now lives at `github.com/ironveilsystems1/WASP`, and release

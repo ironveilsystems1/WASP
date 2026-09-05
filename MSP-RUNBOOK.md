@@ -232,6 +232,16 @@ that is not the site.
 
 ---
 
+## Evidence for a client or an RFP
+
+[docs/VALIDATION.md](docs/VALIDATION.md) records how the platform was tested:
+96 hardware cycles, what the testing found that review could not, and — stated
+separately — what is proven versus what is not.
+
+The measured recovery time and the list of demonstrated controls are the parts
+an RFP response can use. The "not yet demonstrated" list is there so nothing
+gets claimed that has not been run.
+
 ## Weekly review
 
 [docs/WEEKLY-CHECKLIST.md](docs/WEEKLY-CHECKLIST.md) — print one per client per
@@ -396,4 +406,4 @@ client who will be angry about the wrong thing.
 
 *Templates. Argue about the numbers before signing them.*
 
-— **RothITguy**
+— **IronVeil Systems DevOps**

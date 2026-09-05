@@ -113,7 +113,7 @@ resurface this data in a client-facing dashboard, keep that attribution.
 ## What WASP itself is
 
 Everything under `lib/`, `payload/bin/`, `payload/stages/`, `payload/mu-plugins/`
-and `test/` is original work, MIT-licensed, © 2026 RothITguy.
+and `test/` is original work, MIT-licensed, © 2026 IronVeil Systems.
 
 The value here is not the code — it is the accumulated record of what actually
 breaks, written down. See `CHANGELOG.md`, which is deliberately a post-mortem

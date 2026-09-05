@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 RothITguy-jitsi
+Copyright (c) 2026 IronVeil Systems
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,24 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+-------------------------------------------------------------------------------
+NOTE ON CONTRIBUTIONS  (not part of the MIT licence above)
+-------------------------------------------------------------------------------
+
+The MIT text above is unmodified and governs this software. The following is a
+statement of contribution terms, not an alteration of that licence.
+
+Contributions submitted to this project — pull requests, patches, or code in
+issues — are licensed under the same MIT terms, to IronVeil Systems and to all
+recipients of the software. Contributors retain copyright in their own work;
+they grant a licence, they do not assign ownership. Opening a pull request is
+the agreement. See CONTRIBUTING.md.
+
+For the avoidance of doubt: improvements made in a fork that remains
+MIT-licensed may be incorporated back into this project, as the MIT licence
+already permits. Improvements made in a fork that has been relicensed under
+different terms may not, and nothing in this file purports to grant such a
+right — a licence grants rights to others; it cannot take rights from someone
+who never agreed to it.
