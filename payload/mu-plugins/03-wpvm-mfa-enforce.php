@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WASP — MFA Enforcement
  * Description: Requires administrators to hold a configured second factor via the Two Factor plugin, and closes the REST and application-password routes that would otherwise let an admin skip it. Built around recovery: a grace window before blocking, backup codes count, and a console reset if every factor is lost. Deleting this file disables the requirement — it does not lock anyone out.
- * Author: RothITguy
+ * Author: IronVeil Systems DevOps
  * Version: 1.0
  * WHY THIS EXISTS AS A SEPARATE PIECE
  *

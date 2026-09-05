@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WASP — Custom Login Slug
  * Description: Rewrites every login URL WordPress generates so the login form lives at your secret slug instead of /wp-login.php. Apache blocks the default path outright, so deleting this file does not restore it — it locks everyone out. Change the slug in the Apache config first, then here.
- * Author: RothITguy
+ * Author: IronVeil Systems DevOps
  * Version: 1.0
  * Apache blocks direct requests to wp-login.php unless they arrive through
  * the slug rewrite. WordPress, left alone, would still emit wp-login.php in

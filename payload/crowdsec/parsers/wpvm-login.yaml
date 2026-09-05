@@ -13,7 +13,7 @@
 onsuccess: next_stage
 debug: false
 filter: "evt.Line.Labels.type == 'wpvm-login'"
-name: rothitguy/wpvm-login-logs
+name: ironveil/wpvm-login-logs
 description: "Parse WPVM Login Guard authentication events"
 grok:
   # The leading [%{DATA:apache_ts}] captures Apache's own timestamp, e.g.

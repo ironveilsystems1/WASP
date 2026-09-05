@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WASP — SMTP Transport
  * Description: Sends all wp_mail() through your authenticated SMTP relay, with the credentials held in a file outside the web root rather than in the database. Without it WordPress hands mail to a local sendmail that does not exist, and password resets, order confirmations and admin alerts fail silently.
- * Author: RothITguy
+ * Author: IronVeil Systems DevOps
  * Version: 1.0
  *
  * WHY THE CREDENTIALS LIVE OUTSIDE THE DOCROOT

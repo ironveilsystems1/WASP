@@ -379,7 +379,7 @@ case "${1:-status}" in
         mkdir -p "$(dirname "$_WL")"
         if [ ! -f "$_WL" ]; then
           {
-            printf 'name: rothitguy/wpvm-operator-whitelist\n'
+            printf 'name: ironveil/wpvm-operator-whitelist\n'
             printf 'description: "Addresses the operator declared must never be banned"\n'
             printf 'whitelist:\n'
             printf '  reason: "operator-declared address"\n'

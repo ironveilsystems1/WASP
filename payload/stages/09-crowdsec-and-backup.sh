@@ -246,7 +246,7 @@ install -m 0644 "${PAYLOAD_DIR}/crowdsec/scenarios/wpvm-login-bruteforce.yaml" \
 if [ -n "${CROWDSEC_WHITELIST:-}" ]; then
   _WL=/opt/crowdsec/config/postoverflows/s01-whitelist/wpvm-operator.yaml
   {
-    printf 'name: rothitguy/wpvm-operator-whitelist\n'
+    printf 'name: ironveil/wpvm-operator-whitelist\n'
     printf 'description: "Addresses the operator declared must never be banned"\n'
     printf 'whitelist:\n'
     printf '  reason: "operator-declared address (install-time)"\n'

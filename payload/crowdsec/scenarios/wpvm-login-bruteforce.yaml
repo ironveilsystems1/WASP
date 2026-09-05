@@ -10,7 +10,7 @@
 # means the application layer already gave up on this address, which is a
 # stronger signal than a single failure.
 type: leaky
-name: rothitguy/wpvm-login-bruteforce
+name: ironveil/wpvm-login-bruteforce
 description: "WordPress login brute-force (WPVM Login Guard events)"
 filter: "evt.Meta.log_type == 'wpvm_login' && (evt.Parsed.wpvm_event == 'failed' || evt.Parsed.wpvm_event == 'lockout')"
 leakspeed: "20s"

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WASP — Login Guard
  * Description: Rate-limits failed logins with a progressive lockout, and removes the message that tells an attacker which usernames are real. Feeds every outcome to CrowdSec so a persistent source gets banned at the firewall rather than merely slowed down here.
- * Author: RothITguy
+ * Author: IronVeil Systems DevOps
  * Version: 1.0
  *
  * WHY THIS EXISTS RATHER THAN A PLUGIN
