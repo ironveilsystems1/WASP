@@ -1,0 +1,25 @@
+# SINGLE SOURCE OF TRUTH for the custom-login-slug rewrite rules.
+#
+# These land in two places that run at different times, in different shells,
+# on different machines:
+#
+#   lib/03-dynamic-configs.sh  -> wp-security.conf   (Proxmox host, bash)
+#   payload/stages/04-...      -> .htaccess          (inside the VM, sh)
+#
+# They cannot share a function. They CAN share this file, and they now do.
+#
+# WHY THIS FILE EXISTS
+#
+# The two used to be maintained separately and drifted: one sent the bare slug
+# to /wp-login.php, the other to /wp-admin/index.php. Whichever ruleset won, a
+# request to /<slug> reached wp-admin unauthenticated, WordPress redirected to
+# the login page, the login-slug mu-plugin rewrote that back to /<slug>, and
+# the browser looped until it gave up with "The page isn't redirecting
+# properly". Nothing failed, nothing logged an error, and validate-wordpress
+# reported the slug serving the login page — which was true, and was the first
+# hop of the loop.
+#
+# @@SLUG@@ is replaced with the configured slug by whichever consumer reads it.
+# Keep every line a complete RewriteRule; the consumers indent but do not parse.
+RewriteRule ^@@SLUG@@/?$ /wp-login.php [L,QSA,E=WPVM_SLUG:1]
+RewriteRule ^@@SLUG@@/(.+)$ /wp-admin/$1 [L,QSA,E=WPVM_SLUG:1]

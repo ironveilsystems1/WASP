@@ -1,0 +1,83 @@
+# FORENSIC FIX (new-audit Medium finding): wp-cron-run.sh and
+# wp-db-backup.sh below each now hold their own mkdir-based lock (matching
+# update.sh's existing convention) before doing anything state-changing,
+# so a slow run no longer overlaps with the next scheduled tick of itself.
+#
+# Weekly container image update check (Sunday 04:00 UTC — dry run only)
+0 4 * * 0 podman auto-update --dry-run 2>&1 | logger -t podman-autoupdate
+# WordPress system cron — replaces unreliable WP-Cron (which only fires on
+# page loads). DISABLE_WP_CRON=true is set in WORDPRESS_CONFIG_EXTRA.
+# Runs every 5 min; WordPress schedules (backups, updates, email) fire on time.
+*/5 * * * * /usr/local/bin/wp-cron-run.sh >/dev/null 2>&1
+# Daily MariaDB backup — verified logical dump (v7-13, was pipe-to-gzip).
+# Now runs a dedicated script that checks mariadb-dump's own exit status,
+# confirms the dump completed to its own marker, verifies the gzip
+# archive, and rotates old backups ONLY after all three checks pass.
+0 2 * * * /usr/local/bin/wp-db-backup.sh
+# FORENSIC FIX (new-audit High finding): auto re-block the uploads-php
+# PHP-execution escape hatch if it's been left open too long (see
+# wp-hardening.sh's UPLOADS_PHP_MARKER / check-expiry). Silent no-op unless
+# it's actually open past the limit, so this doesn't add routine noise.
+*/15 * * * * /usr/local/bin/wp-hardening.sh check-expiry >/dev/null 2>&1
+# WordPress plugin/theme/core update check (Monday 07:00 UTC). Reports via
+# syslog only when something is actually pending, so it doesn't become noise
+# the operator learns to ignore. Never auto-updates -- see wp-plugins.sh for
+# why that's deliberate rather than an omission.
+0 7 * * 1 /usr/local/bin/wp-plugins.sh check >/dev/null 2>&1
+# Daily malware and integrity scan (03:30 UTC). Runs the QUICK profile:
+# structural checks, core-vs-pinned-image comparison, and database analysis.
+# These are the high-signal, low-noise layers. YARA and ClamAV are excluded
+# from the daily job deliberately -- YARA because a full-tree signature scan
+# is heavy enough to matter on a small VM, ClamAV because of its memory
+# footprint. Reports via syslog only when something is found, so a clean day
+# is silent and the operator does not learn to ignore it.
+30 3 * * * /usr/local/bin/wp-malware-scan.sh quick >/dev/null 2>&1 || logger -t wp-malware "scan reported findings — run: wp-malware-scan.sh status"
+# Weekly full scan including YARA (Sunday 03:45 UTC).
+45 3 * * 0 /usr/local/bin/wp-malware-scan.sh yara >/dev/null 2>&1 || logger -t wp-malware "weekly YARA scan reported findings — run: wp-malware-scan.sh status"
+# Daily vulnerability scan of installed plugins and themes (06:30 UTC).
+# Wordfence Intelligence only -- free, no key, and fetched as one bulk feed
+# that is queried locally, so the site's plugin inventory is never sent
+# anywhere. Silent unless something installed actually matches a disclosed
+# vulnerability.
+30 6 * * * /usr/local/bin/wp-vuln-cron.sh
+# Weekly self-test (Sunday 05:30 UTC): restore the newest backup into a
+# throwaway database and verify the data is really there, and prove the
+# read-only candidate account genuinely refuses writes. Weekly rather than
+# daily because the restore starts a second database and copies the whole
+# dump. Emails only on failure -- a guarantee that stops holding is exactly
+# the thing worth interrupting someone for.
+30 5 * * 0 /usr/local/bin/wasp-selftest.sh all >/tmp/wasp-selftest.out 2>&1 || { logger -t wasp-selftest "SELF-TEST FAILED — a stated guarantee is not holding"; [ -x /usr/local/bin/wp-notify.sh ] && NOTIFY_COOLDOWN_HOURS=0 /usr/local/bin/wp-notify.sh wasp-selftest "Self-test FAILED: backup restore or DB isolation" /tmp/wasp-selftest.out; }
+# Weekly review prompt for vulnerability exceptions (Monday 08:00 UTC).
+# An exception expires 90 days after it was accepted; 14 days' notice is
+# enough to re-argue it before an update is blocked. Silent unless something
+# is actually approaching, so it stays worth reading.
+0 8 * * 1 /usr/local/bin/wp-hardening.sh exceptions-check >/dev/null 2>&1
+# Enrich NEW login brute-force bans (every 30 min). Exits immediately unless
+# CTI_ENRICH_BANS=1, which the installer only recommends with a purchased key
+# -- at the free tier's 40/month this would consume the budget in a day.
+# Only wpvm-login scenario bans are considered: an address that reached the
+# login form is targeting this site, whereas an http-probing ban is noise.
+*/30 * * * * /usr/local/bin/wp-hardening.sh cti-watch >/dev/null 2>&1
+# Disk check twice daily. Silent below 80%; emails once per 48h above it.
+# 80% rather than 95% deliberately: MariaDB refuses writes before the disk is
+# actually full, the errors do not mention disk, and a backup that runs out of
+# space leaves you with neither the space nor the backup.
+0 */12 * * * /usr/local/bin/wp-hardening.sh disk-check >/dev/null 2>&1
+# External heartbeat every 10 minutes. Exits immediately unless a URL is
+# configured. This is the only check that can detect the VM being GONE:
+# everything else runs on the VM, so silence and health look identical.
+# It verifies WordPress serves and MariaDB answers BEFORE pinging — a
+# heartbeat proving only that cron runs would report healthy through a
+# completely broken site.
+*/10 * * * * /usr/local/bin/wp-notify.sh --heartbeat >/dev/null 2>&1
+# TLS expiry, daily at 09:00. Silent above 14 days. Warns at 14 rather than
+# 30 because Let's Encrypt renews at 30 — warning there would fire on every
+# healthy certificate and be ignored within a week. At 14, automatic renewal
+# has had time to run and has not.
+0 9 * * * /usr/local/bin/wp-hardening.sh tls-check >/dev/null 2>&1
+
+# Weekly file-integrity check: core and plugin files vs WordPress.org
+# checksums. Detects a backdoor injected into an existing plugin, which is how
+# most WordPress compromises persist. Output goes to syslog tagged
+# wasp-integrity in key=value form for a SIEM to decode; a FAIL is auth.crit.
+30 4 * * 1 /usr/local/bin/wp-plugins.sh verify >/dev/null 2>&1
