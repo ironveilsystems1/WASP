@@ -104,6 +104,11 @@ WP_SCHEME=$(_vars_q "${WP_SCHEME:-http}")
 WP_SITE_TITLE=$(_vars_q "${WP_SITE_TITLE:-}")
 WP_ADMIN_EMAIL=$(_vars_q "${WP_ADMIN_EMAIL:-}")
 PROXY_IP=$(_vars_q "${PROXY_IP:-}")
+CS_ENFORCEMENT=$(_vars_q "${CS_ENFORCEMENT:-local}")
+CS_LAPI_URL=$(_vars_q "${CS_LAPI_URL:-}")
+CS_LAPI_LOGIN=$(_vars_q "${CS_LAPI_LOGIN:-}")
+CS_LAPI_PASSWORD=$(_vars_q "${CS_LAPI_PASSWORD:-}")
+LOOPBACK_HOSTS=$(_vars_q "${LOOPBACK_HOSTS:-0}")
 SSH_CIDR=$(_vars_q "${SSH_CIDR:-}")
 WEB_CIDR=$(_vars_q "${WEB_CIDR:-}")
 INSTALLERENV
@@ -118,7 +123,37 @@ chmod 644 "$MNT/root/wp-security.conf"
 msg_ok "wp-security.conf injected (admin: ${ADMIN_CIDR:-open}, extra-ip: ${ALLOWED_ADMIN_IP:-none})"
 
 # ─ mod_remoteip files (only if PROXY_IP was set) ─────────────────────────────
+#
+# TRUST-COUNT contract, asserted here at the point of use rather than trusted
+# from the prompt that collected it.
+#
+# RemoteIPTrustedProxy must name exactly ONE literal address. mod_remoteip
+# walks X-Forwarded-For from the RIGHT, popping entries while they match a
+# trusted proxy, and takes the first untrusted one as the client. Give it a
+# range and every host inside that range can prepend whatever address it likes
+# and have mod_remoteip accept it as the client -- which hands an attacker on
+# the same segment the ability to forge the address that CrowdSec bans, that
+# the wp-admin restriction allows, and that the login guard counts against.
+# One compromised neighbour then becomes authentication bypass.
+#
+# lib/01's _ask_single_ip already rejects a CIDR, so in the normal path this
+# never fires. It is here because that is one prompt and this is the only place
+# the value becomes a security decision: a future preset path, an answer file,
+# or an environment override would reach this line without passing that prompt.
+# A contract worth stating is worth asserting where it is relied on.
 if [[ -n "$PROXY_IP" ]]; then
+  case "$PROXY_IP" in
+    */*|*,*|*[[:space:]]*)
+      # msg_warn for the explanation, msg_error LAST: msg_error exits 1 itself,
+      # so a stack of them prints one line and discards the rest of the reason.
+      msg_warn "A range or list lets any host inside it forge the client IP in"
+      msg_warn "  X-Forwarded-For, because mod_remoteip pops trusted entries off"
+      msg_warn "  the right of the header and trusts the next one. That forged"
+      msg_warn "  address is what CrowdSec bans, what wp-admin allows, and what"
+      msg_warn "  the login guard counts — so this is not a cosmetic constraint."
+      msg_warn "  Name the proxy's own address, e.g. 10.20.10.10, and re-run."
+      msg_error "PROXY_IP is '${PROXY_IP}' — RemoteIPTrustedProxy needs a single literal address." ;;
+  esac
   cat > "$MNT/root/wp-remoteip.load" << RILOAD
 LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so
 RILOAD
@@ -127,7 +162,7 @@ RemoteIPHeader X-Forwarded-For
 RemoteIPTrustedProxy ${PROXY_IP}
 RICONF
   chmod 644 "$MNT/root/wp-remoteip.load" "$MNT/root/wp-remoteip.conf"
-  msg_ok "mod_remoteip files injected (trusted proxy: ${PROXY_IP})"
+  msg_ok "mod_remoteip files injected (trusted proxy: ${PROXY_IP} — single literal address)"
 fi
 
 # ─ Stage payload/ onto the VM disk (NEW -- replaces per-file heredocs) ───────

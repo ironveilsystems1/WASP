@@ -370,15 +370,180 @@ echo -e "  ${YW}machine that generated it.${CL}"
 echo ""
 echo -e "  ${YW}Then connect with:  ssh -i ~/.ssh/wasp_ed25519 <admin>@<this-vm-ip>${CL}"
 echo ""
-echo "  Paste your public key (starts with ssh-ed25519 or ssh-rsa),"
-echo "  or press Enter to load from a file path."
-read -rp "  Public key (paste, or blank) : " SSH_KEY_PASTE
+# ── Key collection ───────────────────────────────────────────────────────────
+# More than one key, because one key per VM is the wrong shape for how these
+# are actually administered: a workstation and a laptop, an operator and a
+# colleague, a long-lived key and the replacement during a rotation. The
+# alternatives to collecting them here are sharing one private key between
+# machines, or editing authorized_keys over an SSH session that the edit can
+# break — and the second is how a VM becomes console-only.
+#
+# Every key is validated before it is accepted. When ANY key is supplied,
+# password authentication is switched off for the whole VM, so an unusable
+# authorized_keys is not a degraded login, it is a VM with no network access,
+# recoverable only from the Proxmox console. The classifier lives in lib/00 so
+# lib/05 can assert the same thing where it writes the file.
 SSH_KEYS=""
-if [[ -n "$SSH_KEY_PASTE" ]]; then
-  SSH_KEYS="$SSH_KEY_PASTE"
-else
-  read -rp "  ...or path to a .pub file (blank = set an admin password instead) : " SK
-  [[ -n "$SK" && -f "$SK" ]] && SSH_KEYS=$(cat "$SK")
+_ssh_key_count=0
+
+_add_ssh_key() {               # _add_ssh_key <line> <source-label>
+  local line="$1" src="$2" kind blob existing
+  kind=$(_ssh_key_kind "$line")
+  case "$kind" in
+    empty|comment) return 0 ;;
+    private)
+      echo ""
+      msg_warn "${RD}That is a PRIVATE key.${CL} Not added."
+      msg_warn "  Three things go wrong at once if a private key reaches"
+      msg_warn "  authorized_keys: sshd ignores the line so there is no login,"
+      msg_warn "  password auth is already off so there is no fallback, and the"
+      msg_warn "  private half is now on the VM's disk and in the install log."
+      msg_warn ""
+      msg_warn "  The first two are an outage. The third means that keypair is"
+      msg_warn "  compromised — generate a new one rather than re-pasting:"
+      msg_warn "      ssh-keygen -t ed25519 -f ~/.ssh/wasp_ed25519"
+      msg_warn "  Then paste the ${BLD}.pub${CL} file's contents."
+      echo ""
+      return 1 ;;
+    fingerprint)
+      msg_warn "That is a fingerprint, not a key. Not added."
+      msg_warn "  A fingerprint identifies a key; it cannot authenticate one."
+      msg_warn "  You want the contents of the .pub file — one long line"
+      msg_warn "  starting with a key type."
+      return 1 ;;
+    unknown)
+      msg_warn "Not a usable public key. Not added. (from ${src})"
+      msg_warn "  Expected one line: <type> <base64> [comment], where type is"
+      msg_warn "  ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256/384/521 or an sk-*"
+      msg_warn "  FIDO type. An options prefix such as restrict,from=\"...\" is"
+      msg_warn "  fine and goes before the type."
+      msg_warn "  The usual cause is a truncated paste — a wrapped terminal or"
+      msg_warn "  a selection that missed the end. sshd would silently ignore"
+      msg_warn "  this line, so it is refused here instead."
+      return 1 ;;
+  esac
+  blob=$(_ssh_key_blob "$line")
+  # De-duplicate on the blob, which is the key's identity: the same key with a
+  # different comment is the same key, and two entries for it make a later
+  # review of who has access harder than it needs to be.
+  if [[ -n "$SSH_KEYS" ]] && printf '%s\n' "$SSH_KEYS" | grep -qF "$blob"; then
+    existing=$(_ssh_key_label "$line")
+    msg_info "Already added (same key, possibly a different comment): ${existing}"
+    return 0
+  fi
+  SSH_KEYS="${SSH_KEYS:+${SSH_KEYS}$'\n'}${line}"
+  _ssh_key_count=$((_ssh_key_count+1))
+  msg_ok "[${_ssh_key_count}] $(_ssh_key_label "$line")"
+  return 0
+}
+
+_load_ssh_key_file() {         # _load_ssh_key_file <path>
+  local p="$1" n=0 before="$_ssh_key_count"
+  # Expand a leading ~ by hand: this is a `read` value, so the shell never
+  # performed tilde expansion on it and "~/.ssh/id_ed25519.pub" would be
+  # looked for as a literal directory named "~".
+  case "$p" in "~/"*) p="${HOME}/${p#\~/}" ;; esac
+  if [[ ! -f "$p" ]]; then
+    msg_warn "No such file: ${p}"
+    return 1
+  fi
+  if [[ ! -r "$p" ]]; then
+    msg_warn "Cannot read ${p} (permissions)."
+    return 1
+  fi
+  # A whole authorized_keys file is a normal and useful thing to point at, so
+  # read every line rather than only the first.
+  while IFS= read -r _kl || [[ -n "$_kl" ]]; do
+    _add_ssh_key "$_kl" "$p" && n=$((n+1))
+  done < "$p"
+  if [[ "$_ssh_key_count" -eq "$before" ]]; then
+    msg_warn "  Nothing usable in ${p}."
+    return 1
+  fi
+  return 0
+}
+
+# Preset path, for a fleet rollout. The same keys belong on every tenant behind
+# one proxy, and retyping them ten times is both tedious and the way key nine
+# ends up subtly different from key one.
+if [[ -n "${WASP_SSH_KEY_FILE:-}" ]]; then
+  _load_ssh_key_file "$WASP_SSH_KEY_FILE" \
+    && msg_ok "Loaded ${_ssh_key_count} key(s) from WASP_SSH_KEY_FILE" \
+    || msg_warn "WASP_SSH_KEY_FILE=${WASP_SSH_KEY_FILE} yielded no usable keys"
+fi
+if [[ -n "${WASP_SSH_KEYS:-}" ]]; then
+  while IFS= read -r _kl; do
+    [[ -n "$_kl" ]] && _add_ssh_key "$_kl" "WASP_SSH_KEYS"
+  done <<< "$WASP_SSH_KEYS"
+fi
+
+if [[ "$_ssh_key_count" -eq 0 ]]; then
+  echo "  Paste a public key, or a path to a .pub or authorized_keys file."
+  echo "  Add as many as you need — one per line, blank line when done."
+  echo "  A path loads every key in the file."
+  while :; do
+    if [[ "$_ssh_key_count" -eq 0 ]]; then
+      read -rp "  Key or file path (blank = use a password instead) : " _kin
+    else
+      read -rp "  Another key or path (blank = done, 'del N' removes one) : " _kin
+    fi
+    [[ -z "$_kin" ]] && break
+    # 'del N' rather than making a mistake permanent. Without it the only way
+    # to drop a mistyped-comment key is to abandon the install and start the
+    # whole questionnaire again.
+    if [[ "$_kin" =~ ^del[[:space:]]+([0-9]+)$ ]]; then
+      _dn="${BASH_REMATCH[1]}"
+      if [[ "$_dn" -ge 1 && "$_dn" -le "$_ssh_key_count" ]]; then
+        SSH_KEYS=$(printf '%s\n' "$SSH_KEYS" | sed "${_dn}d")
+        _ssh_key_count=$((_ssh_key_count-1))
+        msg_ok "Removed key ${_dn}. ${_ssh_key_count} remaining."
+        [[ "$_ssh_key_count" -gt 0 ]] && printf '%s\n' "$SSH_KEYS" | nl -ba -w4 \
+          | while IFS= read -r _l; do
+              printf '      %s %s\n' "${_l%%$'\t'*}" "$(_ssh_key_label "${_l#*$'\t'}")"
+            done
+      else
+        msg_warn "No key ${_dn}. There are ${_ssh_key_count}."
+      fi
+      unset _dn
+      continue
+    fi
+    # A path and a key are told apart by shape, not by asking which it is:
+    # a key always contains a space and a base64 blob, a path never does.
+    if [[ "$_kin" != *" "* && ( "$_kin" == /* || "$_kin" == ~* || "$_kin" == ./* || -f "$_kin" ) ]]; then
+      _load_ssh_key_file "$_kin"
+    else
+      _add_ssh_key "$_kin" "pasted"
+    fi
+  done
+  unset _kin
+fi
+
+# Show what will actually be installed, before password auth is switched off on
+# the strength of it. This is the last point at which a wrong key is cheap.
+if [[ "$_ssh_key_count" -gt 0 ]]; then
+  echo ""
+  echo -e "  ${BLD}${_ssh_key_count} key(s) will be installed for the admin account:${CL}"
+  _i=0
+  while IFS= read -r _kl; do
+    [[ -z "$_kl" ]] && continue
+    _i=$((_i+1))
+    printf '    %d. %s\n' "$_i" "$(_ssh_key_label "$_kl")"
+  done <<< "$SSH_KEYS"
+  unset _i _kl
+  echo ""
+  echo -e "  ${YW}Any one of these can log in, and each is equally privileged —${CL}"
+  echo -e "  ${YW}there is no per-key restriction unless you added an options${CL}"
+  echo -e "  ${YW}prefix. Password login is about to be disabled, so if none of${CL}"
+  echo -e "  ${YW}these keys works you reach this VM only from the Proxmox${CL}"
+  echo -e "  ${YW}console. Check the fingerprints against your own:${CL}"
+  echo -e "  ${BL}      ssh-keygen -lf ~/.ssh/wasp_ed25519.pub${CL}"
+  echo ""
+  read -rp "  Proceed with these keys? [Y/n] : " _kok
+  case "${_kok:-y}" in
+    n|N) SSH_KEYS=""; _ssh_key_count=0
+         msg_warn "Keys discarded — falling back to password login." ;;
+  esac
+  unset _kok
 fi
 
 # Sanitise: lowercase, alnum + underscore/hyphen, must start with a letter
@@ -401,7 +566,7 @@ if [[ -n "$SSH_KEYS" ]]; then
   # (openssl rand, unknown to the operator, written to a credentials file
   # on disk) rather than asked for, since nobody needs to remember it.
   ADMIN_PASS=$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 24)
-  msg_ok "SSH key set — password login disabled. Admin account: ${ADMIN_USER}"
+  msg_ok "${_ssh_key_count} SSH key(s) set — password login disabled. Admin account: ${ADMIN_USER}"
 else
   DISABLE_PW_AUTH=0
   msg_warn "No SSH key — ${ADMIN_USER} will use password login (root SSH stays disabled either way)"
@@ -573,7 +738,22 @@ echo -e "  ${BLD}Layer 2b — mod_remoteip (only needed if behind a reverse prox
 echo -e "  ${YW}If WordPress is behind NPM / nginx / Caddy, Apache sees the proxy IP${CL}"
 echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache trusts${CL}"
 echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
-PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
+# Presettable from the environment. Added for multi-tenant rollouts: ten sites
+# behind the same proxy means answering the same three questions ten times, and
+# the tenth answer is the one that gets mistyped. A preset also means the value
+# is reviewable in a runbook rather than living only in someone's terminal
+# history.
+#
+# WASP_PROXY_IP rather than PROXY_IP: a bare, common name in the environment of
+# a root shell on a Proxmox host is too easy to inherit by accident from an
+# unrelated export, and inheriting this one silently widens what Apache trusts.
+# install.sh validates it before anything is built — see its contract preflight.
+if [[ -n "${WASP_PROXY_IP:-}" ]]; then
+  PROXY_IP="$WASP_PROXY_IP"
+  msg_ok "Reverse proxy IP from WASP_PROXY_IP: ${PROXY_IP}"
+else
+  PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
+fi
 
 # Flag the combination that turns a mod_remoteip failure into "allow everyone".
 # A proxy on the LAN is normally inside the operator's own admin CIDR, and when
@@ -677,27 +857,309 @@ if [[ -n "$PROXY_IP" && -z "$WEB_CIDR" ]]; then
   unset _WLOCK
 fi
 
+# ── Where CrowdSec enforces (the reverse-proxy enforcement gap) ───────────────
+# This question only exists because of a defect found by reading the deployed
+# topology rather than this code: behind a reverse proxy, the local CrowdSec
+# bouncer on this VM CANNOT enforce anything, and every signal says it is.
+#
+# The chain: mod_remoteip rewrites the client address in the Apache log, so the
+# CrowdSec agent correctly parses the REAL client IP and correctly writes a ban
+# for it. cs-firewall-bouncer then correctly adds that address to the local
+# nftables set. And nothing is ever dropped -- because not one packet arrives
+# from that address. They all arrive from the proxy. `cscli decisions list`
+# shows the ban, `nft list set` shows the address, the console shows a
+# remediation component, and an attacker continues uninterrupted.
+#
+# That is the worst failure shape this project has: a control that is present,
+# correct in isolation, and inert. Worse here than elsewhere, because the
+# existing production gate in stage 09 REFUSES TO CERTIFY A VM WITHOUT that
+# bouncer -- so production mode has been insisting on the one configuration
+# that provably cannot work, and treating its presence as proof of enforcement.
+#
+# So when a proxy is configured, ask where enforcement actually lives instead
+# of assuming it lives here. Detection stays local (this is the only place that
+# sees real client addresses); enforcement moves to whatever terminates the
+# client connection.
+CS_ENFORCEMENT="local"
+CS_LAPI_URL=""
+CS_LAPI_LOGIN=""
+CS_LAPI_PASSWORD=""
+
+# Preset path for a fleet rollout. The whole set is taken or none of it is:
+# WASP_CS_ENFORCEMENT=upstream with no URL would otherwise land in stage 09's
+# incomplete-LAPI branch and silently become detect-only, which is the kind of
+# "configured it and it quietly did something else" outcome a preset is supposed
+# to remove rather than introduce.
+_CS_PRESET=0
+if [[ -n "${WASP_CS_ENFORCEMENT:-}" ]]; then
+  case "$WASP_CS_ENFORCEMENT" in
+    local|upstream|detect-only)
+      CS_ENFORCEMENT="$WASP_CS_ENFORCEMENT"
+      CS_LAPI_URL="${WASP_CS_LAPI_URL:-}"
+      CS_LAPI_LOGIN="${WASP_CS_LAPI_LOGIN:-}"
+      CS_LAPI_PASSWORD="${WASP_CS_LAPI_PASSWORD:-}"
+      _CS_PRESET=1
+      msg_ok "CrowdSec enforcement from the environment: ${CS_ENFORCEMENT}${CS_LAPI_URL:+ → ${CS_LAPI_URL}}" ;;
+    *)
+      msg_warn "WASP_CS_ENFORCEMENT='${WASP_CS_ENFORCEMENT}' is not local, upstream or detect-only — asking instead." ;;
+  esac
+fi
+
+if [[ -n "$PROXY_IP" && "$_CS_PRESET" -eq 0 ]]; then
+  echo ""
+  echo -e "  ${BLD}Where should CrowdSec bans be enforced?${CL}"
+  echo -e "  ${RD}  This VM cannot enforce them. Read this one before answering.${CL}"
+  echo ""
+  echo -e "  ${YW}  You configured a reverse proxy at ${PROXY_IP}, so every request${CL}"
+  echo -e "  ${YW}  reaches this VM FROM that address. mod_remoteip recovers the${CL}"
+  echo -e "  ${YW}  real client IP for the logs, so CrowdSec detects correctly and${CL}"
+  echo -e "  ${YW}  bans the right address — at a firewall no packet from that${CL}"
+  echo -e "  ${YW}  address ever passes through.${CL}"
+  echo ""
+  echo -e "  ${YW}  The ban is written. The alert is right. Nothing is blocked.${CL}"
+  echo -e "  ${YW}  And every check reports healthy, which is why this needs a${CL}"
+  echo -e "  ${YW}  deliberate answer rather than a default.${CL}"
+  echo ""
+  echo -e "  ${BLD}  1) upstream${CL}  ${YW}— detect here, enforce at the proxy/firewall${CL}"
+  echo -e "  ${YW}       This VM's agent reports to a central CrowdSec LAPI. The${CL}"
+  echo -e "  ${YW}       bouncer there drops the client before it reaches the${CL}"
+  echo -e "  ${YW}       proxy. No local bouncer is installed, because one would${CL}"
+  echo -e "  ${YW}       only manufacture evidence of blocking.${CL}"
+  echo -e "  ${YW}       This is the correct answer for a site behind a proxy.${CL}"
+  echo ""
+  echo -e "  ${BLD}  2) detect-only${CL}  ${YW}— accept that nothing here blocks${CL}"
+  echo -e "  ${YW}       Alerts and logs, no enforcement anywhere this VM knows${CL}"
+  echo -e "  ${YW}       about. Honest and recorded, rather than hidden behind a${CL}"
+  echo -e "  ${YW}       bouncer that appears to work. Marked as a production${CL}"
+  echo -e "  ${YW}       blocker so it cannot be forgotten.${CL}"
+  echo ""
+  echo -e "  ${BLD}  3) local${CL}  ${YW}— install the local bouncer anyway${CL}"
+  echo -e "  ${YW}       Only defensible if the proxy preserves the client's${CL}"
+  echo -e "  ${YW}       source address at layer 3 (transparent/DSR), or clients${CL}"
+  echo -e "  ${YW}       can also reach this VM directly. Otherwise it enforces${CL}"
+  echo -e "  ${YW}       nothing. Refused under the production profile.${CL}"
+  echo ""
+  while :; do
+    read -rp "  Enforcement [1/2/3, default 1] : " _CSE
+    case "${_CSE:-1}" in
+      1|u|upstream)    CS_ENFORCEMENT="upstream";    break ;;
+      2|d|detect-only) CS_ENFORCEMENT="detect-only"; break ;;
+      3|l|local)       CS_ENFORCEMENT="local";       break ;;
+      *) echo -e "  ${RD}Enter 1, 2 or 3.${CL}" ;;
+    esac
+  done
+  unset _CSE
+
+  if [[ "$CS_ENFORCEMENT" == "upstream" ]]; then
+    # ── What the LAPI is, before asking for its address ──────────────────────
+    # Asked at length because every part of this has a failure mode that looks
+    # like a different part's fault. The agent that cannot reach the LAPI, the
+    # agent whose login was never registered, and the agent pointed at a LAPI
+    # with no bouncer behind it ALL present identically from this VM: a clean
+    # start, a healthy service, and nothing blocked anywhere.
+    echo ""
+    echo -e "  ${BLD}The central LAPI${CL}"
+    echo -e "  ${YW}  CrowdSec splits into three parts, and knowing which is which${CL}"
+    echo -e "  ${YW}  is the difference between fixing this in a minute and in a${CL}"
+    echo -e "  ${YW}  day:${CL}"
+    echo ""
+    echo -e "  ${YW}    agent    reads logs, decides who should be banned${CL}"
+    echo -e "  ${YW}             → runs HERE, because this is the only place the${CL}"
+    echo -e "  ${YW}               real client address is visible${CL}"
+    echo -e "  ${YW}    LAPI     stores the decisions and hands them out${CL}"
+    echo -e "  ${YW}             → runs on ONE host for the whole site${CL}"
+    echo -e "  ${YW}    bouncer  asks the LAPI what to drop, and drops it${CL}"
+    echo -e "  ${YW}             → runs where client packets actually arrive:${CL}"
+    echo -e "  ${YW}               the proxy, or the edge firewall${CL}"
+    echo ""
+    echo -e "  ${YW}  You are about to point this VM's agent at that LAPI. Nothing${CL}"
+    echo -e "  ${YW}  this VM can do makes the bouncer exist — if there is no${CL}"
+    echo -e "  ${YW}  bouncer on that LAPI, bans are stored and never applied, and${CL}"
+    echo -e "  ${YW}  from here that is indistinguishable from working.${CL}"
+    echo ""
+    echo -e "  ${YW}  Usually the reverse proxy itself on 8080 — but it can be any${CL}"
+    echo -e "  ${YW}  host this VM can reach.${CL}"
+    echo ""
+    echo -e "  ${YW}  If the LAPI does not exist yet, say no at the next prompt.${CL}"
+    echo -e "  ${YW}  Deferring is a normal answer, not a failure: the agent is${CL}"
+    echo -e "  ${YW}  installed unconfigured, a production blocker is recorded so${CL}"
+    echo -e "  ${YW}  it cannot be forgotten, and you finish with one command once${CL}"
+    echo -e "  ${YW}  the LAPI is published.${CL}"
+    echo ""
+    read -rp "  Point the agent at a LAPI now? [Y/n] : " _CSK
+    case "${_CSK:-y}" in
+      n|N) CS_LAPI_URL=""
+           msg_ok "Deferred — the agent will be installed unconfigured."
+           msg_info "  Finish later:  doas wp-hardening.sh cs-lapi <url> <login> <pw>" ;;
+      *)   read -rp "  LAPI URL [http://${PROXY_IP}:8080/] : " _CSU
+           CS_LAPI_URL="${_CSU:-http://${PROXY_IP}:8080/}" ;;
+    esac
+    unset _CSK
+
+    if [[ -n "$CS_LAPI_URL" ]]; then
+      # ── Reachability, now, from this host ─────────────────────────────────
+      # The single most common cause of "the agent starts cleanly and reports
+      # nothing" is a LAPI still bound to 127.0.0.1:8080, which is the CrowdSec
+      # default. The symptom points at credentials and the cause is an address,
+      # so operators re-generate passwords for an hour.
+      #
+      # Tested from the PROXMOX HOST, which is not where the VM will be. Both
+      # directions of that caveat are stated below rather than implied: a
+      # refused connection from here is strong evidence of a loopback binding,
+      # and a successful one does not prove the VM's own segment is permitted.
+      _lh="${CS_LAPI_URL#*://}"; _lh="${_lh%%/*}"
+      _lport="${_lh##*:}"; _lhost="${_lh%%:*}"
+      [[ "$_lport" == "$_lhost" ]] && _lport=8080
+      echo ""
+      if ! command -v timeout >/dev/null 2>&1; then
+        msg_info "Skipping the reachability test (no 'timeout' on this host)."
+        msg_info "  The install tests it again from inside the VM regardless."
+      else
+        msg_info "Testing ${_lhost}:${_lport} from this Proxmox host…"
+        if timeout 4 bash -c "exec 3<>/dev/tcp/${_lhost}/${_lport}" 2>/dev/null; then
+          msg_ok "  Port ${_lport} is open on ${_lhost} from here."
+          msg_warn "  That is this host, not the VM. The VM lands on its own"
+          msg_warn "  segment, so confirm that segment is permitted to"
+          msg_warn "  ${_lhost}:${_lport} as well."
+        else
+          msg_warn "  Nothing answered on ${_lhost}:${_lport} from this host."
+          msg_warn "  Most likely the LAPI is still on its default binding of"
+          msg_warn "  127.0.0.1:8080, which serves no remote agent however correct"
+          msg_warn "  your credentials are. Publishing it is a change on that host."
+          msg_warn "  Also possible: a firewall between here and there, or this"
+          msg_warn "  host simply has no route — the VM may still succeed."
+          msg_warn "  Continuing. The install tests it again from inside the VM and"
+          msg_warn "  records a production blocker if the agent cannot"
+          msg_warn "  authenticate, so this will not pass silently either way."
+        fi
+      fi
+      unset _lh _lhost _lport
+
+      # ── Machine credentials ───────────────────────────────────────────────
+      # Not generated here. This VM has no authority on that LAPI, and a login
+      # that was never registered produces an agent that starts cleanly,
+      # authenticates nowhere, and reports nothing.
+      echo ""
+      echo -e "  ${BLD}Machine credentials${CL}"
+      echo -e "  ${YW}  The agent authenticates as a named machine that must${CL}"
+      echo -e "  ${YW}  already exist on the LAPI. Register it there first:${CL}"
+      echo ""
+      echo -e "  ${YW}    on the LAPI host        cscli machines add ${HN} --password '<pw>'${CL}"
+      echo -e "  ${YW}    on a containerised LAPI podman exec crowdsec cscli machines add …${CL}"
+      echo ""
+      echo -e "  ${YW}  One machine per tenant, never a shared login. Shared${CL}"
+      echo -e "  ${YW}  credentials make 'cscli machines list' useless for working${CL}"
+      echo -e "  ${YW}  out which site raised an alert, and revoking one site's${CL}"
+      echo -e "  ${YW}  access takes every site down with it.${CL}"
+      echo -e "  ${YW}  The hostname is a good name precisely because it is already${CL}"
+      echo -e "  ${YW}  unique and already written down everywhere else.${CL}"
+      echo ""
+      read -rp "  Machine login [${HN}] : " CS_LAPI_LOGIN
+      CS_LAPI_LOGIN="${CS_LAPI_LOGIN:-$HN}"
+      read -rsp "  Machine password (not echoed) : " CS_LAPI_PASSWORD; echo ""
+      if [[ -z "$CS_LAPI_PASSWORD" ]]; then
+        CS_LAPI_LOGIN=""; CS_LAPI_PASSWORD=""
+        msg_warn "No password — the agent will be installed unregistered."
+        msg_warn "  That is a recorded production blocker, not a quiet gap."
+        msg_warn "  Register the machine, then:"
+        msg_warn "    doas wp-hardening.sh cs-lapi '${CS_LAPI_URL}' <login> <password>"
+      else
+        msg_ok "Agent will report to ${CS_LAPI_URL} as ${CS_LAPI_LOGIN}"
+      fi
+    fi
+    unset _CSU
+
+    # ── What this VM cannot verify, said before it is relied on ──────────────
+    echo ""
+    echo -e "  ${BLD}Two things this VM will never be able to tell you${CL}"
+    echo -e "  ${YW}  1. Whether a bouncer exists on that LAPI. Check it there:${CL}"
+    echo -e "  ${YW}       on the LAPI host    cscli bouncers list${CL}"
+    echo -e "  ${YW}     A registered bouncer is not an enforcing one — a row with${CL}"
+    echo -e "  ${YW}     no recent Last API pull has never authenticated.${CL}"
+    echo -e "  ${YW}  2. Whether a decision becomes a dropped packet. That is${CL}"
+    echo -e "  ${YW}     pfctl or nft on the enforcing host, not anything here.${CL}"
+    echo ""
+    echo -e "  ${YW}  The LAPI is authenticated, but it is a control plane: a${CL}"
+    echo -e "  ${YW}  machine credential can write decisions that the bouncer${CL}"
+    echo -e "  ${YW}  applies to every site behind it. Reach it from the segments${CL}"
+    echo -e "  ${YW}  that need it and nowhere else.${CL}"
+    msg_info "  Verify after install:  doas wp-hardening.sh cs-doctor"
+  elif [[ "$CS_ENFORCEMENT" == "detect-only" ]]; then
+    msg_warn "Detection only — no CrowdSec enforcement for this site, by declaration."
+  else
+    msg_warn "Local bouncer requested behind a proxy at ${PROXY_IP}."
+    msg_warn "  Under the production profile this is refused, because the bans"
+    msg_warn "  it writes cannot match traffic that arrives from the proxy."
+  fi
+fi
+
+# NOTE: the split-horizon loopback question is NOT here, even though it belongs
+# with the proxy questions topically. It needs WP_DOMAIN, which is not asked
+# until several hundred lines below this point -- so asked here its `-n
+# "$WP_DOMAIN"` guard would always be false and the question would never
+# appear, while reading as though it did. It lives immediately after the site
+# address is known instead. (Same class of defect as the empty _SMTP_PORTS
+# expansion that produced a VM with no firewall at all.)
+
 # ── CrowdSec whitelist ────────────────────────────────────────────────────────
 echo ""
 echo -e "  ${BLD}CrowdSec whitelist — addresses that must never be banned${CL}"
-echo -e "  ${YW}CrowdSec does not just block a login form. It bans at nftables,${CL}"
-echo -e "  ${YW}which drops EVERY packet from that address — HTTP, and SSH with${CL}"
-echo -e "  ${YW}it. Mistype an admin password five times from your workstation${CL}"
-echo -e "  ${YW}and you are locked out of the VM entirely, recoverable only from${CL}"
-echo -e "  ${YW}the Proxmox console.${CL}"
+echo -e "  ${YW}CrowdSec does not just block a login form. It bans at the packet${CL}"
+echo -e "  ${YW}filter, which drops EVERY packet from that address — HTTP, and${CL}"
+echo -e "  ${YW}SSH with it. Mistype an admin password five times from your${CL}"
+echo -e "  ${YW}workstation and you are locked out of the VM entirely,${CL}"
+echo -e "  ${YW}recoverable only from the Proxmox console.${CL}"
 echo ""
-if [[ -n "$PROXY_IP" ]]; then
-  echo -e "  ${RD}  You configured a reverse proxy at ${PROXY_IP}.${CL}"
-  echo -e "  ${YW}  If that address is ever banned, the site goes down for EVERY${CL}"
-  echo -e "  ${YW}  visitor at once, because all traffic arrives from it. Including${CL}"
-  echo -e "  ${YW}  it here is strongly advised.${CL}"
+
+# The blast radius of a false positive depends entirely on the enforcement
+# topology chosen above, and it is the difference between one site going down
+# and every site behind the proxy going down. Said here, where the decision is
+# being made, rather than left to be discovered.
+if [[ "$CS_ENFORCEMENT" == "upstream" ]]; then
+  echo -e "  ${RD}  This matters MORE on this VM, not less.${CL}"
+  echo -e "  ${YW}  You chose upstream enforcement, so a decision made here is${CL}"
+  echo -e "  ${YW}  sent to the central LAPI, and the bouncer there applies it to${CL}"
+  echo -e "  ${YW}  EVERY site behind that proxy — not just this one. A false${CL}"
+  echo -e "  ${YW}  positive on your own address stops being a one-site problem${CL}"
+  echo -e "  ${YW}  and becomes a fleet-wide outage you cannot fix remotely,${CL}"
+  echo -e "  ${YW}  because the thing you would fix it through is also blocked.${CL}"
+  echo ""
+  echo -e "  ${YW}  The whitelist runs on THIS VM's engine, so it stops the ban${CL}"
+  echo -e "  ${YW}  being proposed at all. That is the right place for it: once a${CL}"
+  echo -e "  ${YW}  decision reaches the LAPI it is already shared.${CL}"
+  echo ""
+elif [[ -n "$PROXY_IP" && "$CS_ENFORCEMENT" == "detect-only" ]]; then
+  echo -e "  ${YW}  You chose detection only, so nothing here bans anything today.${CL}"
+  echo -e "  ${YW}  Answer anyway — the whitelist is what makes it safe to turn${CL}"
+  echo -e "  ${YW}  enforcement on later, and the addresses are known now.${CL}"
   echo ""
 fi
+
+if [[ -n "$PROXY_IP" ]]; then
+  echo -e "  ${RD}  Include the proxy itself: ${PROXY_IP}${CL}"
+  echo -e "  ${YW}  If it is ever banned, the site goes down for every visitor at${CL}"
+  echo -e "  ${YW}  once, because all traffic arrives from it.${CL}"
+  echo -e "  ${YW}  There is a specific way that happens, and it is not unlikely:${CL}"
+  echo -e "  ${YW}  if X-Forwarded-For substitution breaks — a proxy config${CL}"
+  echo -e "  ${YW}  change, a header set in the wrong place — this VM sees every${CL}"
+  echo -e "  ${YW}  request as coming FROM the proxy. One brute-force attempt then${CL}"
+  echo -e "  ${YW}  makes this VM ban the proxy, and the site is gone. Behind a${CL}"
+  echo -e "  ${YW}  central LAPI it is every site, not just this one.${CL}"
+  echo ""
+fi
+
 echo -e "  ${YW}From what you have already told this installer:${CL}"
 [[ -n "$PROXY_IP" ]]          && echo -e "  ${YW}    reverse proxy   : ${PROXY_IP}${CL}"
 [[ -n "$SSH_CIDR" ]]          && echo -e "  ${YW}    SSH allowed from: ${SSH_CIDR}${CL}"
 [[ -n "$ALLOWED_ADMIN_IP" ]]  && echo -e "  ${YW}    wp-admin extra IP: ${ALLOWED_ADMIN_IP}${CL}"
 [[ -n "$ADMIN_CIDR" ]]        && echo -e "  ${YW}    wp-admin network : ${ADMIN_CIDR}${CL}"
+echo ""
+echo -e "  ${YW}One range worth knowing about: ${BLD}100.64.0.0/10${CL}${YW} (CGNAT).${CL}"
+echo -e "  ${YW}  If you administer this over an overlay — NetBird, Tailscale,${CL}"
+echo -e "  ${YW}  ZeroTier — your real source address is in there. It is NOT${CL}"
+echo -e "  ${YW}  RFC1918, so CrowdSec's own stock whitelist never covers it, and${CL}"
+echo -e "  ${YW}  nothing else here will either. Remote administration is exactly${CL}"
+echo -e "  ${YW}  the case where a lockout is expensive.${CL}"
 echo ""
 _sec_head
 echo -e "  ${YW}  It prevents you locking yourself out. That is its purpose, and${CL}"
@@ -709,13 +1171,55 @@ echo -e "  ${YW}  /24 trusts every device on it, including the laptop that gets$
 echo -e "  ${YW}  malware. Prefer single addresses over ranges where you can.${CL}"
 echo -e "  ${YW}  Alerts are still raised for whitelisted addresses — only the${CL}"
 echo -e "  ${YW}  ban is suppressed — so a compromised machine of your own is${CL}"
-echo -e "  ${YW}  still visible in 'cscli alerts list'.${CL}"
+echo -e "  ${YW}  still visible in 'cscli alerts list'. That is deliberate: these${CL}"
+echo -e "  ${YW}  entries are written as a postoverflow rather than a parser-stage${CL}"
+echo -e "  ${YW}  whitelist, so the bucket still fills and the alert still fires${CL}"
+echo -e "  ${YW}  and only the ban is dropped. At the parser stage the events are${CL}"
+echo -e "  ${YW}  discarded before any scenario sees them and the address becomes${CL}"
+echo -e "  ${YW}  invisible — and a management machine that starts tripping${CL}"
+echo -e "  ${YW}  scenarios is something you want to find out about.${CL}"
+echo -e "  ${YW}  Nothing is permanent: add and remove entries later with${CL}"
+echo -e "  ${YW}  'wp-hardening.sh crowdsec-whitelist add|remove <ip>'.${CL}"
 _sec_note
+
+# A suggested set built from what is already known, offered as the default so
+# the common answer is one keypress. The proxy leads it: in upstream mode that
+# is the entry whose absence takes every site down at once.
 _CS_DEFAULT=""
 [[ -n "$PROXY_IP" ]] && _CS_DEFAULT="$PROXY_IP"
 [[ -n "$ALLOWED_ADMIN_IP" ]] && _CS_DEFAULT="${_CS_DEFAULT:+$_CS_DEFAULT,}$ALLOWED_ADMIN_IP"
+[[ -n "$SSH_CIDR" && "$SSH_CIDR" != "$ALLOWED_ADMIN_IP" ]] \
+  && _CS_DEFAULT="${_CS_DEFAULT:+$_CS_DEFAULT,}$SSH_CIDR"
+
+# Offered separately rather than folded into the default: a /10 is a large
+# trust grant and it should be a deliberate yes, not something accepted by
+# pressing Enter past a long line.
+if [[ -n "$_CS_DEFAULT" ]]; then
+  echo ""
+  read -rp "  Add the CGNAT overlay range 100.64.0.0/10 as well? [y/N] : " _CSO
+  case "${_CSO:-n}" in
+    y|Y) _CS_DEFAULT="${_CS_DEFAULT},100.64.0.0/10"
+         msg_ok "  Overlay range included — your remote source address is covered." ;;
+    *)   msg_info "  Not included. If you administer this over an overlay, add your"
+         msg_info "  own address below, or later with crowdsec-whitelist add." ;;
+  esac
+  unset _CSO
+fi
+
+# Presettable for a fleet. The whitelist is the entry most likely to be
+# identical across every tenant behind one proxy, and the one whose omission is
+# most expensive, so it should not depend on remembering it ten times.
 CROWDSEC_WHITELIST=""
-while :; do
+if [[ -n "${WASP_CROWDSEC_WHITELIST:-}" ]]; then
+  CROWDSEC_WHITELIST="$WASP_CROWDSEC_WHITELIST"
+  msg_ok "CrowdSec whitelist from the environment: ${CROWDSEC_WHITELIST}"
+  if [[ -n "$PROXY_IP" ]] && ! printf '%s' ",${CROWDSEC_WHITELIST}," | grep -qF ",${PROXY_IP},"; then
+    msg_warn "  ${PROXY_IP} — the proxy — is NOT in that list."
+    msg_warn "  If it is ever banned the site goes down for every visitor."
+    msg_warn "  Add it with: wp-hardening.sh crowdsec-whitelist add ${PROXY_IP}"
+  fi
+fi
+while [[ -z "$CROWDSEC_WHITELIST" ]]; do
   if [[ -n "$_CS_DEFAULT" ]]; then
     read -rp "  Never-ban addresses, comma-separated [${_CS_DEFAULT}] : " _CSW
     _CSW="${_CSW:-$_CS_DEFAULT}"
@@ -750,6 +1254,74 @@ while :; do
   break
 done
 unset _CSW _CS_DEFAULT _bad _clean _e _oldIFS
+
+# The one omission worth a second look. Offered as the default above, so
+# leaving it out took a deliberate edit — which is sometimes right, and is
+# worth confirming either way rather than noticing in an outage.
+if [[ -n "$PROXY_IP" && -n "$CROWDSEC_WHITELIST" ]] \
+   && ! printf '%s' ",${CROWDSEC_WHITELIST}," | grep -qF ",${PROXY_IP},"; then
+  echo ""
+  msg_warn "The proxy (${PROXY_IP}) is not in that list."
+  msg_warn "  Defensible if the proxy's own engine whitelists itself, or if you"
+  msg_warn "  want to know immediately when XFF substitution breaks."
+  msg_warn "  The cost if it is banned: the site is down for every visitor, and"
+  [[ "$CS_ENFORCEMENT" == "upstream" ]] \
+    && msg_warn "  behind a central LAPI that is every site, not just this one." \
+    || msg_warn "  recovery is from the Proxmox console."
+  read -rp "  Add ${PROXY_IP} to the whitelist? [Y/n] : " _CSP
+  case "${_CSP:-y}" in
+    n|N) msg_ok "Left out, deliberately." ;;
+    *)   CROWDSEC_WHITELIST="${PROXY_IP},${CROWDSEC_WHITELIST}"
+         msg_ok "CrowdSec will never ban: ${CROWDSEC_WHITELIST}" ;;
+  esac
+  unset _CSP
+fi
+
+# A whitelist here governs only what THIS engine proposes. Said explicitly
+# because "I whitelisted my address" is a reasonable thing to believe covers
+# you, and in a multi-engine deployment it does not.
+if [[ "$CS_ENFORCEMENT" == "upstream" && -n "$CROWDSEC_WHITELIST" ]]; then
+  echo ""
+  echo -e "  ${BLD}This covers what THIS VM proposes — and nothing else.${CL}"
+  echo -e "  ${YW}  The engine on the proxy reads its own logs. The one on the${CL}"
+  echo -e "  ${YW}  firewall reads SSH and GUI auth failures. Neither consults${CL}"
+  echo -e "  ${YW}  this file, so either can ban you while this VM never proposed${CL}"
+  echo -e "  ${YW}  it. Fumbling an SSH password on the firewall is the usual way.${CL}"
+  echo ""
+  echo -e "  ${YW}  Put the same addresses on each enforcing engine, as a${CL}"
+  echo -e "  ${YW}  postoverflow — there, not as a parser whitelist:${CL}"
+  echo ""
+  echo -e "  ${BL}    /etc/crowdsec/postoverflows/s01-whitelist/trusted.yaml${CL}"
+  echo -e "  ${BL}    name: trusted-management${CL}"
+  echo -e "  ${BL}    description: \"Never ban management sources\"${CL}"
+  echo -e "  ${BL}    whitelist:${CL}"
+  echo -e "  ${BL}      reason: \"trusted management\"${CL}"
+  _oldIFS="$IFS"; IFS=','
+  _wl_ip=""; _wl_cidr=""
+  for _e in $CROWDSEC_WHITELIST; do
+    IFS="$_oldIFS"
+    case "$_e" in
+      */*) _wl_cidr="${_wl_cidr} ${_e}" ;;
+      ?*)  _wl_ip="${_wl_ip} ${_e}" ;;
+    esac
+    IFS=','
+  done
+  IFS="$_oldIFS"
+  if [[ -n "$_wl_ip" ]]; then
+    echo -e "  ${BL}      ip:${CL}"
+    for _e in $_wl_ip; do echo -e "  ${BL}        - \"${_e}\"${CL}"; done
+  fi
+  if [[ -n "$_wl_cidr" ]]; then
+    echo -e "  ${BL}      cidr:${CL}"
+    for _e in $_wl_cidr; do echo -e "  ${BL}        - \"${_e}\"${CL}"; done
+  fi
+  echo ""
+  echo -e "  ${YW}  Do that BEFORE enabling the bouncer there. A false positive on${CL}"
+  echo -e "  ${YW}  your own source address while you are administering a remote${CL}"
+  echo -e "  ${YW}  site locks you out of the thing you would fix it with.${CL}"
+  echo -e "  ${YW}  This block is in the install log if you need it again.${CL}"
+  unset _wl_ip _wl_cidr _e _oldIFS
+fi
 
 # ── Outbound (egress) firewall ────────────────────────────────────────────────
 echo ""
@@ -1002,6 +1574,57 @@ if [[ -n "$WP_DOMAIN" ]]; then
     msg_warn "  but this VM only serves plain HTTP on port 80. Make sure whatever"
     msg_warn "  fronts it terminates TLS, or the site will not load correctly."
   fi
+fi
+
+# ── Loopback path for a split-horizon name ────────────────────────────────────
+# Asked HERE, not with the other proxy questions, because it needs WP_DOMAIN
+# and that is not known until the block above.
+#
+# WordPress calls its own public hostname for WP-Cron, Site Health and parts of
+# the REST API. Behind a proxy with split-horizon DNS that name resolves to the
+# proxy, so the call leaves this VM, crosses a segment boundary, and needs a
+# firewall rule permitting this segment -> proxy on 80/443. Where that rule is
+# absent the call is dropped and the symptom is "scheduled posts stopped",
+# which names neither DNS nor the firewall.
+#
+# A hosts entry keeps the call inside the VM and removes the dependency
+# entirely. The cost is real and worth stating: loopback then no longer
+# exercises the proxy path, so a broken vhost or certificate stops showing up
+# in Site Health. Pick one deliberately -- doing both and forgetting which is
+# load-bearing is how this becomes unexplainable later.
+LOOPBACK_HOSTS=0
+case "${WASP_LOOPBACK_HOSTS:-}" in
+  1|y|Y|yes) LOOPBACK_HOSTS=1; _LB_PRESET=1 ;;
+  0|n|N|no)  LOOPBACK_HOSTS=0; _LB_PRESET=1 ;;
+  *)         _LB_PRESET=0 ;;
+esac
+if [[ "$_LB_PRESET" -eq 1 && -n "$WP_DOMAIN" ]]; then
+  [[ "$LOOPBACK_HOSTS" -eq 1 ]] \
+    && msg_ok "Loopback from WASP_LOOPBACK_HOSTS: ${WP_DOMAIN} → 127.0.0.1" \
+    || msg_ok "Loopback from WASP_LOOPBACK_HOSTS: out via the proxy"
+elif [[ -n "$PROXY_IP" && -n "$WP_DOMAIN" ]]; then
+  echo ""
+  echo -e "  ${BLD}Resolve ${WP_DOMAIN} to this VM itself?${CL}"
+  _sec_head
+  echo -e "  ${YW}  WordPress calls its own hostname for WP-Cron, Site Health and${CL}"
+  echo -e "  ${YW}  some REST routes. With a hosts entry those calls stay inside${CL}"
+  echo -e "  ${YW}  this VM and cannot be broken by DNS or by a missing firewall${CL}"
+  echo -e "  ${YW}  rule between this segment and the proxy.${CL}"
+  echo -e "  ${YW}  Without one they go out to the proxy and back, which needs${CL}"
+  echo -e "  ${YW}  that path to be permitted — and when it is not, WP-Cron stops${CL}"
+  echo -e "  ${YW}  with nothing anywhere mentioning DNS or the firewall.${CL}"
+  echo -e "  ${YW}  The cost: loopback stops testing the real path, so a broken${CL}"
+  echo -e "  ${YW}  proxy host or certificate no longer surfaces in Site Health.${CL}"
+  echo -e "  ${YW}  Visitors are unaffected either way — this is internal only.${CL}"
+  read -rp "  Add the hosts entry? [y/N] : " _LBH
+  case "${_LBH:-n}" in
+    y|Y) LOOPBACK_HOSTS=1
+         msg_ok "${WP_DOMAIN} → 127.0.0.1 inside the VM"
+         msg_info "  Then you do NOT need a firewall rule for this VM → proxy on 80/443." ;;
+    *)   msg_ok "${WP_DOMAIN} resolves normally (loopback goes out through the proxy)"
+         msg_info "  Permit this VM → ${PROXY_IP} on 80/443, or WP-Cron will stop." ;;
+  esac
+  unset _LBH
 fi
 
 # The SITE TITLE prompt used to be here and has been removed. It claimed to
@@ -1920,22 +2543,40 @@ if [ "$DEPLOYMENT_PROFILE" = "production" ]; then
   # they'd chosen a profile.
   if [ "$DISABLE_PW_AUTH" != "1" ]; then
     msg_warn "  No SSH key was set, but production profile requires key-only SSH."
+    # Uses the same validated collector as the main prompt rather than its own
+    # read-and-assign. The previous version here looped until SSH_KEYS was
+    # merely NON-EMPTY, so pasting a private key satisfied the loop, exited it,
+    # and switched password auth off — a guaranteed console-only VM holding a
+    # compromised private key, reached by following the prompt. Two paths
+    # collecting the same security-critical value with different rigour is the
+    # shape that produces that; now there is one.
     while [ "$DISABLE_PW_AUTH" != "1" ]; do
-      echo "  Paste your public key (starts with ssh-ed25519 or ssh-rsa),"
-      read -rp "  or a path to a .pub file (required for production) : " _PROD_KEY_INPUT
-      if [ -n "$_PROD_KEY_INPUT" ]; then
-        if [ -f "$_PROD_KEY_INPUT" ]; then
-          SSH_KEYS=$(cat "$_PROD_KEY_INPUT")
+      echo "  Paste a public key, or a path to a .pub or authorized_keys file."
+      echo "  Add as many as you need — blank line when done."
+      while :; do
+        if [ "$_ssh_key_count" -eq 0 ]; then
+          read -rp "  Key or file path (required for production) : " _PROD_KEY_INPUT
         else
-          SSH_KEYS="$_PROD_KEY_INPUT"
+          read -rp "  Another key or path (blank = done) : " _PROD_KEY_INPUT
         fi
-      fi
-      if [ -n "$SSH_KEYS" ]; then
+        [ -z "$_PROD_KEY_INPUT" ] && break
+        if [[ "$_PROD_KEY_INPUT" != *" "* \
+              && ( "$_PROD_KEY_INPUT" == /* || "$_PROD_KEY_INPUT" == ~* \
+                   || "$_PROD_KEY_INPUT" == ./* || -f "$_PROD_KEY_INPUT" ) ]]; then
+          _load_ssh_key_file "$_PROD_KEY_INPUT"
+        else
+          _add_ssh_key "$_PROD_KEY_INPUT" "pasted"
+        fi
+      done
+      if [ "$_ssh_key_count" -gt 0 ]; then
         DISABLE_PW_AUTH=1
         ADMIN_PASS=$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 24)
-        msg_ok "  SSH key set — password login disabled for ${ADMIN_USER}."
+        msg_ok "  ${_ssh_key_count} SSH key(s) set — password login disabled for ${ADMIN_USER}."
       else
-        msg_warn "  Still no key. Production profile can't proceed with password-only SSH."
+        msg_warn "  Still no usable key. Production profile cannot proceed with"
+        msg_warn "  password-only SSH. Generate one on your workstation:"
+        msg_warn "      ssh-keygen -t ed25519 -f ~/.ssh/wasp_ed25519"
+        msg_warn "  then paste the contents of ~/.ssh/wasp_ed25519.pub"
       fi
     done
   fi
@@ -1968,6 +2609,20 @@ printf  "  %-18s nft SSH=%-15s  nft Web=%s\n"   "L1 Firewall:"  "${SSH_CIDR:-any
 printf  "  %-18s admin-cidr=%-18s  allowed-ip=%s\n" "L2 wp-admin:" "${ADMIN_CIDR:-none}" "${ALLOWED_ADMIN_IP:-none}"
 printf  "  %-18s %s\n"  "Site address:" "$([[ -n "$WP_DOMAIN" ]] && echo "${WP_SCHEME}://${WP_DOMAIN}" || echo "(none — will use the VM IP)")"
 printf  "  %-18s %s\n"  "Proxy IP:"    "${PROXY_IP:-direct (no proxy)}"
+# Printed whenever a proxy is configured, because "CrowdSec: yes" on its own is
+# the misleading half of the truth -- the question that decides whether an
+# attacker is actually stopped is WHERE the ban is enforced, not whether the
+# engine is running. Said here, before the build starts, where it can still be
+# changed.
+if [[ -n "$PROXY_IP" ]]; then
+  printf  "  %-18s %s\n"  "CS enforcement:" "$(
+    case "$CS_ENFORCEMENT" in
+      upstream)    printf 'upstream — detect here, block at %s' "${CS_LAPI_URL:-(LAPI not set yet)}" ;;
+      detect-only) printf 'NONE — detection only, by declaration' ;;
+      *)           printf 'local bouncer (refused under production)' ;;
+    esac)"
+  printf  "  %-18s %s\n"  "Loopback:" "$([[ "$LOOPBACK_HOSTS" = "1" ]] && printf '%s → 127.0.0.1 (hosts entry)' "$WP_DOMAIN" || printf 'out via the proxy — needs a path on 80/443')"
+fi
 # Was: "${WP_ADMIN_SLUG:+/${WP_ADMIN_SLUG} (custom)}${WP_ADMIN_SLUG:-/wp-admin (default)}"
 # Two bugs in one line. `${V:+X}${V:-Y}` looks like an if/else but is not:
 # when V is set, `:+` yields X *and* `:-` yields V itself, so the value got

@@ -8,6 +8,30 @@
 echo "$HN" > "$MNT/etc/hostname"
 grep -q "$HN" "$MNT/etc/hosts" 2>/dev/null || echo "127.0.1.1  $HN" >> "$MNT/etc/hosts"
 
+# ─ Split-horizon loopback (optional; lib/01 asks) ─────────────────────────────
+# Behind a reverse proxy with split-horizon DNS, the site's own name resolves to
+# the proxy. WordPress calls that name for WP-Cron, Site Health and parts of the
+# REST API, so those calls leave the VM and need a permitted path back to the
+# proxy on 80/443. Where the segment is firewalled east-west -- which is the
+# point of putting each site on its own VLAN -- that path does not exist by
+# default, the calls are dropped, and the operator sees "scheduled posts
+# stopped" with nothing naming DNS or the firewall.
+#
+# This entry keeps the call inside the VM. Written here, before first boot, so
+# WP-Cron works on day one rather than after someone correlates two unrelated
+# symptoms. The trade-off (loopback no longer exercises the real proxy path) is
+# stated at the prompt, not buried here.
+#
+# Both names: the bare domain and www. A hosts entry for one does nothing for
+# the other, and which one WordPress calls depends on siteurl, which is set
+# later in the browser wizard and is not knowable here.
+if [[ "${LOOPBACK_HOSTS:-0}" = "1" && -n "${WP_DOMAIN:-}" ]]; then
+  if ! grep -q "[[:space:]]${WP_DOMAIN}\$" "$MNT/etc/hosts" 2>/dev/null; then
+    printf '127.0.0.1  %s www.%s\n' "$WP_DOMAIN" "${WP_DOMAIN#www.}" >> "$MNT/etc/hosts"
+    msg_ok "Loopback: ${WP_DOMAIN} → 127.0.0.1 (WP-Cron needs no path to the proxy)"
+  fi
+fi
+
 # ─ SSH hardening ──────────────────────────────────────────────────────────────
 SSHCFG="$MNT/etc/ssh/sshd_config"; mkdir -p "$MNT/etc/ssh"
 [[ $DISABLE_PW_AUTH -eq 1 ]] && _PWAUTH="no" || _PWAUTH="yes"
@@ -27,11 +51,55 @@ if [[ "$ADMIN_USER_CREATED" -eq 1 ]]; then
   ADMIN_HASHED=$(openssl passwd -6 "$ADMIN_PASS")
   sed -i "s|^${ADMIN_USER}:[^:]*:|${ADMIN_USER}:${ADMIN_HASHED}:|" "$MNT/etc/shadow"
   if [[ -n "$SSH_KEYS" ]]; then
+    # Re-validated here, at the point of use, rather than trusted from the
+    # prompt that collected it — the same reasoning as the TRUST-COUNT
+    # assertions in lib/03 and lib/06. lib/01 validates every key it accepts,
+    # so in the normal path this changes nothing. It exists because this is the
+    # only place the value becomes a login decision, and because password auth
+    # is switched off on the strength of this file: a future preset path, an
+    # answer file, or an edit to lib/01 that loosened a check would reach this
+    # line without having passed one.
+    #
+    # Written line by line rather than as one blob so a single bad line is
+    # dropped instead of poisoning the file, and so the count that goes into
+    # the install log is the count that is actually on disk.
     mkdir -p "$MNT/home/${ADMIN_USER}/.ssh"
-    echo "$SSH_KEYS" > "$MNT/home/${ADMIN_USER}/.ssh/authorized_keys"
+    _AK="$MNT/home/${ADMIN_USER}/.ssh/authorized_keys"
+    : > "$_AK"
+    _written=0; _skipped=0
+    while IFS= read -r _kl || [[ -n "$_kl" ]]; do
+      [[ -z "$_kl" ]] && continue
+      case "$(_ssh_key_kind "$_kl")" in
+        ok) printf '%s\n' "$_kl" >> "$_AK"; _written=$((_written+1)) ;;
+        private)
+          # Refused rather than written, even this late. A private key in
+          # authorized_keys gives no login AND leaves the private half on the
+          # VM's disk; dropping the line keeps at least the second from being
+          # true of a file we created.
+          msg_warn "A PRIVATE key reached the key-injection stage and was NOT written."
+          msg_warn "  Treat that keypair as compromised and generate a new one."
+          _skipped=$((_skipped+1)) ;;
+        *) msg_warn "Unusable SSH key line skipped: $(printf '%.40s' "$_kl")…"
+           _skipped=$((_skipped+1)) ;;
+      esac
+    done <<< "$SSH_KEYS"
     chmod 700 "$MNT/home/${ADMIN_USER}/.ssh"
-    chmod 600 "$MNT/home/${ADMIN_USER}/.ssh/authorized_keys"
+    chmod 600 "$_AK"
     chown -R "${ADMIN_UID}:${ADMIN_GID}" "$MNT/home/${ADMIN_USER}"
+
+    # Nothing usable, with password auth about to be off, is a VM that cannot
+    # be reached over the network at all. Refuse to build it rather than hand
+    # back something only the Proxmox console can rescue.
+    if [[ "$_written" -eq 0 ]]; then
+      msg_warn "No usable SSH key was written to authorized_keys, and password"
+      msg_warn "  authentication is disabled for this VM. It would come up with"
+      msg_warn "  no network login path at all — reachable only from the"
+      msg_warn "  Proxmox console via 'qm terminal ${VMID}'."
+      msg_error "Refusing to build a VM with no way in. Re-run and supply a valid public key."
+    fi
+    msg_ok "authorized_keys written: ${_written} key(s)$([[ "$_skipped" -gt 0 ]] && printf ', %s skipped' "$_skipped")"
+    [[ "$_written" -gt 1 ]] && msg_info "  Any of the ${_written} can log in; each is equally privileged."
+    unset _AK _kl _written _skipped
   fi
 else
   # FALLBACK — should be rare, adduser is a simple local-filesystem

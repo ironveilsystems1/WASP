@@ -50,6 +50,83 @@ msg_ok()    { echo -e "  ${GN}✔${CL}  $*"; }
 msg_warn()  { echo -e "  ${YW}⚠${CL}  $*"; }
 msg_error() { echo -e "  ${RD}✗${CL}  $*" >&2; exit 1; }
 
+# ── SSH public-key classification ────────────────────────────────────────────
+# Defined here, in the first file sourced, because two places need it and they
+# must agree: lib/01 collects keys and lib/05 writes them to authorized_keys.
+# A validator that runs only at the prompt is a validator a preset path skips.
+#
+# WHY VALIDATE AT ALL
+#
+# When any key is supplied, password authentication is switched OFF for the
+# whole VM. So an unusable authorized_keys is not a degraded login — it is a
+# VM with no network access at all, recoverable only from the Proxmox console.
+# The prompt has always said "NEVER paste the private half"; nothing enforced
+# it, which makes it advice rather than a control.
+#
+# Pasting a private key is the case worth refusing loudly rather than merely
+# rejecting. It fails three ways at once: sshd ignores the line so there is no
+# login, password auth is already off so there is no fallback, and the private
+# key is now sitting on the VM's disk and in the install log. The first two are
+# an outage; the third means generating a new keypair, not fixing a typo.
+#
+# Returns one of: ok | private | fingerprint | pubkey-file-missing | unknown
+_ssh_key_kind() {
+  local line="$1" body type
+  # Strip an options prefix if present. `restrict,from="10.0.0.0/8" ssh-ed25519
+  # AAAA... user@host` is a legitimate and useful authorized_keys line, so it
+  # must be accepted — but the type has to be found after the options, not at
+  # the start of the line.
+  body=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
+  case "$body" in
+    "") printf 'empty'; return 0 ;;
+    \#*) printf 'comment'; return 0 ;;
+    -----BEGIN*PRIVATE\ KEY-----*|*PRIVATE\ KEY-----*)
+      printf 'private'; return 0 ;;
+    SHA256:*|MD5:*|*:*:*:*:*:*)
+      # `ssh-keygen -l` output, or a fingerprint copied from a UI. Looks
+      # key-shaped to a human and is not a key.
+      printf 'fingerprint'; return 0 ;;
+  esac
+  # Find the first field that is a known key type; everything before it is
+  # options. Note sk-* are FIDO/U2F resident keys and are entirely valid here.
+  type=$(printf '%s' "$body" | tr ' \t' '\n\n' | grep -m1 -xE \
+    'ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com')
+  if [ -z "$type" ]; then printf 'unknown'; return 0; fi
+  # The field after the type must be a base64 blob of plausible length. A
+  # truncated paste — the single most common real failure, from a terminal
+  # that wrapped or a selection that missed the end — is caught here and
+  # nowhere else: sshd simply ignores the malformed line.
+  local blob
+  blob=$(printf '%s' "$body" | tr ' \t' '\n\n' | grep -A1 -xF "$type" | tail -1)
+  case "$blob" in
+    AAAA*) : ;;
+    *) printf 'unknown'; return 0 ;;
+  esac
+  [ "${#blob}" -lt 60 ] && { printf 'unknown'; return 0; }
+  printf '%s' "$blob" | grep -qE '^[A-Za-z0-9+/]+=*$' || { printf 'unknown'; return 0; }
+  printf 'ok'
+}
+
+# The base64 blob alone, which is the key's identity. Used for de-duplication:
+# the same key pasted twice with different comments is one key, and two entries
+# for it in authorized_keys is clutter that makes a real review harder.
+_ssh_key_blob() {
+  printf '%s' "$1" | tr ' \t' '\n\n' | grep -m1 -E '^AAAA[A-Za-z0-9+/]+=*$'
+}
+
+# A short human label so the operator can recognise what they pasted before
+# committing to key-only login. Uses ssh-keygen when it is present (it is, on
+# any Proxmox host — openssh-client is a dependency of the GUI's console) and
+# degrades to type plus comment rather than failing.
+_ssh_key_label() {
+  local line="$1" fp
+  if command -v ssh-keygen >/dev/null 2>&1; then
+    fp=$(printf '%s\n' "$line" | ssh-keygen -l -f /dev/stdin 2>/dev/null | head -1)
+    [ -n "$fp" ] && { printf '%s' "$fp"; return 0; }
+  fi
+  printf '%s' "$(printf '%s' "$line" | awk '{print $1, $NF}')"
+}
+
 # ── VM sizing ─────────────────────────────────────────────────────────────────
 _next_vmid() { pvesh get /cluster/nextid 2>/dev/null | tr -d '"' || echo 100; }
 VMID=""

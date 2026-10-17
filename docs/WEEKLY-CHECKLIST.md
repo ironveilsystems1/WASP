@@ -27,6 +27,9 @@ Ticket/Change #: ______________  Build on VM: ___________________
       — `doas wp-plugins.sh core-version` shows files AND image agreeing
 - [ ] Alpine updates reviewed; reboot scheduled if the kernel changed
 - [ ] Container image digests current — `doas update.sh digest-check`
+      *(detects a pinned tag being re-published, not a new release)*
+- [ ] Upstream currency — `doas update.sh upstream`
+      *(detects a newer version existing; the other question entirely)*
 
 ## WordPress and plugins
 

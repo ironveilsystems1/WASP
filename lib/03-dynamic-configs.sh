@@ -538,7 +538,20 @@ else
 fi
 
 # Build mod_remoteip block (only if PROXY_IP was set)
+#
+# TRUST-COUNT contract, second write site. lib/06 asserts the same thing before
+# it writes wp-remoteip.conf; this file writes the SAME directive into
+# wp-security.conf, and a check that only guards one of two paths is not a
+# guard. See the long note in lib/06 for why a range is an authentication
+# bypass rather than a style preference.
 if [[ -n "$PROXY_IP" ]]; then
+  case "$PROXY_IP" in
+    */*|*,*|*[[:space:]]*)
+      msg_warn "RemoteIPTrustedProxy takes one literal address. A range lets any"
+      msg_warn "  host inside it forge the client IP that CrowdSec bans and that"
+      msg_warn "  the wp-admin restriction allows."
+      msg_error "PROXY_IP is '${PROXY_IP}' — expected a single IPv4 address." ;;
+  esac
   # v7-14: the dual-IP verification log is only meaningful behind a proxy —
   # see the long note at its emission point in APACHE_SECURITY_CONF below.
   REMOTEIP_DEBUG_LOG=$(cat << 'RIDEBUG'
