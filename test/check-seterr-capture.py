@@ -38,6 +38,38 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # assignment from $( ), then `; _rc=$?` on the SAME line, with no || guard.
 BAD_RE = re.compile(r"^[^#\n]*?[A-Za-z_][A-Za-z0-9_]*=\$\([^\n]*\)\s*;\s*[A-Za-z_][A-Za-z0-9_]*=\$\?")
 
+# ── A SECOND SHAPE, DELIBERATELY NOT AUTOMATED ───────────────────────────────
+#
+# This one shipped in wasp-sign-release.sh:
+#
+#     TRUSTED="... $([ -d .git ] && printf ' — %s' "$(git rev-parse ...)")"
+#
+# When .git is absent the substitution's last command is the failed test, so
+# under `set -e` the ASSIGNMENT exits 1 and the script dies — having printed
+# the line before it and nothing else. Harder to diagnose than a crash: no
+# error, no output, and the command the operator was waiting on never ran. It
+# read as a hung passphrase prompt.
+#
+# A rule for it WAS written and then removed, because it cannot be done with a
+# line regex. Flagging "an assignment whose $( ) contains && or || without a
+# fallback" produced nine false positives on correct code in this tree:
+#
+#   * `awk '$1>=a && $1<=b'`        — && inside awk PROGRAM TEXT, not shell
+#   * `sed 's|^\./||'`              — the sed delimiters read as ||
+#   * `_x=$(cmd) || _x=0`           — a trailing guard the pattern cannot see
+#   * `$(date ... || date ...)`     — a fallback that is not true/:/echo
+#
+# Shell operators are not distinguishable from quoted program text by a
+# per-line pattern, and a check that is wrong nine times out of ten gets
+# suppressed or makes the suite permanently red. Both are worse than a comment.
+#
+# So: no rule. The shape is recorded here for review, and the symptom to
+# recognise is a `set -e` script that stops after printing one line, with no
+# error — look at the assignment immediately after that line.
+#
+# What DID change: tools/ is now in the scanned set (see main()), because that
+# is where this bug lived and the check could not see the file at all.
+
 
 def scan(paths):
     problems = []
@@ -63,6 +95,7 @@ def self_test():
         comment = os.path.join(d, "c.sh")
         open(comment, "w").write("# _out=$(cmd); _rc=$?\n")
         assert not scan([comment]), "self-test: commented example flagged"
+
     return True
 
 
@@ -71,6 +104,15 @@ def main():
     files = sorted(
         glob.glob(os.path.join(REPO, "payload", "**", "*.sh"), recursive=True)
         + glob.glob(os.path.join(REPO, "lib", "*.sh"))
+        # tools/ added after a `set -e` capture bug shipped in
+        # wasp-sign-release.sh and this check could not see it. These run as
+        # root on the Proxmox host and use `set -euo pipefail`, which is
+        # exactly the condition that makes an unguarded capture fatal — the
+        # script stops with no error and no output, which is harder to
+        # diagnose than a crash. Excluded from check-doas-prefix.py for a
+        # different and still-correct reason (Proxmox uses sudo, not doas);
+        # that exclusion is not a reason to exclude them here.
+        + glob.glob(os.path.join(REPO, "tools", "*.sh"))
         + [os.path.join(REPO, "install.sh")]
     )
     files = [f for f in files if os.path.exists(f)]

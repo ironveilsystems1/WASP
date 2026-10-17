@@ -5,7 +5,18 @@ import glob, re, sys
 # suspicious when the continuation is NOT a legitimate operator continuation
 # (`&& \`, `|| \`, `| \`), which is idiomatic and correct.
 OP_END = re.compile(r'(&&|\|\||\||;)\s*\\$')
-STATEMENT = re.compile(r'^\s*(\}|\{|mkdir\b|chmod\b|chown\b|install\b|cat\b|rm\b|cp\b)')
+# The command names are matched with a following space or end-of-line, not a
+# bare \b. `\b` treats a dot as a word boundary, so `install\b` also matched
+# the FILENAME `install.sh` — which in this repo is the single most-referenced
+# path, and appears legitimately as the argument of a continued command:
+#
+#     sed "s|...|...|" \
+#       install.sh > "$tmp"
+#
+# That is correct shell and was reported as a split command. A check that
+# misfires on the most common filename in the tree is one people start
+# ignoring, so the pattern now requires the name to be the command.
+STATEMENT = re.compile(r'^\s*(\}|\{|(mkdir|chmod|chown|install|cat|rm|cp)(\s|$))')
 problems = []
 for f in sorted(set(glob.glob('**/*.sh', recursive=True)) | {'install.sh'}):
     try: lines = open(f, errors='replace').read().split('\n')

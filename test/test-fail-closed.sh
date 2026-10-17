@@ -251,6 +251,152 @@ _t6c() { local prof="$1" ep="$2" blocked=0
 # This is the drift the header warns about, and it needs closing rather than
 # noting. Each fail-closed path is asserted to be present at its call site, so
 echo ""
+echo "── Install-time topology validation"
+# From the melroseparkfire install: every prompt answered, disk image built,
+# whole payload injected, then dead at VM creation on
+#   storage 'local-vm' does not exist
+# Three faults lined up to make a one-character typo cost a full run: the
+# storage list printed NOTHING (awk read $2 for Status, but pvesm's columns are
+# Name Type Status Total — so $2 is the type and never equals "active"), the
+# default was hardcoded regardless of the host, and the answer was never
+# checked against reality.
+_t0="$(mktemp)"
+python3 - "$REPO/lib/00-preflight.sh" > "$_t0" <<'PYX'
+import re, sys
+src = open(sys.argv[1]).read().split('\n')
+want = {'_pve_storages','_storage_exists','_pve_bridges','_bridge_exists',
+        '_bridge_is_vlan_aware','_guest_net_lines','_vlan_tags_in_use',
+        '_vlan_tag_in_use','_guest_addrs_in_use','_addr_in_use'}
+out, i = [], 0
+while i < len(src):
+    m = re.match(r'^(_[a-z_]+)\(\)\s*\{', src[i])
+    if m and m.group(1) in want:
+        d = src[i].count('{') - src[i].count('}'); out.append(src[i]); i += 1
+        while i < len(src) and d > 0:
+            d += src[i].count('{') - src[i].count('}'); out.append(src[i]); i += 1
+        continue
+    i += 1
+print('\n'.join(out))
+PYX
+if [ -s "$_t0" ]; then
+  # Driven with tispve's real `pvesm status` column layout.
+  _stor() { ( . "$_t0"
+    pvesm(){ printf 'Name Type Status Total Used Avail %%\nlocal dir active 9 4 8 4%%\nlocal-lvm lvmthin active 1 0 1 0%%\n'; }
+    _storage_exists "$1" ); }
+  _stor local-lvm \
+    && _p "a real storage name validates" \
+    || _f "a real storage was rejected" "the column parsing is wrong again"
+  _stor local-vm \
+    && _f "'local-vm' was accepted" \
+          "this exact typo cost a full install run, 15 minutes in" \
+    || _p "the 'local-vm' typo is refused at the prompt"
+  _nstor=$( . "$_t0"
+    pvesm(){ printf 'Name Type Status Total Used Avail %%\nlocal dir active 9 4 8 4%%\nlocal-lvm lvmthin active 1 0 1 0%%\n'; }
+    _pve_storages | grep -c . )
+  [ "${_nstor:-0}" -eq 2 ] \
+    && _p "the storage list is populated (it printed nothing before)" \
+    || _f "the storage list is empty" \
+          "pvesm columns are Name Type Status Total — Status is \$3, not \$2"
+
+  # VLAN tag and address collisions, read from guest configs.
+  _tags=$( . "$_t0"
+    qm(){ case "$1" in list) printf 'VMID NAME ST\n100 opn running\n';; config) printf 'net0: virtio=AA,bridge=vmbr1\n';; esac; }
+    pct(){ case "$1" in list) printf 'VMID Status Lock Name\n200 running npm\n';; config) printf 'net0: name=eth0,bridge=vmbr1,ip=10.20.10.10/24,tag=10,type=veth\n';; esac; }
+    _vlan_tags_in_use | tr '\n' ' ' )
+  [ "${_tags% }" = "10" ] \
+    && _p "VLAN tags in use are read from guest configs" \
+    || _f "tag collection is wrong (got '${_tags}')" ""
+  _au=$( . "$_t0"
+    qm(){ case "$1" in list) printf 'VMID NAME ST\n';; esac; }
+    pct(){ case "$1" in list) printf 'VMID Status Lock Name\n200 running npm\n';; config) printf 'net0: name=eth0,bridge=vmbr1,ip=10.20.10.10/24,tag=10,type=veth\n';; esac; }
+    _addr_in_use 10.20.10.10 && echo yes || echo no )
+  [ "$_au" = "yes" ] \
+    && _p "an address another guest holds is detected" \
+    || _f "an in-use address was not detected" "two hosts on one address is an ARP conflict"
+else
+  _f "the topology predicates are missing from lib/00" \
+     "the installer cannot validate storage, bridge, VLAN or address answers"
+fi
+rm -f "$_t0"
+
+echo ""
+echo "── Generated nftables syntax"
+# From the melroseparkfire install (tispve, 2026-10-17). ALLOWED_ADMIN_IP is
+# SPACE-separated (Apache's `Require ip` takes that natively); WEB_CIDR and
+# SSH_CIDR become nftables SET ELEMENTS, which are comma-separated. The two
+# were joined with a bare comma, so a two-address admin list produced a space
+# inside an nft set — a syntax error that fails the WHOLE ruleset, leaving the
+# VM with no packet filter at all.
+#
+# The install aborted earlier on an unrelated storage typo, so this never
+# reached a running VM. It would have.
+if command -v nft >/dev/null 2>&1; then
+  _nftok() {   # does this saddr value produce a loadable ruleset?
+    local v="$1" f; f=$(mktemp)
+    printf 'table inet t {\n chain c {\n  type filter hook input priority 0; policy drop;\n  ip saddr { %s } tcp dport 22 accept\n }\n}\n' "$v" > "$f"
+    if nft -c -f "$f" >/dev/null 2>&1; then rm -f "$f"; return 0; fi
+    rm -f "$f"; return 1
+  }
+  _nftok '10.20.10.10,10.0.0.4/24,98.206.9.121 100.87.54.172' \
+    && _f "a space inside an nft set was accepted by this test" \
+          "the test is wrong, not the code" \
+    || _p "a space inside an nft set is rejected by nft (the original defect)"
+  _nftok '10.20.10.10,10.0.0.4/24,98.206.9.121,100.87.54.172' \
+    && _p "the normalised comma list loads" \
+    || _f "the normalised list does not load" "_csv is producing something nft rejects"
+else
+  _p "nft not installed — set-syntax cases skipped (logic cases below still run)"
+fi
+
+# The normaliser itself, driven through the real function.
+_c0="$(mktemp)"; sed -n '/^_csv()/,/^}/p' "$REPO/lib/00-preflight.sh" > "$_c0"
+if [ -s "$_c0" ]; then
+  _csvq() { ( . "$_c0"; _csv "$1" ); }
+  [ "$(_csvq '10.0.0.4/24,98.206.9.121 100.87.54.172')" = "10.0.0.4/24,98.206.9.121,100.87.54.172" ] \
+    && _p "_csv normalises a mixed comma/space list" \
+    || _f "_csv did not normalise the list that broke the ruleset" ""
+  [ -z "$(_csvq '')" ] && _p "_csv on empty yields empty" || _f "_csv invented a value from nothing" ""
+else
+  _f "_csv is missing from lib/00" "the list conventions have nothing converting between them"
+fi
+rm -f "$_c0"
+
+# Both set-valued rules must be braced, or a list is a syntax error again.
+if grep -qE 'SSH_RULE="ip saddr \{ \$\{SSH_CIDR\} \}' "$REPO/lib/03-dynamic-configs.sh"; then
+  _p "the SSH rule braces its CIDR list"
+else
+  _f "the SSH rule is unbraced" "ip saddr a,b is a syntax error; the whole ruleset fails"
+fi
+if grep -cE 'ip saddr \{ \$\{WEB_CIDR\}' "$REPO/lib/03-dynamic-configs.sh" >/dev/null \
+   && ! grep -qE 'ip saddr \$\{WEB_CIDR\}' "$REPO/lib/03-dynamic-configs.sh"; then
+  _p "no unbraced WEB_CIDR rule remains"
+else
+  _f "an unbraced WEB_CIDR rule remains" "WEB_CIDR is built as a comma list in lib/01"
+fi
+
+echo ""
+echo "── Login slug template"
+# The sed that reads this template used ${SCRIPT_DIR}, which is assigned
+# NOWHERE. It expanded empty, sed failed, the command substitution yielded
+# nothing, and the next line printed a green tick.
+#
+# The two rules in that template are the only thing setting E=WPVM_SLUG:1, and
+# the generated config 403s /wp-login.php without it — so the VM would have had
+# the slug 404ing AND wp-login 403ing. No login path at all, reported as
+# configured.
+_tmpl="$REPO/payload/templates/slug-rewrite.rules"
+[ -r "$_tmpl" ] \
+  && _p "the slug rewrite template ships" \
+  || _f "payload/templates/slug-rewrite.rules is missing" \
+        "the generated config would 404 the slug and 403 wp-login.php"
+grep -q 'E=WPVM_SLUG:1' "$_tmpl" 2>/dev/null \
+  && _p "the template sets the env var the wp-login block tests" \
+  || _f "the template no longer sets WPVM_SLUG" \
+        "the 403 on /wp-login.php would then have no way to be satisfied"
+# (the three "does the shipped code still do this" assertions are in the
+#  guards section at the end — _guard is defined there)
+
+echo ""
 echo "── SSH public keys"
 # Supplying any key switches password authentication OFF for the whole VM, so
 # an unusable authorized_keys is not a degraded login — it is a VM with no
@@ -489,6 +635,12 @@ _guard "lib/05 refuses to build a VM with no usable key" \
   "lib/05-ssh-and-network-inject.sh" "Refusing to build a VM with no way in"
 _guard "install.sh refuses a private key in the preset file" \
   "install.sh" "contains a PRIVATE key"
+_guard "lib/03 reads the template from REPO_DIR, not an unset name" \
+  "lib/03-dynamic-configs.sh" 'REPO_DIR}/payload/templates/slug-rewrite.rules'
+_guard "a missing slug template stops the install" \
+  "lib/03-dynamic-configs.sh" "Cannot read \${_slug_tmpl}"
+_guard "an empty substitution stops the install" \
+  "lib/03-dynamic-configs.sh" "produced no rules"
 # The production gate must not abort mid-stage: that strands the operator
 # without stage 10's diagnostic tooling, which this stage already taught once.
 if grep -nE '^\s*err "cs-firewall-bouncer' "$REPO/payload/stages/09-crowdsec-and-backup.sh" >/dev/null 2>&1; then
