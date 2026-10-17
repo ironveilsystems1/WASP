@@ -6,6 +6,989 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — fetching a site from someone else's hosting
+
+**[docs/IMPORT-FETCH.md](docs/IMPORT-FETCH.md)** — pulling a WordPress site off
+a web designer's host, a client's old provider, or anywhere you did not build,
+by object storage, URL or SFTP. It answers open question 4 of
+`IMPORT-DESIGN.md` ("where does the operator put the archive?").
+
+The thing worth reading first is which firewall is in the way, because the
+common failure is adjusting the wrong one and watching the fetch keep failing:
+
+- the **Squid allowlist** (`EGRESS_PROXY=1`) governs the **containers** —
+  WordPress itself. `wp-import.sh` runs on the VM's OS, so Squid never sees a
+  fetch and `wasp-egress maintenance enable` does not help.
+- **host egress** (`RESTRICT_EGRESS=1`) governs the VM's own connections, and
+  is the one that matters. It permits 443, so object storage and URL fetches
+  work unchanged; it does **not** permit 22, so SFTP needs
+  `wp-hardening.sh egress-allow 22 tcp`.
+
+Also covered: that SFTP gets files and a WordPress site is files *plus* a
+database, with what to ask for when the sender cannot run `mysqldump`; scoped
+time-limited object-storage tokens so a designer gets a drop box rather than
+your bucket credentials; and copy-pasteable instructions to send someone
+non-technical, which ask them not to send `wp-config.php` — an emailed
+`wp-config.php` is live credentials in a mailbox.
+
+### Two documented paths that could not work
+
+**`wp-import.sh where` recommended SFTP into the VM.** Option 2 told the
+operator to point FileZilla, WinSCP or Cyberduck at the VM and drag the file
+in. The installer writes `sshd_config` with no `Subsystem sftp`, so every one
+of those clients connects, authenticates, and then fails to list the directory.
+Its `scp` example was also missing `-O`, which release 10.3 fixed *everywhere
+else* — `check-tool-availability.py` scans documents, and this was a heredoc
+inside a script.
+
+The README's import section said the same thing, plus "which is group-writable
+by your admin user so SFTP works without a permissions fight" — describing a
+permissions fix for a protocol the VM does not serve.
+
+Both now say what does work, and why `-O` is required rather than stylistic.
+
+### `check-tool-availability.py` only knew about one tool
+
+It was written for the `rsync` defect and never generalised. `rclone` and
+`openssh-client` come from the **same conditional** —
+`payload/stages/08-update-tooling.sh` installs all three only for the matching
+off-site backup method — so a fetch guide was exactly the document that would
+reintroduce the defect, and it did: the first draft used `rclone ls` and `sftp`
+with the install note further down the page.
+
+Both are now listed. `scp` deliberately is **not**: in these documents it is
+almost always run on the operator's workstation, where the VM's package set is
+irrelevant, and flagging it would hit every correct example in the tree — a
+check that cries wolf on the common case is one people learn to ignore.
+
+The check also could not connect `apk add openssh-client` to `sftp`, because a
+package does not always share its binary's name. The only way to satisfy it was
+to write `apk add sftp`, which installs nothing — a check satisfiable only by a
+wrong command. A package→binaries map fixes that, with self-test cases for all
+four behaviours.
+
+---
+
+## Unreleased — multiple SSH keys
+
+The installer takes as many public keys as you want: paste one, press Enter,
+paste the next, blank line to finish. A path loads **every** key in the file,
+so `~/.ssh/authorized_keys` is a valid single answer, and `del N` removes one
+before you commit.
+
+One key per VM is the wrong shape for how these are administered — a
+workstation and a laptop, an operator and a colleague, a long-lived key and its
+replacement mid-rotation. The alternatives were sharing one private key between
+machines, or editing `authorized_keys` over an SSH session that the edit can
+break, which is how a VM becomes console-only.
+
+### Every key is now validated, and that is the bigger change
+
+Supplying any key switches password authentication off for the **whole VM**, so
+an unusable `authorized_keys` is not a degraded login — it is a VM with no
+network access, reachable only from the Proxmox console.
+
+The prompt has always said "NEVER paste the private half". Nothing enforced it,
+which made it advice rather than a control. Refused now: a private key, a
+fingerprint paste (`SHA256:…`), a truncated key — the common real failure, from
+a wrapped terminal or a selection that missed the end — prose, and unknown key
+types. Accepted: `ssh-ed25519`, `ssh-rsa`, `ssh-dss`, the three `ecdsa-sha2-*`
+curves, `sk-*` FIDO keys, and an options prefix such as
+`restrict,from="10.0.0.0/8"`, which is the way to scope one key to one source.
+The same key pasted twice with different comments is de-duplicated on the key
+itself.
+
+**The private-key case is refused loudly rather than merely rejected.** It
+fails three ways at once: `sshd` ignores the line so there is no login,
+password auth is already off so there is no fallback, and the private half is
+now on the VM's disk and in the install log. The first two are an outage; the
+third means that keypair is compromised and needs regenerating, not re-pasting.
+
+The classifier lives in `lib/00` so the two places that need it cannot
+disagree, and it is asserted at three points — the prompt, the `lib/05` write
+site, and `install.sh`'s contract preflight for the preset path. Same reasoning
+as the TRUST-COUNT assertions: a validator that runs only at the prompt is a
+validator a preset path skips.
+
+**If nothing usable survives to the write, the build is refused.** Previously
+`authorized_keys` was written as one unchecked blob; it is now written line by
+line, so one bad line is dropped instead of poisoning the file, and the count
+in the install log is the count actually on disk.
+
+### A second collector that was accepting private keys
+
+The production profile re-asks for a key when none was supplied, and had its
+own read-and-assign rather than using the main prompt's path. Its loop exited
+as soon as `SSH_KEYS` was merely **non-empty** — so pasting a private key
+satisfied the loop, exited it, and switched password authentication off on the
+strength of it. A guaranteed console-only VM holding a compromised private key,
+reached by following the prompt.
+
+Two paths collecting the same security-critical value with different rigour is
+what produces that. There is one now, and a test asserts the old assignment has
+not returned.
+
+### Presets
+
+`WASP_SSH_KEY_FILE` (a path; every key in the file) and `WASP_SSH_KEYS`
+(inline, newline-separated). `install.sh` refuses a missing or unreadable file
+before the build starts — silently loading nothing would mean falling back to a
+password or stopping to ask, neither of which is what a runbook claiming to
+preset keys says happens.
+
+### Also
+
+- 14 further fail-closed cases, each driven through the real classifier, and
+  each confirmed to fail the suite when its guard is removed.
+- A note in `test/test-fail-closed.sh` recording why the SSH "guard exists"
+  assertions sit at the end of the file: `_guard` is defined there, and calling
+  it earlier fails with `command not found` while the suite still reports a
+  pass for everything around it. Found by doing exactly that.
+
+---
+
+## Unreleased — stack groundwork
+
+Scoping work for selecting WASP, NPMplus and OPNsense at one prompt and getting
+three VMs already tuned to each other. The design is in
+**[docs/STACK-DESIGN.md](docs/STACK-DESIGN.md)**; what ships here is the one
+piece nothing else can be built without.
+
+### `tools/wasp-topology.sh`
+
+Reads a Proxmox host and proposes a stack that collides with nothing on it.
+Runs on the host, reads only, changes nothing.
+
+Every value it picks is one that fails silently when wrong, which is the whole
+argument for a command rather than a checklist: a VLAN tag reused by an
+existing guest puts two trust boundaries on one segment and both keep working;
+a colliding subnet makes a remote site invisible over an overlay because the
+directly-connected route wins; a tag on a bridge that is **not** VLAN-aware is
+accepted by Proxmox and delivered untagged, so the guest comes up on the wrong
+segment with no error anywhere.
+
+The addressing conventions are taken from `OPNSENSE.md` rather than invented,
+so a plan and a generated firewall config cannot disagree about what a tag
+means. On a clean host it reproduces the canonical layout — proxy
+`10.20.10.10`, tenant `10.20.101.10`, tags 10 and 101 — which is the layout
+Site B arrived at by hand. That agreement is the point.
+
+`--plan --vars` emits the assignments alone, with **stdout as data and stderr
+as narration**, so `eval "$(wasp-topology.sh --plan --vars)"` works. The first
+version printed the map to stdout alongside the vars and the eval failed with
+`command not found` on a line of box-drawing characters — a message naming
+neither the tool nor the cause. A machine-readable mode that is not
+machine-readable is the same shape as every other defect in this project.
+
+`--collect` writes a bundle and `--from` reads one, so a topology can be
+reviewed without granting hypervisor access, and so the tool is testable
+without a Proxmox host. Every fact is read through one source function, because
+a second collection path written for testing is a path that stops matching the
+real one and then tests the wrong thing.
+
+It refuses to overclaim: it reads Proxmox configuration and does **not** scan,
+so an appliance on a VLAN with no Proxmox guest is invisible to it. That limit
+prints with every plan, alongside the commands that check it.
+
+### `test/test-topology.sh` — 30 cases, two fixtures
+
+A segmented host modelled on a real deployment and a flat single-bridge
+homelab. Three cases are regressions for defects found while writing the tool:
+`pct list` and `qm list` do not share a column layout, so a fixed field index
+named every container "running"; loopback appeared in "subnets in use", which
+is noise in the one list an operator scans for a real collision; and the
+`--vars` stdout bug above. Each was confirmed to fail the suite when
+reintroduced.
+
+### The test runner was not running its own negative tests
+
+`test/run-all-checks.sh` invoked `test-fail-closed.sh` from **inside** the
+`command -v php` block. It is a bash script with no PHP dependency, so on any
+host without php the 57 negative tests silently did not run while the suite
+still printed `ALL CHECKS PASSED`.
+
+That is the exact failure this suite exists to catch, in the file that does the
+catching: a control present, correct, and not running. Both shell harnesses now
+run unconditionally in their own section, and a missing harness file is itself
+a failure rather than a skip. The php block now says explicitly what did not
+run when php is absent, instead of passing quietly.
+
+### Findings from scoping, recorded rather than acted on
+
+- **`ironveilsystems1/npmplus` is the same architecture as WASP** —
+  `install.sh` + `lib/00`…`07` + `payload/` + `test/`, 79 files. This is a
+  composition problem, not a rewrite.
+- **Its CrowdSec `lapi` mode cannot serve a remote agent.** The mode exists, is
+  selectable, and prints that WASP VMs should register against it — while
+  `lib/03-dynamic-configs.sh` publishes the LAPI as `127.0.0.1:8080:8080`. Same
+  shape as the defect 10.4 closed, in the companion repo, and it is what gates
+  the whole CrowdSec topology. Its own TODO named B2 as the blocker; **B2 is
+  now confirmed**, so that block is lifted.
+- **OPNsense needs config generation, not install automation.** It has no
+  cloud-init and its installer is interactive; `OPNSENSE.md` already specifies
+  `config.xml` precisely enough to generate from, including the Filter model
+  version trap and the comma-vs-space trap in `<members>`.
+- **`tools/` is outside the signed manifest.** Noted in the design doc for a
+  decision rather than widened quietly as part of adding a tool.
+
+---
+
+## 10.4 — Released 2026-10-16
+
+**A control that was present, correct, and inert — and a production gate that
+insisted on it.**
+
+This release came out of reading a deployed topology rather than reading this
+code. Ten WordPress sites on their own VLANs behind one reverse proxy, which is
+the arrangement this project was built for and had never been checked against.
+
+### The defect
+
+A reverse proxy terminates the client connection, so every packet reaching a
+WASP VM comes from the proxy. `mod_remoteip` recovers the real client address
+for the access log, so CrowdSec detects correctly and bans the correct address —
+at this VM's nftables, where no packet from that address ever arrives.
+
+`cscli decisions list` shows the ban. `nft list set` shows the address. The
+console shows a remediation component. The attacker is unaffected.
+
+Every signal agreed enforcement was working. None of them was looking at
+whether traffic from a banned address could reach the firewall holding the ban.
+
+### The part that was worse
+
+Production **required** that bouncer. The gate added earlier in this series
+refused to certify a VM whose local bouncer was not running and registered — on
+the correct reasoning that detection without enforcement is a different
+security posture than production promises.
+
+Behind a proxy, that made the strictest profile insist on the one configuration
+that provably cannot work, and treat its presence as proof of enforcement. A
+fail-closed gate on an inert control is not fail-closed; it is a gate that
+cannot fail.
+
+This is the fourth time in this project that a control turned out to be present
+and correct and doing nothing, and the first time the fail-closed check was
+itself the thing pointing the wrong way.
+
+### What changed
+
+**Enforcement is chosen, not assumed.** Give the installer a reverse proxy
+address and it asks where bans are enforced, with no default, because there is
+no safe one:
+
+- `upstream` — the agent reports to a central LAPI; enforcement is that LAPI's
+  bouncer, at the proxy or the edge firewall. **No local bouncer is installed**,
+  and that absence is deliberate: one here would fill nftables with client
+  addresses that never send this VM a packet, which the next person to read
+  that set would reasonably take as evidence of blocking.
+- `detect-only` — declared, recorded, and a production blocker. Honest beats a
+  bouncer that appears to work.
+- `local` — unchanged for direct-access installs, and a production blocker when
+  a proxy is configured.
+
+**The production gate now asks a different question.** Not "is the local
+bouncer running" but "does enforcement exist on this traffic path": a local
+bouncer when clients arrive directly, an authenticated upstream LAPI when they
+arrive through a proxy. It also uses `block_production` rather than `err`, so it
+no longer aborts mid-stage and strands the operator without stage 10's
+diagnostic tooling — which this file already recorded as a lesson, from this
+same stage.
+
+**`wp-hardening.sh cs-lapi <url> <login> <password>`** moves an existing VM to a
+central LAPI: re-creates the agent, confirms it authenticated, stops the local
+bouncer, removes its nftables table, records the topology. It refuses a
+loopback LAPI URL, and resolves the CrowdSec image from the running container
+rather than falling back to a floating tag — a credential fix should not
+silently discard digest pinning.
+
+**`cs-doctor` reads the topology first.** In `upstream` mode it tests that a
+decision reaches the LAPI and then says plainly what it cannot see. Steps 4 and
+6 invert — a *running* local bouncer is reported as the fault in that mode. And
+a new step 8 asks the question none of the others could: it counts access-log
+addresses other than the proxy's, and reports a fault when a VM set to enforce
+locally has never seen a request from anywhere but the proxy. Steps 1–7 can all
+pass on a VM where nothing is ever blocked.
+
+A VM built before this release has no recorded topology. `cs-doctor` says so,
+infers from the configured proxy, and warns that the live test proves the
+plumbing rather than the protection.
+
+### TRUST-COUNT
+
+`RemoteIPTrustedProxy` must name exactly one literal address. `mod_remoteip`
+walks `X-Forwarded-For` from the right, popping entries while they match a
+trusted proxy, so a range lets any host inside it prepend whatever client
+address it likes and have Apache believe it.
+
+That forged address is the one CrowdSec bans, the one `Require ip` checks for
+wp-admin, the one the login guard counts attempts against, and the one the
+contact-form rate limit keys on. One compromised neighbour on the same segment
+becomes an authentication bypass, a way to get any third party banned on
+demand, and a way to never be rate-limited.
+
+The interactive prompt already rejected a CIDR. That was one input, and the
+constraint is now asserted where it is relied upon: `install.sh` refuses a
+range, a list or a hostname before anything is built, `lib/03` and `lib/06`
+each assert it at their own write site — a guard on one of two write paths is
+not a guard — and `check-trusted-proxy.py` holds it in the source tree, which
+is the one failure the runtime assertions cannot catch, since they would
+faithfully assert whatever weaker rule replaced them. `RemoteIPInternalProxy`,
+which the upstream WordPress image ships pre-populated with every RFC1918
+range, can no longer re-enter the tree.
+
+A hostname is refused too: Apache resolves the directive once at startup, so a
+name that later resolves elsewhere leaves Apache trusting an address nothing
+told it about.
+
+### Split-horizon loopback
+
+WordPress calls its own public hostname for WP-Cron, Site Health and parts of
+the REST API. With split-horizon DNS that name resolves to the proxy, so the
+call leaves the VM and needs a permitted path back on 80 and 443 — which, where
+each site has its own VLAN, does not exist by default. The call is dropped and
+the symptom is "scheduled posts stopped working", naming neither DNS nor the
+firewall.
+
+The installer now offers a hosts entry mapping the site's name to `127.0.0.1`,
+with the cost stated rather than discovered: loopback then stops exercising the
+real path, so a broken proxy host or certificate no longer surfaces in Site
+Health. The alternative — a firewall rule on the segment — is documented
+alongside it, including that it needs an explicit sequence number to sort above
+an east-west block.
+
+### The LAPI questions, asked properly
+
+Three things present identically from a WASP VM and have unrelated causes: an
+agent that cannot reach the LAPI, an agent whose login was never registered,
+and an agent pointed at a LAPI with no bouncer behind it. All three give a clean
+start, a healthy service, and nothing blocked anywhere. So the installer now
+asks about each rather than collecting three values and hoping.
+
+- **It explains the agent/LAPI/bouncer split before asking for an address**,
+  because "which of the three is missing" is the question an operator needs to
+  be able to form, and nothing in a CrowdSec install volunteers it.
+- **It tests the address from the Proxmox host.** A LAPI still on its default
+  `127.0.0.1:8080` binding serves no remote agent however correct the
+  credentials are — and the symptom points at credentials, so the hour goes
+  into password resets. A refused connection now names the likely cause up
+  front. The caveat is stated in both directions: this host is not where the VM
+  will be, so a refusal is evidence rather than proof, and a success does not
+  mean the VM's own segment is permitted.
+- **Deferring is a first-class answer.** "The LAPI does not exist yet" is a
+  normal state, not an error, and it is the state most tenants are in. The agent
+  installs unconfigured, a production blocker is recorded, and one command
+  finishes it later.
+- **The machine login defaults to the hostname**, with the reason for one
+  credential per tenant stated: a shared login makes `cscli machines list`
+  useless for finding which site raised an alert, and revoking one site's access
+  takes every site down with it.
+- **It names what this VM will never be able to tell you** — whether a bouncer
+  exists on that LAPI, and whether a decision becomes a dropped packet — with
+  the commands that answer both, on the host that can.
+
+### Never-ban lists, and the blast radius that changes
+
+The whitelist prompt was written for a VM that enforces locally, where a false
+positive locks you out of one VM. Under upstream enforcement a decision made on
+a tenant is sent to the central LAPI and applied by the bouncer there to **every
+site behind that proxy**, so the same mistake is a fleet-wide outage that cannot
+be fixed remotely, because the path you would fix it through is also blocked.
+
+The prompt now says that, in the mode where it is true, and the whitelist is
+written in every mode — locally it stops this VM's firewall dropping you,
+upstream it stops the decision being *proposed*, which is the only place it can
+be stopped.
+
+- **The proxy's own address leads the suggested set**, with the specific route
+  to needing it: if `X-Forwarded-For` substitution breaks, this VM sees every
+  request as coming from the proxy, and one brute-force attempt bans it. If the
+  operator removes it, the installer asks once more and takes no for an answer.
+- **`100.64.0.0/10` is offered separately.** Overlay addresses (NetBird,
+  Tailscale, ZeroTier) are CGNAT, not RFC1918, so CrowdSec's stock whitelist
+  never covers them — and remote administration is exactly where a lockout is
+  expensive. Offered rather than defaulted: a `/10` is a large trust grant and
+  should not be accepted by pressing Enter past a long line.
+- **Why postoverflow rather than parser stage is now stated** — the bucket still
+  fills and the alert still fires, so a whitelisted machine of your own that
+  starts tripping scenarios is still visible. At the parser stage the events are
+  discarded before any scenario sees them and the address goes dark.
+- **It says what the whitelist does not cover.** The engines on the proxy and
+  the firewall read their own logs and never consult this file, so either can
+  ban you while this VM proposed nothing. The installer prints a ready
+  postoverflow block filled in with the operator's own answers, for pasting on
+  the enforcing hosts, and says to do it before enabling the bouncer there.
+- `wp-hardening.sh crowdsec-whitelist add|remove` is named at the prompt, so
+  the answer is visibly not permanent.
+
+### Presets, for a fleet
+
+`WASP_PROXY_IP`, `WASP_CS_ENFORCEMENT`, `WASP_CS_LAPI_URL`,
+`WASP_CS_LAPI_LOGIN`, `WASP_CS_LAPI_PASSWORD`, `WASP_CROWDSEC_WHITELIST` and
+`WASP_LOOPBACK_HOSTS` can be set in the environment, so ten tenants behind one
+proxy is a loop rather than ten identical interactive sessions answered slightly
+differently. The machine login is the one to vary per tenant; the whitelist is
+usually identical across a proxy's whole fleet, which is why it should not
+depend on remembering it ten times.
+
+A new contract preflight in `install.sh` validates all of it **before** an
+image is downloaded or a disk created. A preset typo caught in `lib/06` costs
+fifteen minutes and a half-built VM; the same typo costs two seconds here. It
+refuses an `upstream` declaration missing any credential rather than letting it
+degrade to detect-only with a message nobody is present to read, and it echoes
+the contract it was given, so an unattended run records what it was told and
+not only what it did.
+
+The whitelist is validated there for a different reason than the rest. A
+malformed entry fails **nowhere** at runtime: CrowdSec loads the file, ignores
+what it cannot parse, and the address the operator believes is protected is not
+— discovered during a lockout, or never. The interactive prompt already
+validated each entry; a preset would have skipped that. It also warns, without
+refusing, when the proxy's address is absent, since an unattended run cannot be
+asked at a prompt.
+
+`WASP_`-prefixed rather than bare: a common name in the environment of a root
+shell on a Proxmox host is too easy to inherit by accident, and inheriting this
+one silently widens what Apache trusts.
+
+### Also
+
+- `check-trusted-proxy.py` — new, with its own self-test and two verified
+  failure modes (a widened literal, and a removed guard).
+- `check-doas-prefix.py` gained a narrow exemption for commands that name
+  another host. The CrowdSec registration steps run on the LAPI host, which may
+  be OPNsense with no `doas`, or a container needing `podman exec` — and the
+  cheap way past the check would have been to add a `doas` that is confidently
+  wrong. The line must say where it runs, which makes the escape visible.
+- The loopback question is asked where `WP_DOMAIN` exists rather than beside the
+  other proxy questions. Written in the topically obvious place first, where its
+  own `-n "$WP_DOMAIN"` guard would have been false every time and the question
+  would never have appeared while reading as though it did — the same class of
+  defect as the empty `_SMTP_PORTS` expansion that produced a VM with no
+  firewall at all.
+- Stage 09 builds the CrowdSec container through a function taking the
+  mode-specific flags, rather than `set --` before the run: the stage is
+  *sourced*, so `set --` would rewrite the dispatcher's positional parameters
+  for everything sourced after it. Harmless today, depending on a line in
+  another file.
+- `/etc/wp-install/crowdsec-topology` records the declared topology, so later
+  tooling judges this VM against what it was built to do rather than
+  re-deriving intent from whether a bouncer happens to be installed.
+
+### Upgrading
+
+No migration. Existing VMs are unaffected until re-provisioned.
+
+- **A VM behind a proxy is almost certainly in `local-inferred` state.** Run
+  `doas wp-hardening.sh cs-doctor` and read step 8. If every logged request
+  came from the proxy, that VM has never blocked anything.
+- Move it with `doas wp-hardening.sh cs-lapi <url> <login> <password>`, after
+  registering the machine on the LAPI host.
+- **A LAPI bound to `127.0.0.1:8080` serves no remote agent.** Publishing it is
+  a change on that host. Until it is published, every WASP tenant runs an
+  isolated engine and its bans remain no-ops.
+- Whitelist your own management addresses on the enforcing engine *before*
+  turning enforcement on. A false positive against your own source address
+  locks you out of a remote site, and a postoverflow whitelist — not a parser
+  one — still raises the alert. A whitelist on a WASP tenant governs only what
+  that tenant proposes; the engines on the proxy and the firewall read their own
+  logs and never consult it.
+- Include `100.64.0.0/10` if you administer over an overlay. It is CGNAT, not
+  RFC1918, so CrowdSec's stock whitelist does not cover it.
+
+---
+
+## 10.3 — Released 2026-09-05
+
+One version number from here. `WASP_RELEASE` and `WASP_VERSION` are the same
+value, and both exist only because the codebase references each.
+
+There were two: a semantic release plus a date build stamp, on the argument —
+which I made, in this file — that a single number cannot say WHICH 10.2 a VM is
+running. That was reasonable and it lost to reality. **The build stamp read
+`2026.08.x` through most of September**, because nothing verified it and nobody
+reads a build stamp closely enough to catch it. Every changelog entry above
+carries a date that is weeks wrong.
+
+An identifier that is silently incorrect is worse than one carrying less
+information: it looks precise, it gets quoted in tickets, and the error
+propagates. The historical entries are left as written — rewriting them would
+falsify the record — but the shape stops here. If a build stamp is wanted
+again, it should be generated rather than typed.
+
+Worth noting who caught it. Not a check, not a review — the operator, reading a
+version number and observing that August had ended. That is the same way most
+real defects in this project surfaced, and it is a reasonable argument for the
+next check being one that compares a written date against the system clock.
+
+**In this release**, beyond 10.2:
+
+- `06-wasp-username-privacy.php` — the REST users endpoint, `?author=N` and
+  login error messages, all of which hand an attacker a username. That matters
+  more here than the usual advice suggests, because the login guard locks
+  accounts by username: knowing one lets an attacker lock an administrator out
+  indefinitely without approaching the password.
+- A long-window counter in the login guard for slow-drip attacks. Every
+  existing limit uses a 20-minute rolling window; an attacker who waits 21
+  minutes is never counted at all.
+- Two CrowdSec parsing defects — one caught before shipping, one that had been
+  in the tree since the guard was written, both event names containing a hyphen
+  that `%{WORD}` cannot match.
+
+Operator-facing advice in `wasp-triage.sh` now cites release numbers rather
+than build stamps, so it stays correct.
+
+---
+
+## 10.2 / 2026.08.14q — Enumeration, and the attack the rate limit cannot see
+
+Two additions, and the first matters more here than the usual advice suggests.
+
+**`06-wasp-username-privacy.php`.** WordPress leaks usernames three ways — the
+REST users endpoint, `?author=N` redirects, and login errors that distinguish
+"unknown username" from "incorrect password". Most guides rate that low: a
+username still leaves the password.
+
+On this platform it is worse, because **the login guard locks accounts by
+username**. An attacker who learns an administrator's login name can lock that
+administrator out repeatedly, five wrong passwords every twenty minutes,
+escalating to twenty-four hours, without going near the password. That turns a
+protective control into a denial-of-service against the client, and from
+outside it looks like a broken site.
+
+All three closed. The REST endpoint is restricted rather than removed, since
+the block editor needs it and breaking wp-admin to hide a username is a poor
+trade. Password-reset errors collapsed the same way.
+
+**A long-window counter for slow-drip attacks.** Every existing limit counts
+within a 20-minute rolling window that resets after 20 minutes of quiet, so an
+attacker who stays under it is never counted at all:
+
+    4 attempts, wait 21 minutes, 4 more    ->  288 guesses/day, no lockout ever
+    1 per IP per hour across 1000 hosts    ->  24,000 guesses/day, nothing near
+                                               any threshold
+
+CrowdSec does not close it either — 6 failures in 10 minutes is a tighter
+window still. Short windows are correct for stopping a burst and blind to
+patience.
+
+The new counter is 20 failures per username in 24 hours, deliberately generous:
+someone who forgot their password tries three or four times and uses the reset
+link. It does **not** reset on success — an attacker who finally guesses right
+should not erase the thousand attempts before it.
+
+**A parsing bug caught before it shipped, and one that already had.** The new
+event was first named `drip-lockout`, and the CrowdSec grok pattern is
+`%{WORD:wpvm_event}`, which does not match a hyphen — the line would have
+failed to parse and been silently dropped, which is the exact class of defect
+that made CrowdSec see nothing for weeks. Renamed to `lockout` with the reason
+in the free-form detail.
+
+Checking that turned up `spray-lockout`, which has the same problem and has
+been in the tree since the guard was written. Every per-IP lockout it logged
+was unparseable. Renamed too, with `scope=address` preserved in the detail.
+
+That is the second time a working control was emitting events nothing could
+read. Worth a check of its own — event names must match the parser that
+consumes them — and that is now on the list.
+
+---
+
+## 10.2 / 2026.08.14p — What the contact docs left out
+
+Asked what code goes on the send button. The answer is none — `type="submit"`
+is the whole requirement — and the documentation did not say so. Form plugins
+condition people to expect a shortcode or an onclick somewhere, so "nothing
+goes here" needs stating rather than assuming.
+
+Two larger omissions behind that question:
+
+**When NOT to use it.** Divi's own Contact Form module, and the Elementor and
+Beaver Builder equivalents, already handle submission through `wp_mail()` — so
+they already use the VM's relay. Wiring this up alongside one gives two
+handlers for one form. The README now says so plainly, and says what this IS
+for: hand-written HTML, a design pasted into a Code module, a static build
+brought into WordPress. Exactly the case where a page builder gives no
+submission handling and the usual answer is to install a plugin.
+
+**What the visitor sees.** The handler redirects to `/?sent=1` and the page
+looks unchanged, which reads as nothing having happened. The mail sends either
+way, but a form with no feedback gets submitted three times. All four status
+values are now documented in a table, with a five-line snippet for a
+confirmation message and the `wasp_contact_redirect` filter for a dedicated
+thank-you page.
+
+Every filter and status value named in the documentation was then verified
+against the implementation — three filters, four statuses, all present. That
+check took ten seconds and is the difference between documentation and a
+promise, which this release has already had to correct three times.
+
+---
+
+## 10.2 / 2026.08.14o — Released
+
+Tagged for GitHub. `docs/RELEASE-10.2.md` carries the notes.
+
+An operator-experience release, and worth naming as such: almost nothing here
+is a platform defect. The contact handler is new capability, and the rest is
+tooling and documentation that told an operator something untrue —
+
+- every `scp` example was unrunnable against the VM it documented
+- `rsync` was recommended as "already installed" and is conditional
+- `install-file` reported "No such file" for a file present under different case
+- `digest-check` was reasonably read as detecting new releases, and cannot
+- the missing theme update UI read as an egress fault rather than a control
+- `set-destination` described a format instead of showing the answer
+
+Each was found by someone following the instructions, and each cost real time
+on a live deployment. That is a different failure class from a bug in a control,
+and arguably a more expensive one: a broken control is caught by a check, while
+a wrong instruction is caught by a person, mid-task, usually when something else
+has already gone wrong.
+
+Three checks now guard that class specifically — `check-tool-availability.py`
+for tools the VM may not have, `check-doas-prefix.py` for commands that fail on
+paste, and `check-menu-entries.py` for menu items pointing at nothing. All three
+exist because the documentation was wrong before the code was.
+
+Verified at 25 static checks, 27 fail-closed negative tests, and a commission
+check passing 10 of 10 on hardware.
+
+---
+
+## 10.1 / 2026.08.14n — A contact handler, so a contact-form plugin is not needed
+
+Every WordPress site needs a contact form, and the usual answer is a plugin:
+tens of thousands of lines, an admin UI, a database table of submissions, and a
+supply-chain dependency, to accomplish "take three fields and email them".
+Those plugins are also over-represented in WordPress vulnerability disclosures,
+because they accept unauthenticated input by definition and sit on millions of
+sites.
+
+`payload/mu-plugins/05-wasp-contact.php` is that job in ninety lines, using
+`wp_mail()` and therefore whatever relay the VM already has. No admin screen,
+no stored submissions, and being an mu-plugin it cannot be deactivated from
+wp-admin.
+
+**The rule that makes it safe is worth stating on its own: the recipient is
+decided server-side and never read from the request.** A handler that emails
+whatever address the form supplies is an open relay — anyone can POST to it and
+have the server send mail to anybody, carrying the domain's reputation. That is
+how a contact form becomes a spam cannon and a domain lands on a blocklist. The
+recipient comes from `admin_email`, a `wp-config.php` constant, or a PHP
+filter; nothing in `$_POST` can redirect it. Verified by grepping every
+assignment to that variable.
+
+**It works with a form it has never seen.** Field names default to
+name/email/message and are filterable; anything else the form posts appears in
+the email automatically, so adding `company` or `budget` to the markup needs no
+code change.
+
+Two limits are documented rather than left to be discovered:
+
+- **No CSRF nonce**, because a nonce must be generated in PHP at render time
+  and these forms usually live in page-builder HTML modules that do not execute
+  PHP. The realistic threat is spam, not forgery — an attacker gains nothing by
+  making you email yourself — so a honeypot and a five-minute per-address rate
+  limit are the proportionate controls. A nonce IS verified when present, so a
+  PHP-rendered form gets full protection by adding one.
+- **The rate limit keys on `REMOTE_ADDR`**, which behind a reverse proxy is
+  only the real client when mod_remoteip is working. If it is not, every
+  visitor shares one bucket and one submission blocks everyone for five
+  minutes. Written into the code beside the limit and into the README, because
+  that failure is otherwise very hard to attribute.
+
+Prompted by a live site where the pasted design's form posted to `/contact` — a
+path that does not exist — and WordPress served its 404 page. The design was
+right that the site should own its form handler; it just assumed one existed.
+
+---
+
+## 10.1 / 2026.08.14m — rsync is not installed, and the docs said it was
+
+    sh: rsync: not found
+    rsync: connection unexpectedly closed (0 bytes received so far) [sender]
+
+Two releases ago the file-transfer documentation was corrected to lead with
+`rsync`, described as "already installed on the VM". It is installed only when
+`OFFSITE_METHOD=rsync`. An s3 or rclone install — which is most of them — does
+not have it.
+
+The failure is remote-side, so it reads as a transport problem rather than a
+missing package, and the second line of the error actively points away from the
+first.
+
+**Third consecutive defect in the same paragraph.** First the missing SFTP
+subsystem made every documented `scp` command unrunnable. Then `install-file`
+reported "No such file" for a file present under different case. Now a
+recommended tool that is not there. Each fix was correct and each introduced or
+exposed the next, which is worth recording plainly: this paragraph has cost an
+operator more time than any single bug in the codebase.
+
+**`scp -O` is now primary** everywhere, because it works on every install with
+nothing to add. `rsync` is documented as an option with the reason it is absent
+and the one-line install, and the reason it is not installed by default: every
+binary reachable over SSH is surface on a VM built to minimise that, and
+`scp -O` covers the same ground.
+
+**New check: `check-tool-availability.py`.** Commands at the start of a line in
+a fenced block are checked against tools the installer does not unconditionally
+install. Naming one as a primary instruction fails the build; naming it in a
+block that also shows `apk add` is fine, which is how an option is expressed
+rather than an assumption. Verified by restoring the rsync instruction — it
+fails, naming the file and the line.
+
+A documented command that cannot run is the same class as a printed command
+with no space in it. Both fail at the moment someone is following instructions
+because something has already gone wrong, and this project now has a check for
+each.
+
+---
+
+## 10.1 / 2026.08.14l — First fully green commission check on hardware
+
+    PASS 10   FAIL 0   SKIP 0
+
+Every control passing on a live VM at one time: health, full validation, the
+self-test suite, the egress boundary, tooling integrity, update currency, mail
+delivery, wp-cli, file integrity, and CrowdSec actually blocking.
+
+Worth stating what that is and is not. It is ten independent controls verified
+on one machine in one pass — the first time in this series that has happened
+without something being silently absent. It is not a claim that the platform
+cannot fail; the same run reports what is still owed before the VM should be
+called proven.
+
+**That footer is the part worth keeping.** The commission check names the
+off-site restore drill and MFA lockout recovery as outstanding, per VM, even
+though both are demonstrated on the platform. Recovery was measured at 33
+seconds — but on a different machine, with a different key, token and
+destination. A green board that stopped asking would be a worse instrument than
+one that keeps asking, and the distinction between "the mechanism works" and
+"it works here" is the whole reason the drill exists as a recurring step.
+
+Released as **10.1** for tagging. `docs/RELEASE-10.1.md` carries the notes: the
+upstream currency check, the corrected file-transfer documentation, the
+`DISALLOW_FILE_MODS` update-UI explanation, guided destination and credential
+changes, the move to the IronVeil Systems organisation, and the two new checks
+that keep stale branding and client material out of the tree.
+
+Two upgrade notes, both about expectations rather than migration: `update.sh
+upstream` will surface releases nobody was tracking — CrowdSec v1.8.1 against a
+v1.7.8 pin, for one — and any `scp` command in an operator's own runbook needs
+`-O` or should become `rsync`.
+
+---
+
+## 10.0 / 2026.08.14k — digest-check could never see a new release
+
+Reported from the field: CrowdSec published a newer version and `update.sh
+check` reported everything current.
+
+Nothing was broken. `digest-check` inspects the **pinned tag** and compares its
+digest — it answers *"has v1.7.8 been re-published underneath me?"*, which is
+the right question for integrity and detects a supply-chain swap. It cannot
+answer *"does v1.7.9 exist?"*, and never could.
+
+An operator reading a clean report reasonably assumes both questions were
+asked. That assumption is how a deliberate pin quietly becomes a stale pin, and
+this platform's own weekly checklist had been asking only the first.
+
+**New: `update.sh upstream`.** It enumerates tags from each registry and
+reports anything newer than the pin, for WordPress, MariaDB and CrowdSec. It
+changes nothing — digest pinning remains the mechanism, and moving version is
+still deliberate.
+
+Three details that make it usable rather than noisy:
+
+- **The tag pattern is derived from the pin's own shape.** WordPress's
+  `7.1-php8.4-apache` is compared against other `php8.4-apache` builds rather
+  than every tag in the repository, so a `-fpm-alpine` variant is not reported
+  as "newer".
+- **Pre-release tags are excluded.** `v1.8.0-rc1` is not an upgrade to offer a
+  client site.
+- **`sort -V`**, so `v1.10.0` sorts above `v1.9.0` rather than below it.
+
+`update.sh check` now states the limit of what it checked and names the command
+that asks the other question, because leaving that to documentation is what
+produced the gap. The weekly checklist carries both lines, each labelled with
+what it detects.
+
+And the output repeats the lesson this project has already paid for: **verify
+the tag exists before pinning it.** A version number is not a tag. An earlier
+release here shipped `6.9.6-php8.4-apache`, which had never been published, and
+every install died fifteen minutes in on "manifest unknown".
+
+---
+
+## 10.0 / 2026.08.14j — Showing the answer instead of describing the format
+
+`set-destination` said:
+
+    Format: remote:bucket/prefix   (the part before ':' is the rclone
+    remote name and normally stays as it is)
+
+Accurate, and it requires the reader to map an abstract shape onto their own
+string — at the exact moment they are changing something they cannot easily
+verify, on a subsystem that has already been troublesome. An operator with
+`wasp-s3:test/wasp/ctrl` who wants the bucket to be `testpress` still has to
+work out which part is which and reassemble it correctly.
+
+It now decomposes their actual value and prints the string to type:
+
+    Current destination:  wasp-s3:test/wasp/ctrl
+
+      which is made up of:
+        remote    wasp-s3       the rclone remote — normally leave this alone
+        bucket    test          your bucket at the storage provider
+        prefix    wasp/ctrl     a folder path inside the bucket
+
+      To change only the bucket to (say) 'testpress', enter:
+          wasp-s3:testpress/wasp/ctrl
+
+It also names the two failures that are indistinguishable from a typo, before
+the prompt rather than after: the bucket must already exist, and the token must
+be scoped to the NEW bucket — a token scoped to the old one returns 403 rather
+than 404, because the provider will not confirm a bucket exists to a caller
+that cannot see it. That specific confusion has already cost this project two
+sessions.
+
+**`set-credentials` names the provider's own labels** — "Access Key ID, 32 hex
+characters" and "Secret Access Key, 64 hex characters" — because an operator
+copying from a dashboard is matching words, not concepts. It repeats that the
+value alone is wanted, which is the pasted-label defect that took two sessions
+to find and is already refused by the input guard.
+
+**The README carries the same worked example**, plus the one thing with no
+command and never will have: the age recipient. Rotating it orphans every
+backup already at the destination, so `wp-rotate-secrets.sh` refuses and there
+is no `set-recipient`.
+
+---
+
+## 10.0 / 2026.08.14i — The documented scp command could not work
+
+From an install log, three attempts to move a theme onto the VM:
+
+    scp divi.zip irontask@10.10.30.10:/var/lib/wasp-import/incoming/
+    scp: stat local "divi.zip": No such file or directory
+
+    scp Divi.zip irontask@10.10.30.10:/var/lib/wasp-import/incoming/
+    subsystem request failed on channel 0
+    scp: Connection closed
+
+    scp -O /run/media/.../Divi.zip irontask@10.10.30.10:...
+    Divi.zip  100%  17MB  90.8MB/s
+
+The second failure is the documentation's fault. OpenSSH 9 and later use the
+SFTP protocol for `scp` by default, and this VM's `sshd_config` is written from
+scratch by the installer with no `Subsystem sftp` line — so there is nothing for
+the client to talk to. Every `scp` example in the docs was unrunnable against
+the platform they document, and had been since the sshd config was written.
+
+`subsystem request failed on channel 0` reads like a network fault, a key
+problem or a permissions issue. It is none of them, and an operator who has
+spent a fortnight on egress has every reason to suspect the wrong thing first.
+
+**Corrected everywhere**, with `rsync` given as the primary — it is already
+installed on the VM, needs no subsystem, shows progress and resumes a partial
+transfer, and 17 MB over a flaky link is where that matters. `scp -O` is given
+as the alternative with the reason attached, and a new **Getting files onto the
+VM** section explains the cause once rather than repeating it at each example.
+
+Not enabling the SFTP subsystem is recorded as a deliberate choice rather than
+an oversight: it puts another binary within reach over SSH on a VM built to
+minimise that, and both alternatives work without it.
+
+**The first failure was case**, and the tooling made it worse. `install-file`
+reported `No such file` for `divi.zip` when `Divi.zip` was sitting in that
+directory — accurate, unhelpful, and identical to what a failed transfer looks
+like. It now does a case-insensitive match and says *"Did you mean:
+.../Divi.zip — filenames are case-sensitive"*, lists the directory contents when
+there is no near match, and when the directory is empty says so and names the
+scp flag, since that is the likeliest reason nothing arrived.
+
+Three round trips, all avoidable, all caused by documentation and error
+messages rather than by the platform.
+
+---
+
+## 10.0 / 2026.08.14h — The missing update section was a control, not a fault
+
+Reported from a live VM: Divi 4.27.4 installed, 4.27.8 available, vendor licence
+entered and accepted, Squid allowing `.elegantthemes.com`, information fetching
+correctly — and no update section anywhere in wp-admin.
+
+Nothing was broken. `DISALLOW_FILE_MODS` removes the **update** UI as well as
+the install UI. WordPress offers no update notification, no update link and no
+section, regardless of licence state or connectivity.
+
+The documentation covered installing a commercial theme under that restriction
+in detail and never mentioned updating one, so the only reasonable conclusion
+available to the operator was that egress was at fault — which is precisely the
+subsystem that had been troublesome for a fortnight. A correct control that
+looks like a familiar bug is an expensive kind of correct.
+
+**Documented properly.** The preferred path is `install-file` with the newer
+zip, which replaces the theme in place — wp-cli reports "Removing the old
+version of the theme" and settings survive, since Divi stores those in the
+database. No hardening change at any point. The alternative, toggling
+`file-mods` off and back, is named as the weaker option: the risk is not the
+update, it is forgetting to re-enable.
+
+**And the tooling now says it**, rather than leaving it in a document nobody
+reads mid-task:
+
+- `install-file` explains, on success, that the same command performs updates
+  and that no update UI will appear.
+- `wp-hardening.sh status` reports the consequence next to the flag —
+  `BLOCKED (no install OR update UI in wp-admin — use wp-plugins.sh
+  install-file)` — because "BLOCKED" alone tells an operator nothing about why
+  a page looks broken.
+
+Also stated, because it is a deliberate limit rather than an oversight: neither
+path enables vendor auto-updates. A third party pushing code into a client site
+without review is the supply-chain risk this platform exists to narrow. Updates
+here happen when the operator decides.
+
+---
+
+## 10.0 / 2026.08.14g — Client material removed from the platform repository
+
+`docs/CALL-NOTES-ELITEPRO.md` and `docs/CLIENT-BROCHURE.md` are gone.
+
+Both were written during working sessions and both were useful. Neither belongs
+in a repository that is cloned, forked, published, and shipped to other clients.
+
+The call notes are the reason this matters rather than being tidy-up. They
+contained a named individual, their employer, their direct phone number, their
+current hosting provider, and an assessment of unpatched vulnerabilities on
+their live website. That travelled inside several release tarballs. Anyone
+receiving one had it, and if the repository had been public at the time, so did
+everyone else.
+
+That is a privacy problem and a professional one, and no check here would have
+caught it — every existing check reads code or verifies documentation links.
+None asked whether a document should exist at all.
+
+**New check: `check-no-client-material.py`.** Filenames indicating sales,
+prospect or client-specific material fail the build, along with a narrow set of
+content markers for the same. Deliberately filename-led: scanning content for
+personal data is a much larger problem, and a check that attempts it badly is
+worse than one with a clear scope.
+
+It produced a false positive on its first run — `check-embedded-quotes.py`
+matched on "quote", where the word means shell quoting. Narrowed to
+"sales-quote", with the reason recorded next to the marker list. A check that
+fires on a correct file trains people to ignore it, which is the failure mode
+that makes a check worse than useless.
+
+The brochure is still worth having; it simply belongs wherever the business
+keeps client documents. It was delivered as a standalone .docx and .pdf and
+does not need to live in the platform tree to be used.
+
+---
+
 ## 10.0 / 2026.08.14f — Signed releases are proven, and the record said otherwise
 
 Minisign signing has been in production use throughout August. The validation

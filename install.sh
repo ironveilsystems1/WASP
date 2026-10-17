@@ -168,15 +168,20 @@ fi
 # state their build cannot be reasoned about safely.
 #
 # Bump this whenever behaviour changes in a way an operator would notice.
-# Two identifiers, deliberately. WASP_RELEASE is what a human quotes -- "we're
-# on 9.3" -- and what a client sees on a change ticket. WASP_VERSION is the
-# build stamp: date plus a letter, unique per build, which is what every log
-# line, every PRODUCTION-BLOCKER and every CHANGELOG entry references. A single
-# semver would lose the ability to say WHICH 9.3 a VM is running, and this
-# project has already spent a session on exactly that ambiguity.
-WASP_RELEASE="10.0"
-WASP_VERSION="2026.08.14f"
-WASP_VERSION_NOTE="Signed releases have been in production use since August; the validation record and TODO said otherwise and now do not"
+# ONE version. WASP_RELEASE and WASP_VERSION are the same value and both exist
+# only because the rest of the codebase references each of them.
+#
+# There used to be two: a semantic release plus a date build stamp, on the
+# argument that a single number cannot say WHICH 10.2 a VM is running. That was
+# a reasonable argument and it lost to reality — the date stamp was wrong for
+# weeks, reading 2026.08.x through most of September, because nothing verified
+# it and nobody reads a build stamp closely enough to notice. An identifier
+# that is silently wrong is worse than one that carries less information.
+#
+# If a build stamp is wanted again later, generate it rather than typing it.
+WASP_RELEASE="10.4"
+WASP_VERSION="10.4"
+WASP_VERSION_NOTE="Reverse-proxy enforcement gap closed: CrowdSec enforcement topology is chosen, not assumed; TRUST-COUNT asserted at both write sites; split-horizon loopback; proxy settings presettable"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
@@ -414,6 +419,220 @@ verify_release() {
   echo "  All files match the signed manifest."
 }
 verify_release "$REPO_DIR"
+
+# ── Deployment-contract preflight ────────────────────────────────────────────
+# Validates the WASP_* deployment presets BEFORE anything is downloaded,
+# mounted or created.
+#
+# Why here and not in lib/01, where these values are used: the build takes
+# about fifteen minutes and lib/06 is roughly twelve of them in. A preset typo
+# caught there costs a quarter of an hour and a half-built VM to clean up; the
+# same typo costs two seconds here. For a fleet rollout -- ten tenants behind
+# one proxy, which is what the presets exist for -- that difference is the
+# difference between a loop you can run and a loop you have to babysit.
+#
+# These are refusals, not warnings. Each one is a value that decides a security
+# property, and a security property that defaults quietly when its input is
+# malformed is the failure shape this whole project keeps finding.
+contract_preflight() {
+  local fail=0
+
+  # TRUST-COUNT. RemoteIPTrustedProxy must name exactly ONE literal address:
+  # mod_remoteip walks X-Forwarded-For from the right, popping entries while
+  # they match a trusted proxy, and takes the first untrusted one as the
+  # client. A range therefore lets any host inside it prepend whatever client
+  # address it likes and have Apache believe it -- and that forged address is
+  # what CrowdSec bans, what the wp-admin restriction allows, and what the
+  # login guard counts attempts against. One compromised neighbour becomes an
+  # authentication bypass. lib/03 and lib/06 assert this again where they
+  # write the directive; this catches it before the clock starts.
+  if [[ -n "${WASP_PROXY_IP:-}" ]]; then
+    if [[ "$WASP_PROXY_IP" =~ [/,[:space:]] ]]; then
+      echo "FATAL: WASP_PROXY_IP='${WASP_PROXY_IP}' is a range or a list." >&2
+      echo "  RemoteIPTrustedProxy takes one literal address. A range lets any" >&2
+      echo "  host inside it forge the client IP in X-Forwarded-For, which is" >&2
+      echo "  the address CrowdSec bans and the one wp-admin checks." >&2
+      echo "  Use the proxy's own address, e.g. WASP_PROXY_IP=10.20.10.10" >&2
+      fail=1
+    elif [[ ! "$WASP_PROXY_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "FATAL: WASP_PROXY_IP='${WASP_PROXY_IP}' is not an IPv4 address." >&2
+      echo "  A hostname is not usable here — Apache resolves RemoteIPTrustedProxy" >&2
+      echo "  once at startup, so a name that later resolves elsewhere leaves" >&2
+      echo "  Apache trusting an address nothing told it about." >&2
+      fail=1
+    fi
+  fi
+
+  # The enforcement mode decides whether a bouncer is installed at all, so an
+  # unrecognised value cannot be allowed to fall through to a default: the two
+  # candidate defaults differ by whether this VM enforces anything.
+  if [[ -n "${WASP_CS_ENFORCEMENT:-}" ]]; then
+    case "$WASP_CS_ENFORCEMENT" in
+      local|upstream|detect-only) : ;;
+      *) echo "FATAL: WASP_CS_ENFORCEMENT='${WASP_CS_ENFORCEMENT}' is not recognised." >&2
+         echo "  Expected one of:" >&2
+         echo "    local        bouncer on this VM. Only enforces when clients" >&2
+         echo "                 reach it directly." >&2
+         echo "    upstream     detect here, enforce at the proxy or firewall." >&2
+         echo "                 Needs WASP_CS_LAPI_URL, _LOGIN and _PASSWORD." >&2
+         echo "    detect-only  alerts, no enforcement. Recorded as a blocker." >&2
+         fail=1 ;;
+    esac
+
+    # upstream with a missing credential becomes detect-only in stage 09 and
+    # says so — correct behaviour for an interactive install where the operator
+    # is there to read it, and wrong for a scripted one where nobody is. An
+    # unattended run that asked for enforcement and got none is exactly the
+    # silent downgrade the preset was meant to prevent, so refuse instead.
+    if [[ "$WASP_CS_ENFORCEMENT" == "upstream" ]]; then
+      local missing=""
+      [[ -z "${WASP_CS_LAPI_URL:-}" ]]      && missing="${missing} WASP_CS_LAPI_URL"
+      [[ -z "${WASP_CS_LAPI_LOGIN:-}" ]]    && missing="${missing} WASP_CS_LAPI_LOGIN"
+      [[ -z "${WASP_CS_LAPI_PASSWORD:-}" ]] && missing="${missing} WASP_CS_LAPI_PASSWORD"
+      if [[ -n "$missing" ]]; then
+        echo "FATAL: upstream enforcement is missing:${missing}" >&2
+        echo "  Without all three the agent authenticates nowhere, and this VM" >&2
+        echo "  detects attacks that reach no bouncer — indistinguishable from" >&2
+        echo "  working, from here." >&2
+        echo "  Register the machine on the LAPI host first:" >&2
+        echo "    cscli machines add <login> --password '<password>'" >&2
+        fail=1
+      fi
+      if [[ -n "${WASP_CS_LAPI_URL:-}" && ! "$WASP_CS_LAPI_URL" =~ ^https?:// ]]; then
+        echo "FATAL: WASP_CS_LAPI_URL='${WASP_CS_LAPI_URL}' needs a scheme, e.g." >&2
+        echo "  http://10.20.10.10:8080/" >&2
+        fail=1
+      fi
+      # A loopback LAPI cannot serve an agent in another VM. Caught here
+      # because the symptom — an agent that starts cleanly and reports
+      # nothing — points at credentials, and the cause is an address.
+      if [[ "${WASP_CS_LAPI_URL:-}" =~ ^https?://(127\.|localhost) ]]; then
+        echo "FATAL: WASP_CS_LAPI_URL points at loopback (${WASP_CS_LAPI_URL})." >&2
+        echo "  That is this VM, not the central LAPI. A stock CrowdSec install" >&2
+        echo "  binds 127.0.0.1:8080 and is unreachable from anywhere else —" >&2
+        echo "  publishing it is a change on the LAPI host, not here." >&2
+        fail=1
+      fi
+    fi
+
+    # local enforcement behind a proxy is the configuration that cannot work.
+    # Stage 09 records it as a production blocker, which is the right place for
+    # the decision — but if it was asked for by preset rather than chosen at a
+    # prompt, nobody read the explanation, so say it now.
+    if [[ "$WASP_CS_ENFORCEMENT" == "local" && -n "${WASP_PROXY_IP:-}" ]]; then
+      echo "NOTE: local enforcement with a proxy at ${WASP_PROXY_IP}." >&2
+      echo "  Every request will arrive from that address, so a ban on a real" >&2
+      echo "  client address matches nothing this VM sees. The install will" >&2
+      echo "  continue and record a production blocker." >&2
+      echo "  Correct unless the proxy preserves the client source address at" >&2
+      echo "  layer 3, or clients can also reach this VM directly." >&2
+    fi
+  fi
+
+  # SSH key presets. The full classification lives in lib/00 and runs on every
+  # key; this catches the two that are worth catching before a fifteen-minute
+  # build, and it cannot call that helper because this function runs before
+  # lib/00 is sourced.
+  if [[ -n "${WASP_SSH_KEY_FILE:-}" ]]; then
+    local kf="$WASP_SSH_KEY_FILE"
+    [[ "$kf" == "~/"* ]] && kf="${HOME}/${kf#\~/}"
+    if [[ ! -f "$kf" ]]; then
+      # Silently loading nothing is the bad outcome: with no key the install
+      # falls back to password auth, or under production stops to ask — either
+      # way the preset did not do what the runbook says it does.
+      echo "FATAL: WASP_SSH_KEY_FILE='${WASP_SSH_KEY_FILE}' does not exist." >&2
+      echo "  No keys would be loaded, and the install would fall back to a" >&2
+      echo "  password or stop to ask — so a scripted run would not be doing" >&2
+      echo "  what its runbook says." >&2
+      fail=1
+    elif [[ ! -r "$kf" ]]; then
+      echo "FATAL: WASP_SSH_KEY_FILE='${kf}' is not readable." >&2
+      fail=1
+    elif grep -q 'PRIVATE KEY' "$kf" 2>/dev/null; then
+      # Refused early and loudly. A private key here would end up on the VM's
+      # disk and in the install log, which is a new keypair rather than a typo.
+      echo "FATAL: WASP_SSH_KEY_FILE='${kf}' contains a PRIVATE key." >&2
+      echo "  Point this at the .pub file. A private key in authorized_keys" >&2
+      echo "  gives no login AND puts the private half on the VM's disk and in" >&2
+      echo "  the install log — treat that keypair as compromised." >&2
+      fail=1
+    fi
+  fi
+  if [[ -n "${WASP_SSH_KEYS:-}" ]] && [[ "$WASP_SSH_KEYS" == *"PRIVATE KEY"* ]]; then
+    echo "FATAL: WASP_SSH_KEYS contains a PRIVATE key. Use the .pub contents." >&2
+    fail=1
+  fi
+
+  if [[ -n "${WASP_LOOPBACK_HOSTS:-}" ]]; then
+    case "$WASP_LOOPBACK_HOSTS" in
+      0|1|y|Y|n|N|yes|no) : ;;
+      *) echo "FATAL: WASP_LOOPBACK_HOSTS='${WASP_LOOPBACK_HOSTS}' — expected 1 or 0." >&2
+         fail=1 ;;
+    esac
+  fi
+
+  # The whitelist is validated here for a different reason than the others:
+  # a malformed entry does not fail anywhere. CrowdSec loads the file, ignores
+  # the entry it cannot parse, and the address the operator believes is
+  # protected simply is not — discovered when a lockout happens, which is the
+  # worst possible moment to find out. The interactive prompt validates each
+  # entry; a preset would otherwise skip that.
+  if [[ -n "${WASP_CROWDSEC_WHITELIST:-}" ]]; then
+    local bad="" entry
+    local oldifs="$IFS"; IFS=','
+    for entry in $WASP_CROWDSEC_WHITELIST; do
+      IFS="$oldifs"
+      entry="${entry//[[:space:]]/}"
+      [[ -z "$entry" ]] && { IFS=','; continue; }
+      if [[ ! "$entry" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        bad="${bad:+$bad, }$entry"
+      fi
+      IFS=','
+    done
+    IFS="$oldifs"
+    if [[ -n "$bad" ]]; then
+      echo "FATAL: WASP_CROWDSEC_WHITELIST has entries that are not an IPv4" >&2
+      echo "  address or CIDR: ${bad}" >&2
+      echo "  CrowdSec would load the file, ignore these, and never say so —" >&2
+      echo "  so the addresses you believe are protected would not be." >&2
+      fail=1
+    fi
+    # Not fatal, because a proxy's own engine may whitelist itself, but worth
+    # saying out loud: an unattended run cannot be asked this at a prompt.
+    if [[ -n "${WASP_PROXY_IP:-}" ]] \
+       && [[ ",${WASP_CROWDSEC_WHITELIST}," != *",${WASP_PROXY_IP},"* ]]; then
+      echo "NOTE: ${WASP_PROXY_IP} (the proxy) is not in WASP_CROWDSEC_WHITELIST." >&2
+      echo "  If X-Forwarded-For substitution ever breaks, this VM sees every" >&2
+      echo "  request as coming from the proxy — one brute-force attempt then" >&2
+      echo "  bans it and the site is down for every visitor." >&2
+      if [[ "${WASP_CS_ENFORCEMENT:-}" == "upstream" ]]; then
+        echo "  With upstream enforcement that ban is shared, so it is every" >&2
+        echo "  site behind that proxy, not just this one." >&2
+      fi
+    fi
+  fi
+
+  if [[ $fail -ne 0 ]]; then
+    echo "" >&2
+    echo "Nothing has been created. Fix the above and re-run." >&2
+    exit 1
+  fi
+
+  # Echo the contract when any of it was preset, so an unattended run leaves a
+  # record of what it was told rather than only what it did.
+  if [[ -n "${WASP_PROXY_IP:-}${WASP_CS_ENFORCEMENT:-}${WASP_LOOPBACK_HOSTS:-}${WASP_CROWDSEC_WHITELIST:-}${WASP_SSH_KEY_FILE:-}${WASP_SSH_KEYS:-}" ]]; then
+    echo "Deployment contract (from the environment):"
+    [[ -n "${WASP_SSH_KEY_FILE:-}" ]] && echo "  ssh keys from     ${WASP_SSH_KEY_FILE}"
+    [[ -n "${WASP_SSH_KEYS:-}" ]]     && echo "  ssh keys inline   $(printf '%s' "$WASP_SSH_KEYS" | grep -c . ) line(s)"
+    [[ -n "${WASP_PROXY_IP:-}" ]]       && echo "  trusted proxy    ${WASP_PROXY_IP}  (single literal address)"
+    [[ -n "${WASP_CS_ENFORCEMENT:-}" ]] && echo "  cs enforcement   ${WASP_CS_ENFORCEMENT}${WASP_CS_LAPI_URL:+  → ${WASP_CS_LAPI_URL}}"
+    [[ -n "${WASP_CS_LAPI_LOGIN:-}" ]]  && echo "  cs machine       ${WASP_CS_LAPI_LOGIN}"
+    [[ -n "${WASP_CROWDSEC_WHITELIST:-}" ]] && echo "  never ban        ${WASP_CROWDSEC_WHITELIST}"
+    [[ -n "${WASP_LOOPBACK_HOSTS:-}" ]] && echo "  loopback         ${WASP_LOOPBACK_HOSTS}"
+    echo ""
+  fi
+}
+contract_preflight
 
 LIB_DIR="${REPO_DIR}/lib"
 

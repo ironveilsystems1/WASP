@@ -206,7 +206,9 @@ their site.
 lowering the hardening, and allow its licence domain so it keeps updating:
 
 ```sh
-scp divi.zip admin@vm:/var/lib/wasp-import/incoming/
+scp -O divi.zip admin@vm:/var/lib/wasp-import/incoming/
+#   -O is required: no SFTP subsystem is enabled on the VM.
+#   rsync is only installed when the off-site method is rsync.
 doas wp-plugins.sh install-file /var/lib/wasp-import/incoming/divi.zip --activate
 doas wasp-egress.sh allow .elegantthemes.com
 ```
