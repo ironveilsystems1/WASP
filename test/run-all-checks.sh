@@ -33,12 +33,35 @@ if command -v php >/dev/null 2>&1; then
   done
   rm -f /tmp/.mulint.$$
   [ $pf = 0 ] && echo "  php -l: all mu-plugins OK"
-  if [ -x test/test-fail-closed.sh ]; then
-    ./test/test-fail-closed.sh || rc=1
-  fi
   if [ -f test/test-mfa-enforcement.php ]; then
     php test/test-mfa-enforcement.php || rc=1
   fi
+else
+  echo ""
+  echo "── php checks ────────────────────────────────────────────"
+  echo "  SKIPPED — php not installed. The mu-plugin lint and the 21-case MFA"
+  echo "  harness did not run. A syntax error in an mu-plugin is a site-wide"
+  echo "  fatal that cannot be cleared from wp-admin, so do not read a clean"
+  echo "  run here as covering them."
+fi
+
+# ── Shell test harnesses ─────────────────────────────────────────────────────
+# OUTSIDE the php block, which is where test-fail-closed.sh used to live.
+# It is a bash script with no PHP dependency, and nesting it there meant that
+# on any host without php the 57 negative tests were silently not run while the
+# suite still printed ALL CHECKS PASSED. That is the exact failure this file
+# exists to catch, in this file: a control present, correct, and not running.
+echo ""
+echo "── shell test harnesses ──────────────────────────────────"
+if [ -f test/test-fail-closed.sh ]; then
+  bash test/test-fail-closed.sh || rc=1
+else
+  echo "  test-fail-closed.sh MISSING — the negative tests are gone"; rc=1
+fi
+if [ -f test/test-topology.sh ]; then
+  bash test/test-topology.sh || rc=1
+else
+  echo "  test-topology.sh MISSING"; rc=1
 fi
 echo ""
 [ $rc = 0 ] && echo "ALL CHECKS PASSED" || echo "CHECKS FAILED"

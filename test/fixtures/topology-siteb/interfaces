@@ -1,0 +1,20 @@
+auto lo
+iface lo inet loopback
+
+iface enp1s0 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+	address 10.0.0.30/24
+	gateway 10.0.0.1
+	bridge-ports enp1s0
+	bridge-stp off
+	bridge-fd 0
+
+auto vmbr1
+iface vmbr1 inet manual
+	bridge-ports enp2s0
+	bridge-stp off
+	bridge-fd 0
+	bridge-vlan-aware yes
+	bridge-vids 2-4094

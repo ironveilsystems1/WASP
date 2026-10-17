@@ -1,0 +1,3 @@
+arch: amd64
+hostname: npmplus
+net0: name=eth0,bridge=vmbr1,gw=10.20.10.1,hwaddr=BC:24:11:00:00:02,ip=10.20.10.10/24,tag=10,type=veth

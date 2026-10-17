@@ -50,6 +50,29 @@ SUGGESTION = re.compile(
     r'(?:["\'][ ]{2,}|&&[ ]+|;[ ]+|\|\|[ ]+)(' + ROOT_BINS + r')\b'
 )
 
+# A command to run on a DIFFERENT machine must not carry this VM's doas.
+#
+# Added when WASP gained the central-LAPI topology: the instructions for
+# registering an agent run on the LAPI host, which may be OPNsense (no doas, a
+# root shell), a container (`podman exec crowdsec cscli …`), or another distro
+# entirely. Prefixing those with doas would be confidently wrong, and the cheap
+# way out of this check would have been to add it anyway — so the exemption has
+# to exist, or the check teaches the wrong lesson.
+#
+# Narrow on purpose. The line must SAY where it runs, in one of these shapes,
+# which makes the escape visible in review rather than implicit:
+#
+#     echo "   on the LAPI host:   cscli machines list"
+#     echo "   on OPNsense         pfctl -t crowdsec_blocklists -T show"
+#
+# A bare command with no host named is still flagged, which is the common case
+# and the one that locks an operator out of their own VM.
+OTHER_HOST = re.compile(
+    r'\bon\s+(?:the\s+\w[\w.-]*\s+(?:host|box|firewall|proxy|machine)|'
+    r'OPNsense|pfSense|NPMplus|a\s+\w+\s+bouncer)\b',
+    re.IGNORECASE,
+)
+
 
 def scan_text(text: str):
     problems = []
@@ -62,6 +85,9 @@ def scan_text(text: str):
             continue
         # A crontab line is written for root's crontab, not pasted by a human.
         if re.search(r'["\']\s*[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+\s', line):
+            continue
+        # The line names another machine, so this VM's doas does not apply.
+        if OTHER_HOST.search(line):
             continue
         for m in SUGGESTION.finditer(line):
             # Is this occurrence already preceded by doas?
@@ -127,6 +153,15 @@ def self_test():
     # REGRESSION: a crontab line is written for root, not pasted by a person.
     cron = 'echo "0 3 * * * apk update -q && apk upgrade --no-cache -q"\n'
     assert not scan_text(cron), "self-test: crontab line flagged"
+
+    # A command for ANOTHER machine must not be made to carry this VM's doas.
+    elsewhere = 'echo "   on the LAPI host:   cscli machines list"\n'
+    assert not scan_text(elsewhere), "self-test: another host's command flagged"
+    opn = 'echo "   on OPNsense         pfctl -t crowdsec_blocklists -T show"\n'
+    assert not scan_text(opn), "self-test: OPNsense command flagged"
+    # …and the exemption must not swallow the common case it exists beside.
+    here = 'echo "   cscli machines list"\n'
+    assert scan_text(here), "self-test: a local bare suggestion was exempted"
     return True
 
 

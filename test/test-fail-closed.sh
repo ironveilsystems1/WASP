@@ -250,6 +250,186 @@ _t6c() { local prof="$1" ep="$2" blocked=0
 #
 # This is the drift the header warns about, and it needs closing rather than
 # noting. Each fail-closed path is asserted to be present at its call site, so
+echo ""
+echo "── SSH public keys"
+# Supplying any key switches password authentication OFF for the whole VM, so
+# an unusable authorized_keys is not a degraded login — it is a VM with no
+# network access, reachable only from the Proxmox console. For years the only
+# control here was a sentence in the prompt saying not to paste the private
+# half.
+_k0="$(mktemp)"
+sed -n '/^_ssh_key_kind()/,/^}/p;/^_ssh_key_blob()/,/^}/p' "$REPO/lib/00-preflight.sh" > "$_k0"
+if [ -s "$_k0" ]; then
+  _kind() { ( . "$_k0"; _ssh_key_kind "$1" ); }
+  _ED="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK7Yz9kQf2vJ8mN3pQrS5tUvWxYz0a1B2c3D4e5F6g7H u@h"
+
+  [ "$(_kind '-----BEGIN OPENSSH PRIVATE KEY-----')" = "private" ] \
+    && _p "a private key is identified, not accepted" \
+    || _f "a private key was not identified" \
+          "no login, no password fallback, and the private half on the VM's disk"
+  [ "$(_kind '-----BEGIN RSA PRIVATE KEY-----')" = "private" ] \
+    && _p "the older PEM private-key header is identified too" \
+    || _f "PEM private key not identified" ""
+  [ "$(_kind 'SHA256:abc123 u@h (ED25519)')" = "fingerprint" ] \
+    && _p "a fingerprint paste is rejected" \
+    || _f "a fingerprint was treated as a key" \
+          "it identifies a key; it cannot authenticate one"
+  [ "$(_kind 'ssh-ed25519 AAAAC3Nza u@h')" = "unknown" ] \
+    && _p "a truncated key is rejected" \
+    || _f "a truncated key was accepted" \
+          "sshd silently ignores the line; this is the common real failure"
+  [ "$(_kind 'not a key at all')" = "unknown" ] \
+    && _p "prose is rejected" || _f "prose accepted as a key" ""
+  [ "$(_kind "$_ED")" = "ok" ] \
+    && _p "a valid ed25519 key is accepted" || _f "a valid key was rejected" ""
+  [ "$(_kind "restrict,from=\"10.0.0.0/8\" $_ED")" = "ok" ] \
+    && _p "an options prefix is accepted (restrict,from=…)" \
+    || _f "a legitimate options prefix was rejected" \
+          "it is the way to scope one key to one source"
+  [ "$(_kind 'sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIK7Yz9kQf2vJ8mN3pQrS5tUvWxYz0a1B2c3 yk')" = "ok" ] \
+    && _p "a FIDO sk-* key is accepted" || _f "FIDO key rejected" ""
+
+  # Same key, different comment, is one key.
+  _b1="$( . "$_k0"; _ssh_key_blob "$_ED" )"
+  _b2="$( . "$_k0"; _ssh_key_blob "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK7Yz9kQf2vJ8mN3pQrS5tUvWxYz0a1B2c3D4e5F6g7H other@box" )"
+  [ -n "$_b1" ] && [ "$_b1" = "$_b2" ] \
+    && _p "de-duplication keys on the blob, not the comment" \
+    || _f "the same key with two comments would be stored twice" ""
+else
+  _f "the SSH key classifier is missing from lib/00" \
+     "both lib/01 and lib/05 depend on it"
+fi
+rm -f "$_k0"
+
+# NOTE: the "does the shipped code still call this" assertions for SSH keys are
+# in the guards section at the end of this file, not here — _guard is defined
+# down there, and calling it this early fails with `command not found` while
+# the suite still reports a pass for everything around it. Found by doing
+# exactly that.
+
+# The production re-ask must not have its own read-and-assign any more.
+if grep -qE 'SSH_KEYS=\$\(cat "\$_PROD_KEY_INPUT"\)' "$REPO/lib/01-interactive-setup.sh" 2>/dev/null; then
+  _f "the production re-ask assigns SSH_KEYS without validating" \
+     "a pasted private key satisfies the loop and disables password auth"
+else
+  _p "the production re-ask goes through the validated collector"
+fi
+
+echo ""
+echo "── CrowdSec enforcement topology"
+# The gate this replaces was the one case in this file's own catalogue where a
+# fail-closed check pointed the wrong way: production REFUSED a VM without a
+# local bouncer, which behind a reverse proxy is the configuration that cannot
+# enforce anything. So the question is no longer "is the bouncer up" but "does
+# enforcement exist on this traffic path".
+_t8() { # mode, proxy_ip, bouncer_up, bouncer_registered, lapi_ready -> blocked?
+  local mode="$1" proxy="$2" up="$3" reg="$4" lapi="$5" blocked=0
+  block_production() { blocked=1; }
+  case "$mode" in
+    local)
+      if [ -n "$proxy" ]; then block_production "local behind proxy"
+      elif [ "$up" != "1" ] || [ "$reg" != "1" ]; then block_production "no bouncer"; fi ;;
+    upstream)    [ "$lapi" != "1" ] && block_production "agent unauthenticated" ;;
+    detect-only) block_production "detection only" ;;
+  esac
+  echo "$blocked"; }
+
+[ "$(_t8 local 10.20.10.10 1 1 0)" = "1" ] \
+  && _p "local enforcement behind a proxy -> BLOCKED" \
+  || _f "a VM behind a proxy was certified as enforcing locally" \
+        "its bans match no packet it ever sees; this is the original defect"
+[ "$(_t8 local '' 1 1 0)" = "0" ] \
+  && _p "local enforcement, direct access, bouncer up -> no block" \
+  || _f "false block on a directly-reachable VM" ""
+[ "$(_t8 local '' 0 0 0)" = "1" ] \
+  && _p "local enforcement, direct access, no bouncer -> BLOCKED" \
+  || _f "detection-only certified on a direct-access VM" \
+        "the pre-10.4 gate caught this and it must keep catching it"
+[ "$(_t8 upstream 10.20.10.10 0 0 1)" = "0" ] \
+  && _p "upstream, agent authenticated -> no block" \
+  || _f "false block with working upstream enforcement" ""
+[ "$(_t8 upstream 10.20.10.10 0 0 0)" = "1" ] \
+  && _p "upstream, agent could NOT reach the LAPI -> BLOCKED" \
+  || _f "a VM reporting to nobody was certified" \
+        "detection that reaches no LAPI reaches no bouncer either"
+[ "$(_t8 detect-only 10.20.10.10 0 0 0)" = "1" ] \
+  && _p "detect-only -> BLOCKED (declared, not discovered)" \
+  || _f "detect-only certified as production" ""
+# A running local bouncer must not rescue an upstream VM from the gate: the
+# whole point is that its presence proves nothing behind a proxy.
+[ "$(_t8 upstream 10.20.10.10 1 1 0)" = "1" ] \
+  && _p "a running local bouncer does not satisfy the upstream gate" \
+  || _f "a local bouncer was accepted as upstream enforcement" \
+        "that is exactly the inference 10.4 exists to remove"
+
+echo ""
+echo "── TRUST-COUNT: RemoteIPTrustedProxy takes one literal address"
+# Driven through the REAL guard shape used in lib/03 and lib/06. A range lets
+# any host inside it forge the client address in X-Forwarded-For — the address
+# CrowdSec bans, wp-admin allows, and the login guard counts against.
+_t9() { local v="$1"; case "$v" in */*|*,*|*[[:space:]]*) echo refused ;; *) echo accepted ;; esac; }
+[ "$(_t9 10.20.10.0/24)" = "refused" ]          && _p "a CIDR -> refused"            || _f "a CIDR was accepted" "any host in the range can forge the client IP"
+[ "$(_t9 '10.20.10.10,10.20.10.11')" = "refused" ] && _p "a list -> refused"         || _f "a list was accepted" "mod_remoteip trusts every entry"
+[ "$(_t9 '10.20.10.10 10.20.10.11')" = "refused" ] && _p "two space-separated -> refused" || _f "two addresses accepted" ""
+[ "$(_t9 10.20.10.10)" = "accepted" ]           && _p "a single literal -> accepted" || _f "the correct form was refused" ""
+
+# The installer's own preflight, run for real rather than re-implemented.
+if [ -r "$REPO/install.sh" ]; then
+  _cpf="$(mktemp)"; sed -n '/^contract_preflight() {/,/^}/p' "$REPO/install.sh" > "$_cpf"
+  if [ -s "$_cpf" ]; then
+    _pf() { ( set +u; . "$_cpf"; export "$@"; contract_preflight >/dev/null 2>&1 ) \
+            && echo accepted || echo refused; }
+    [ "$(_pf WASP_PROXY_IP=10.20.0.0/16)" = "refused" ] \
+      && _p "install.sh refuses a CIDR in WASP_PROXY_IP" \
+      || _f "install.sh accepted a CIDR" "fifteen minutes later lib/06 catches it, or does not"
+    [ "$(_pf WASP_PROXY_IP=npm.internal)" = "refused" ] \
+      && _p "install.sh refuses a hostname (resolved once at Apache startup)" \
+      || _f "install.sh accepted a hostname" ""
+    [ "$(_pf WASP_PROXY_IP=10.20.10.10)" = "accepted" ] \
+      && _p "install.sh accepts a single literal address" \
+      || _f "install.sh refused a valid address" ""
+    [ "$(_pf WASP_CS_ENFORCEMENT=upstream)" = "refused" ] \
+      && _p "install.sh refuses upstream with no LAPI credentials" \
+      || _f "upstream accepted with no credentials" \
+            "it would degrade to detect-only with nobody there to read why"
+    [ "$(_pf WASP_CS_ENFORCEMENT=upstream WASP_CS_LAPI_URL=http://127.0.0.1:8080/ WASP_CS_LAPI_LOGIN=a WASP_CS_LAPI_PASSWORD=b)" = "refused" ] \
+      && _p "install.sh refuses a loopback LAPI URL" \
+      || _f "a loopback LAPI was accepted" "that address is this VM, not the central LAPI"
+    [ "$(_pf WASP_CS_ENFORCEMENT=sideways)" = "refused" ] \
+      && _p "install.sh refuses an unknown enforcement mode" \
+      || _f "an unknown mode fell through to a default" \
+            "the candidate defaults differ by whether this VM enforces at all"
+    # A malformed whitelist entry fails NOWHERE at runtime: CrowdSec loads the
+    # file, ignores what it cannot parse, and the address the operator believes
+    # is protected is not. Discovered during a lockout, or never.
+    [ "$(_pf WASP_CROWDSEC_WHITELIST=10.0.0.16o)" = "refused" ] \
+      && _p "install.sh refuses a malformed whitelist entry" \
+      || _f "a typo'd whitelist entry was accepted" \
+            "CrowdSec silently ignores it and the address is unprotected"
+    [ "$(_pf WASP_CROWDSEC_WHITELIST=my-laptop.lan)" = "refused" ] \
+      && _p "install.sh refuses a hostname in the whitelist" \
+      || _f "a hostname was accepted as a whitelist entry" ""
+    [ "$(_pf WASP_CROWDSEC_WHITELIST=10.20.10.10,10.0.0.160,100.64.0.0/10)" = "accepted" ] \
+      && _p "install.sh accepts a valid whitelist including a CIDR" \
+      || _f "a valid whitelist was refused" ""
+    # Not fatal — a proxy's own engine may whitelist itself — but it must be
+    # said, because an unattended run cannot be asked at a prompt.
+    if ( set +u; . "$_cpf"; export WASP_PROXY_IP=10.20.10.10 \
+         WASP_CS_ENFORCEMENT=upstream WASP_CS_LAPI_URL=http://10.20.10.10:8080/ \
+         WASP_CS_LAPI_LOGIN=a WASP_CS_LAPI_PASSWORD=b \
+         WASP_CROWDSEC_WHITELIST=10.0.0.160; contract_preflight 2>&1 >/dev/null ) \
+       | grep -q "the proxy) is not in"; then
+      _p "install.sh warns when the proxy is absent from the whitelist"
+    else
+      _f "a preset whitelist omitting the proxy passed silently" \
+         "if XFF substitution breaks, this VM bans the proxy and the site is down"
+    fi
+  else
+    _f "contract_preflight not found in install.sh" "the preset validation is gone"
+  fi
+  rm -f "$_cpf"
+fi
+
 # removing one fails the suite even though the logic tests would not notice.
 echo ""
 echo "── The guards exist in the shipped code"
@@ -280,6 +460,42 @@ if grep -qE '^\s*\.\s+"\$CONF"' "$REPO/payload/bin/wasp-offsite-backup.sh" 2>/de
   _f "offsite.conf is being SOURCED again" "write access to it becomes root code execution"
 else
   _p "no live source of offsite.conf remains"
+fi
+_guard "local enforcement behind a proxy is a blocker" \
+  "payload/stages/09-crowdsec-and-backup.sh" "behind a reverse proxy at"
+_guard "an unauthenticated upstream agent is a blocker" \
+  "payload/stages/09-crowdsec-and-backup.sh" "report to a central CrowdSec LAPI"
+_guard "detect-only is a blocker" \
+  "payload/stages/09-crowdsec-and-backup.sh" "enforcement is set to detect-only"
+_guard "no local bouncer is installed in upstream mode" \
+  "payload/stages/09-crowdsec-and-backup.sh" 'CS_ENFORCEMENT" = "local"'
+_guard "lib/06 asserts TRUST-COUNT before writing the directive" \
+  "lib/06-vars-and-payload-inject.sh" 'RemoteIPTrustedProxy needs a single literal'
+_guard "lib/03 asserts TRUST-COUNT at its own write site" \
+  "lib/03-dynamic-configs.sh" "expected a single IPv4 address"
+_guard "install.sh validates the deployment contract before building" \
+  "install.sh" "contract_preflight"
+_guard "cs-doctor asks whether a local ban can match real traffic" \
+  "payload/bin/wp-hardening.sh" "Can a local ban match real traffic"
+# Both SSH key collectors must go through the one validator. A second path
+# collecting the same security-critical value with less rigour is how the
+# production re-ask came to accept a private key and then switch password auth
+# off on the strength of it.
+_guard "lib/01 validates every SSH key it accepts" \
+  "lib/01-interactive-setup.sh" "_ssh_key_kind"
+_guard "lib/05 re-validates SSH keys at the write site" \
+  "lib/05-ssh-and-network-inject.sh" "_ssh_key_kind"
+_guard "lib/05 refuses to build a VM with no usable key" \
+  "lib/05-ssh-and-network-inject.sh" "Refusing to build a VM with no way in"
+_guard "install.sh refuses a private key in the preset file" \
+  "install.sh" "contains a PRIVATE key"
+# The production gate must not abort mid-stage: that strands the operator
+# without stage 10's diagnostic tooling, which this stage already taught once.
+if grep -nE '^\s*err "cs-firewall-bouncer' "$REPO/payload/stages/09-crowdsec-and-backup.sh" >/dev/null 2>&1; then
+  _f "the CrowdSec gate calls err() mid-stage again" \
+     "stage 10 never runs, so the tools needed to diagnose it are not installed"
+else
+  _p "the CrowdSec gate defers rather than aborting mid-stage"
 fi
 
 # ── Result ───────────────────────────────────────────────────────────────────

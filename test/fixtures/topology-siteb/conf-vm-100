@@ -1,0 +1,5 @@
+cores: 2
+memory: 4096
+name: opnsense
+net0: virtio=BC:24:11:AA:BB:CC,bridge=vmbr0
+net1: virtio=BC:24:11:AA:BB:CD,bridge=vmbr1

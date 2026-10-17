@@ -1,0 +1,2 @@
+default via 192.168.1.1 dev vmbr0 proto kernel
+192.168.1.0/24 dev vmbr0 proto kernel scope link src 192.168.1.50
