@@ -389,8 +389,58 @@ verify_release() {
     # Deliberately not silently downgraded to "hashes only": hashes from an
     # unverified manifest catch corruption, not tampering, and reporting that
     # as verification would be worse than reporting nothing.
-    _sig_fail "minisign is not installed, so the release SIGNATURE cannot be checked (apt install minisign)."
-    return 0
+    #
+    # BUT this cause is different in kind from the other three, and the message
+    # used to hide that. "Unsigned build", "no manifest" and "invalid
+    # signature" are all problems WITH THE RELEASE. A missing minisign is a
+    # missing tool on this host, fixable in one command, with a correctly
+    # signed release sitting right there.
+    #
+    # Reported from a real run on a Proxmox host: the operator saw
+    # "an unverified install is not permitted", a block promoting
+    # WASP_DEV_UNVERIFIED=1, and the actual fix in parentheses on the first
+    # line. The cheap correct answer was the least prominent thing on screen
+    # and the expensive wrong one came with a command to copy — so the likely
+    # outcome was a permanently UNVERIFIED VM when `apt install minisign`
+    # would have verified it.
+    echo ""
+    echo "  minisign is not installed, so the release signature cannot be checked."
+    echo ""
+    echo "  This is a missing tool on THIS HOST, not a problem with the release."
+    echo "  Do NOT reach for WASP_DEV_UNVERIFIED — that permanently marks the VM"
+    echo "  unverified to work around a package you can install in one command:"
+    echo ""
+    echo "      apt install -y minisign"
+    echo ""
+    # Offered, never automatic. Installing packages on someone's hypervisor
+    # without asking is exactly the kind of thing this project does not do, and
+    # a non-interactive run cannot consent — it falls through to the refusal
+    # below, which is the correct outcome for an unattended install.
+    if [[ -t 0 ]] && command -v apt-get >/dev/null 2>&1; then
+      printf "  Install it now and continue? [Y/n] : "
+      read -r _mi
+      if [[ ! "${_mi:-y}" =~ ^[Nn] ]]; then
+        echo "  Installing minisign…"
+        if apt-get install -y minisign >/dev/null 2>&1 \
+           || { apt-get update >/dev/null 2>&1 && apt-get install -y minisign >/dev/null 2>&1; }; then
+          if command -v minisign >/dev/null 2>&1; then
+            echo "  ✔ minisign installed — continuing with verification."
+            # Fall through to the real checks below rather than returning.
+            # Returning here would skip verification entirely, which would
+            # turn a fixed problem into an unverified install.
+          else
+            echo "  apt reported success but minisign is still not on PATH." >&2
+          fi
+        else
+          echo "  Could not install it automatically." >&2
+          echo "  Run 'apt install minisign' yourself, then re-run this script." >&2
+        fi
+      fi
+    fi
+    if ! command -v minisign >/dev/null 2>&1; then
+      _sig_fail "minisign is still not installed, so the release SIGNATURE cannot be checked."
+      return 0
+    fi
   fi
 
   verify_key_dns

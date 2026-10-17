@@ -6,6 +6,148 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## Unreleased — the installer now reads the host instead of trusting the answer
+
+From the melroseparkfire install on tispve (2026-10-17). Every prompt answered,
+the Alpine image built and verified, the whole payload injected — then dead at
+VM creation on:
+
+```
+storage 'local-vm' does not exist
+```
+
+Fifteen minutes and a full questionnaire for a one-character typo the host could
+have refused at the prompt. **Three faults lined up to make that possible**, and
+all three are fixed.
+
+### The storage list printed nothing
+
+`pvesm status` columns are `Name Type Status Total Used Available %`. The awk
+filtered on `$2=="active"` — but `$2` is the **type** (`lvmthin`, `dir`) and is
+never the string `active`, so the filter matched nothing and `$4` printed Total
+rather than the type. The operator saw `Available storages:` followed by a blank
+line.
+
+Then the default was hardcoded `local-lvm` regardless of what the host had, and
+the answer was never checked against anything.
+
+Now: the list is correct, the default is a storage that actually exists on
+**this** host, and a name that does not exist re-prompts — with a
+nearest-match suggestion, because the failure being replaced was `local-vm`
+for `local-lvm`, which reads as correct at a glance.
+
+### Validation at every prompt that names something real
+
+Predicates live in `lib/00` — inside the signed manifest. `tools/` is not
+signed, so an installer that read its facts from `tools/wasp-topology.sh` would
+have a verification gap; the standalone tool keeps its richer map, plan and
+bundle modes, and the installer carries only what it needs to refuse a wrong
+answer.
+
+| Prompt | Now refuses or warns |
+|---|---|
+| Storage | a name with no active image storage — re-prompts |
+| Bridge | a bridge that does not exist — re-prompts |
+| VLAN tag | out of 1–4094; **a tag on a non-VLAN-aware bridge** (Proxmox accepts it and delivers the frames untagged, so the guest lands on the wrong segment with no error); a tag another guest already uses |
+| Static IP | an address another guest already holds — an ARP conflict presents as intermittent loss on both hosts, not a clean failure |
+
+The VLAN-awareness warning says what to change and that it is a live network
+change worth wrapping in a revert timer, rather than just naming the condition.
+
+### What is already on the host, shown before the questions that collide with it
+
+VLAN tags and addresses in use are printed immediately before the network
+prompts — at the point where they change an answer, not as a separate summary
+at the top. Both collisions they prevent are silent: a reused tag puts two trust
+boundaries on one segment and both keep working; a colliding subnet makes a
+remote site invisible over an overlay, because the directly-connected route
+wins.
+
+It is read from Proxmox's guest configuration, so a VM addressed inside the
+guest is invisible — stated at the prompt, because a check that silently covers
+half the cases is worse than one whose limit is known. The full map and a
+non-colliding proposed stack remain `tools/wasp-topology.sh --plan`.
+
+### The interface hint was teaching the wrong answer
+
+It printed `10.0.0.4  (subnet: 10.0.0.4/24)`. The subnet is `10.0.0.0/24`. The
+operator then entered `10.0.0.4/24` at the SSH and wp-admin CIDR prompts —
+which is what the installer had just told them their subnet was. nft and Apache
+both normalise it, so it worked, and the summary displayed it back as though it
+were a network.
+
+It also offered the NetBird overlay address as a candidate, with a `/16` of
+CGNAT presented as "your subnet". Now the real network address is computed, and
+overlay, link-local and loopback are left out — a list you have to know to
+ignore is not a hint.
+
+---
+
+## Unreleased — release signing, scripted
+
+**`tools/wasp-sign-release.sh`** and **[docs/SIGNING.md](docs/SIGNING.md)**.
+Signing was documented as two commands to run by hand; the script produces
+exactly what `verify_release()` checks, in the order that matters, and proves
+it before publishing.
+
+Key published at `minisign._wasp.ironveil.systems`, read out of `install.sh`
+rather than hardcoded in the script, so the two cannot drift.
+
+```
+--keygen   once, ever          --dns     the TXT record to publish
+(default)  sign a release      --check   prove it the way install.sh will
+```
+
+### The ordering trap, enforced rather than documented
+
+`install.sh` is **in** the manifest, and the public key is embedded **in**
+`install.sh`. So embedding the key changes `install.sh`, which changes its
+hash. Embed, then hash, then sign — any other order yields a release whose
+signature is valid and whose `sha256sum -c` fails on `install.sh`, which the
+installer reports as *"the signature was valid … which means a shipped file was
+modified after signing"*. Indistinguishable from tampering, caused by signing
+in the wrong order.
+
+The script also refuses a dirty tree, and runs `test/run-all-checks.sh` first:
+a signature says the files are authentic, not that they work, and signing a
+build that fails its own checks publishes the failure with a guarantee
+attached.
+
+`--check` runs all five of the installer's checks plus two it cannot: manifest
+**coverage**, because a valid signature over an incomplete manifest verifies
+perfectly and leaves files unsigned; and the DNS cross-check, so an
+unpublished rotation is found by you rather than by a client.
+
+### Three defects found while testing it
+
+**A `set -e` bug in the script itself.** The trusted comment was built with
+`$([ -d .git ] && printf ... )` — when `.git` is absent the substitution's last
+command is the failed test, so under `set -e` the *assignment* exits 1 and the
+script dies having printed one line and nothing else. It read as a hung
+passphrase prompt; minisign never ran.
+
+`check-seterr-capture.py` could not see it, because it scanned only `payload/`
+and `lib/`. **`tools/` is now in its scanned set** (48 scripts, up from 45) —
+those run as root on the Proxmox host under `set -euo pipefail`, which is
+exactly the condition that makes an unguarded capture fatal.
+
+A rule for the shape itself was written and then **removed**. Flagging "an
+assignment whose `$( )` contains `&&` or `||` without a fallback" produced nine
+false positives on correct code: `&&` inside awk *program text*, `||` from
+`sed 's|^\./||'` delimiters, trailing `|| _x=0` guards the pattern cannot see,
+and fallbacks that are not `true`/`:`/`echo`. Shell operators are not
+distinguishable from quoted program text by a per-line regex, and a check wrong
+nine times in ten gets suppressed or makes the suite permanently red. The shape
+is recorded in the file for review instead, with the symptom to recognise.
+
+**A false positive in `check-line-continuations.py`.** Its statement pattern
+used `install\b`, and `\b` treats a dot as a word boundary — so it matched the
+*filename* `install.sh`, which is the most-referenced path in this repo and
+appears legitimately as the argument of a continued command. Now requires the
+name to be the command.
+
+---
+
 ## Unreleased — fetching a site from someone else's hosting
 
 **[docs/IMPORT-FETCH.md](docs/IMPORT-FETCH.md)** — pulling a WordPress site off

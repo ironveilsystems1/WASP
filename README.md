@@ -83,6 +83,7 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Threat Intelligence](#threat-intelligence-crowdsec-cti)
 - [Incident Playbook](INCIDENT-PLAYBOOK.md), the [support runbook](SUPPORT-RUNBOOK.md)
 - [MSP Runbook](MSP-RUNBOOK.md)
+- [Signing a release](docs/SIGNING.md)
 - [Fetching a site from someone else's hosting](docs/IMPORT-FETCH.md)
 - [Import design](docs/IMPORT-DESIGN.md)
 - [Fleet management](docs/FLEET.md)

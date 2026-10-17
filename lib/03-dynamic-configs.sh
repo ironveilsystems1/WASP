@@ -10,7 +10,11 @@
 WEB_CONTAINER_PORT=80
 
 if [[ -n "$SSH_CIDR" ]]; then
-  SSH_RULE="ip saddr ${SSH_CIDR} tcp dport 22"
+  # Braced, because SSH_CIDR can now hold a list. `ip saddr a,b` is a syntax
+  # error; `ip saddr { a, b }` is a set. nft accepts a single element inside
+  # braces too, so this is correct either way and there is no branch to get
+  # wrong later. The same bracing is why the WEB_RULE below survived a list.
+  SSH_RULE="ip saddr { ${SSH_CIDR} } tcp dport 22"
 else
   SSH_RULE="tcp dport 22"
 fi
@@ -20,7 +24,10 @@ if [[ -n "$WEB_CIDR" && -n "$PROXY_IP" ]]; then
   # to port 80 even though mod_remoteip would correctly identify the real client.
   WEB_RULE="ip saddr { ${WEB_CIDR}, ${PROXY_IP} } tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
 elif [[ -n "$WEB_CIDR" ]]; then
-  WEB_RULE="ip saddr ${WEB_CIDR} tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
+  # Braced for the same reason as SSH above: WEB_CIDR is built as a comma list
+  # in lib/01 when admin addresses are added alongside the proxy, and this
+  # branch (no PROXY_IP) was the one that would have emitted it unbraced.
+  WEB_RULE="ip saddr { ${WEB_CIDR} } tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
 else
   WEB_RULE="tcp dport { ${WEB_CONTAINER_PORT}, 443 }"
 fi
@@ -610,6 +617,54 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
   # context) is now removed from the pattern side; the substitution side
   # keeps its leading "/" (an absolute path from the document root), same as
   # WordPress core's own `RewriteRule . /index.php [L]`.
+  # ── Read the shared rewrite template BEFORE building the block ───────────
+  # FORENSIC FIX, from a real install on tispve (melroseparkfire, 2026-10-17).
+  #
+  # This sed used to run INSIDE the heredoc below, reading
+  # "${SCRIPT_DIR}/payload/templates/slug-rewrite.rules". SCRIPT_DIR is
+  # assigned NOWHERE in this project — the repository root is REPO_DIR — so it
+  # expanded empty and sed was handed the absolute path
+  # "/payload/templates/slug-rewrite.rules", which does not exist.
+  #
+  # What that produced, in order:
+  #
+  #   sed: can't read /payload/templates/slug-rewrite.rules: No such file
+  #   ✔  Apache security config built (… slug: firedept)
+  #
+  # A command substitution that fails yields an empty string, the heredoc
+  # completed, and the next line printed success.
+  #
+  # The consequence was NOT "the slug might not work". The two rules in that
+  # template are the only thing that sets E=WPVM_SLUG:1, and the rule below
+  # 403s /wp-login.php whenever that env var is absent. So the generated config
+  # gave:
+  #
+  #   /<slug>         404  — no rewrite rule was emitted
+  #   /wp-login.php   403  — blocked, because WPVM_SLUG is never set
+  #
+  # i.e. a VM with NO login path at all, reported as configured. An operator
+  # discovers it after the install, from the outside, with no error to go on.
+  #
+  # Now: read it first, into a variable, and fail the install if it is missing.
+  # A template this file cannot find is a packaging fault, and continuing past
+  # it can only produce a broken site.
+  _slug_tmpl="${REPO_DIR}/payload/templates/slug-rewrite.rules"
+  [[ -r "$_slug_tmpl" ]] || msg_error "Cannot read ${_slug_tmpl}
+   This file is the single source of truth for the custom-login-slug rewrite
+   rules. Without it the generated config would 404 the slug AND 403
+   /wp-login.php, leaving no way to log in — so the install stops here rather
+   than building that.
+   It ships in payload/templates/; if it is absent the release is incomplete."
+  SLUG_RULES=$(sed -e "s|@@SLUG@@|${WP_ADMIN_SLUG}|g" \
+                   -e "s|^|      |" \
+                   -e "s|/wp-admin/\$1|/wp-admin/\\\\\$1|" \
+                   "$_slug_tmpl" | grep -vE '^ *(#|$)')
+  # grep -v can legitimately return 1 (nothing matched); what must not happen
+  # is an EMPTY result, which is the silent-failure shape above.
+  [[ -n "$SLUG_RULES" ]] || msg_error "The slug rewrite template produced no rules.
+   ${_slug_tmpl} exists but yielded nothing after substitution. The generated
+   config would 403 /wp-login.php with no slug to reach it instead."
+
   SLUG_BLOCK=$(cat << SLUGEOF
     # ── Custom wp-admin slug ────────────────────────────────────────────────
     # Slug: /${WP_ADMIN_SLUG}
@@ -636,11 +691,7 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
       #   /edith        -> wp-login.php
       #   /edith/       -> wp-login.php
       #   /edith/foo    -> wp-admin/foo
-$(sed -e "s|@@SLUG@@|${WP_ADMIN_SLUG}|g" \
-      -e "s|^|      |" \
-      -e "s|/wp-admin/\$1|/wp-admin/\\\\\$1|" \
-      "${SCRIPT_DIR}/payload/templates/slug-rewrite.rules" \
-      | grep -vE '^ *(#|$)')
+${SLUG_RULES}
 
       # v7-14: block the default login path unless the request came through
       # the slug rewrite above. Without this the slug was decorative — bots

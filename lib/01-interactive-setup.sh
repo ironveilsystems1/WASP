@@ -173,18 +173,125 @@ done
 read -rp "  Hostname       [wordpress] : " HN; HN="${HN:-wordpress}"
 
 echo ""
-msg_info "Available storages:"
-pvesm status --content images 2>/dev/null \
-  | awk 'NR>1 && $2=="active" {printf "    • %-20s (%s)\n", $1, $4}'
-read -rp "  Storage  [local-lvm] : " STORAGE; STORAGE="${STORAGE:-local-lvm}"
-read -rp "  Bridge       [vmbr0] : " BRIDGE;  BRIDGE="${BRIDGE:-vmbr0}"
-read -rp "  VLAN tag  (blank=no) : " VLAN_RAW
+# ── Storage: listed correctly, defaulted to what exists, and validated ───────
+# All three were broken, and together they cost a full install run: the list
+# printed nothing (wrong awk column), the default was hardcoded regardless of
+# what the host had, and the answer was never checked — so `local-vm` was
+# accepted and failed fifteen minutes later at disk import.
+_STORAGES=$(_pve_storages)
+if [ -n "$_STORAGES" ]; then
+  msg_info "Available storages:"
+  printf '%s\n' "$_STORAGES" | awk '{printf "    • %-20s (%s)\n", $1, $2}'
+  # Prefer a real local-lvm if present, else the first active image store, so
+  # the default is always something that exists on THIS host.
+  _STOR_DEFAULT=$(printf '%s\n' "$_STORAGES" | awk '$1=="local-lvm"{print $1; exit}')
+  [ -n "$_STOR_DEFAULT" ] || _STOR_DEFAULT=$(printf '%s\n' "$_STORAGES" | awk 'NR==1{print $1}')
+else
+  # No list means pvesm is absent or answered nothing. Keep going — preflight
+  # has its own Proxmox checks — but do not pretend to validate.
+  msg_warn "Could not list storages (pvesm unavailable or returned nothing)."
+  msg_warn "  Your answer cannot be checked here, so a typo will surface at VM"
+  msg_warn "  creation instead. Confirm with:  pvesm status --content images"
+  _STOR_DEFAULT="local-lvm"
+fi
+while :; do
+  read -rp "  Storage  [${_STOR_DEFAULT}] : " STORAGE; STORAGE="${STORAGE:-$_STOR_DEFAULT}"
+  [ -z "$_STORAGES" ] && break
+  _storage_exists "$STORAGE" && break
+  msg_warn "No active image storage called '${STORAGE}' on this host."
+  # Named explicitly, because the failure this replaces was a one-character
+  # typo (local-vm for local-lvm) that reads as correct at a glance.
+  _near=$(printf '%s\n' "$_STORAGES" | awk '{print $1}' \
+          | awk -v w="$STORAGE" 'index($0,substr(w,1,4))||index(w,substr($0,1,4))' | head -3)
+  [ -n "$_near" ] && msg_info "  Did you mean: $(printf '%s ' $_near)"
+  msg_info "  Pick one of the names listed above."
+done
+
+# ── Bridge: same treatment ───────────────────────────────────────────────────
+_BRIDGES=$(_pve_bridges | sort -u)
+if [ -n "$_BRIDGES" ]; then
+  msg_info "Available bridges:"
+  while IFS= read -r _b; do
+    [ -z "$_b" ] && continue
+    if _bridge_is_vlan_aware "$_b"; then
+      printf '    • %-12s %s\n' "$_b" "VLAN-aware"
+    else
+      printf '    • %-12s %s\n' "$_b" "not VLAN-aware"
+    fi
+  done <<< "$_BRIDGES"
+  _BR_DEFAULT=$(printf '%s\n' "$_BRIDGES" | grep -qx vmbr0 && echo vmbr0 || printf '%s\n' "$_BRIDGES" | head -1)
+else
+  _BR_DEFAULT="vmbr0"
+fi
+while :; do
+  read -rp "  Bridge       [${_BR_DEFAULT}] : " BRIDGE; BRIDGE="${BRIDGE:-$_BR_DEFAULT}"
+  [ -z "$_BRIDGES" ] && break
+  _bridge_exists "$BRIDGE" && break
+  msg_warn "No bridge called '${BRIDGE}' on this host. Pick one listed above."
+done
+
+# ── VLAN tag: the two things that silently misplace a guest ──────────────────
+while :; do
+  read -rp "  VLAN tag  (blank=no) : " VLAN_RAW
+  [ -z "$VLAN_RAW" ] && break
+  case "$VLAN_RAW" in
+    ''|*[!0-9]*) msg_warn "A VLAN tag is a number from 1 to 4094."; continue ;;
+  esac
+  if [ "$VLAN_RAW" -lt 1 ] || [ "$VLAN_RAW" -gt 4094 ]; then
+    msg_warn "A VLAN tag is a number from 1 to 4094."; continue
+  fi
+  # Proxmox accepts a tag on a non-VLAN-aware bridge and delivers the frames
+  # untagged. The guest then comes up on the wrong segment, reachable from the
+  # wrong places, with nothing reporting an error anywhere.
+  if [ -n "$_BRIDGES" ] && ! _bridge_is_vlan_aware "$BRIDGE"; then
+    echo ""
+    msg_warn "${BRIDGE} is NOT VLAN-aware, and you have given a tag."
+    msg_warn "  Proxmox accepts this and delivers the frames UNTAGGED. The VM"
+    msg_warn "  comes up on ${BRIDGE}'s native segment instead of VLAN ${VLAN_RAW},"
+    msg_warn "  with no error anywhere — and every firewall rule you write"
+    msg_warn "  about it will name a segment it is not on."
+    msg_info "  Fix on the host:  'bridge-vlan-aware yes' on ${BRIDGE} in"
+    msg_info "  /etc/network/interfaces. That is a live network change — wrap"
+    msg_info "  it in a revert timer before applying it on a remote host."
+    read -rp "  Continue anyway? [y/N] : " _vt
+    case "${_vt:-n}" in y|Y) : ;; *) continue ;; esac
+    unset _vt
+  fi
+  if _vlan_tag_in_use "$VLAN_RAW"; then
+    msg_info "VLAN ${VLAN_RAW} is already used by another guest on this host."
+    msg_info "  Expected if this is another tenant on a shared segment; wrong if"
+    msg_info "  each site is supposed to have its own trust boundary."
+  fi
+  break
+done
 VLAN="${VLAN_RAW:+,tag=${VLAN_RAW}}"
 
 echo ""
 echo -e "  ${BLD}Network addressing${CL}"
-echo -e "  ${YW}Proxmox host interfaces (for reference — pick an address on the same subnet):${CL}"
-ip -4 addr show scope global 2>/dev/null | awk '/inet /{split($2,a,"/"); print "    " a[1] "  (subnet: " $2 ")"}' | head -6
+# ── What is already on this host, before the questions that collide with it ──
+# Shown HERE rather than as a separate summary at the top, because this is the
+# point where it changes an answer. A VLAN tag another tenant already uses, or
+# a subnet that collides with another site, are both silent faults: the tag
+# puts two trust boundaries on one segment and both keep working; the colliding
+# subnet makes the remote site invisible over an overlay, because the
+# directly-connected route wins.
+#
+# Read from Proxmox's own guest configuration, which means a VM carrying its
+# address internally is invisible — so this informs a choice rather than
+# validating one. The standalone tool does the full map and proposes a
+# non-colliding stack:  tools/wasp-topology.sh --plan
+_T_TAGS=$(_vlan_tags_in_use | tr '\n' ' ')
+_T_ADDRS=$(_guest_addrs_in_use | tr '\n' ' ')
+if [ -n "${_T_TAGS// /}" ] || [ -n "${_T_ADDRS// /}" ]; then
+  echo -e "  ${YW}Already in use by guests on this host:${CL}"
+  [ -n "${_T_TAGS// /}" ]  && echo -e "  ${YW}    VLAN tags  ${_T_TAGS}${CL}"
+  [ -n "${_T_ADDRS// /}" ] && echo -e "  ${YW}    addresses  ${_T_ADDRS}${CL}"
+  echo -e "  ${YW}    (from guest configs — a VM addressed inside the guest is not${CL}"
+  echo -e "  ${YW}     listed, so this is a hint, not a guarantee)${CL}"
+  echo ""
+fi
+echo -e "  ${YW}Proxmox host interfaces (overlay and loopback addresses are not listed):${CL}"
+_host_subnet_hints 6
 echo ""
 echo "  [1] DHCP — VM gets an address automatically (default)"
 echo "  [2] Static IPv4 — you assign the address, gateway, and DNS now"
@@ -214,7 +321,25 @@ _valid_ipv4() {
 if [[ "$NET_MODE_SEL" == "2" ]]; then
   while true; do
     read -rp "  VM static IPv4 address (e.g. 192.168.1.50) : " VM_STATIC_IP
-    _valid_ipv4 "$VM_STATIC_IP" && break || echo -e "  ${RD}Not a valid IPv4 address — try again.${CL}"
+    _valid_ipv4 "$VM_STATIC_IP" || { echo -e "  ${RD}Not a valid IPv4 address — try again.${CL}"; continue; }
+    # An address another Proxmox guest already holds produces an ARP conflict,
+    # which presents as intermittent packet loss on BOTH hosts rather than as a
+    # clean failure — and it is the hardest symptom here to attribute.
+    #
+    # This reads Proxmox's guest configuration, so it sees statically-addressed
+    # containers and nothing else: a VM carrying its address internally, or a
+    # non-Proxmox device, is invisible. Said at the prompt rather than implied,
+    # because a check that silently covers half the cases is worse than one
+    # whose limit is known.
+    if _addr_in_use "$VM_STATIC_IP"; then
+      msg_warn "${VM_STATIC_IP} is already configured on another guest on this host."
+      msg_warn "  Two hosts on one address is an ARP conflict: intermittent loss"
+      msg_warn "  on both, not a clean failure, and the hardest symptom here to"
+      msg_warn "  attribute to its cause."
+      read -rp "  Use it anyway? [y/N] : " _ai
+      case "${_ai:-n}" in y|Y) unset _ai; break ;; *) unset _ai; continue ;; esac
+    fi
+    break
   done
   while true; do
     read -rp "  Subnet prefix length, CIDR bits [24] : " VM_PREFIX
@@ -287,36 +412,89 @@ if [[ "$NET_MODE_SEL" == "2" ]]; then
   echo ""
   echo "    9) Enter your own"
   echo ""
+  # ── The gateway, which was the right answer and was not on the menu ───────
+  # From the melroseparkfire install: the operator typed 10.20.101.1 — their
+  # VLAN gateway, and the documented correct answer for a guest on a segmented
+  # network — at a prompt that takes a NUMBER. It fell through to the default
+  # and the VM was built on Quad9.
+  #
+  # A guest on Quad9 resolves its own published name to the public IP, cannot
+  # hairpin where NAT reflection is off, and fails in a way that never mentions
+  # DNS. The same fault had just been cleared from three other guests on that
+  # host.
+  #
+  # The root cause is not that the answer was typed wrongly. It is that the
+  # correct answer for this deployment shape was not offered at all, so the
+  # operator had to know to pick "9" and then retype what they had already
+  # decided. Offered first now, when a gateway is actually known.
+  if [[ -n "${VM_GATEWAY:-}" ]]; then
+    echo -e "  ${BLD}This network${CL}"
+    echo -e "    g) This segment's gateway   ${VM_GATEWAY}   ${GN}(recommended here)${CL}"
+    echo -e "  ${YW}       A guest on a segmented network should normally resolve${CL}"
+    echo -e "  ${YW}       through its own gateway. A public resolver returns the${CL}"
+    echo -e "  ${YW}       PUBLIC address for this site's own hostname, which the${CL}"
+    echo -e "  ${YW}       VM then cannot reach if the firewall does not hairpin —${CL}"
+    echo -e "  ${YW}       and WP-Cron, Site Health and parts of the REST API break${CL}"
+    echo -e "  ${YW}       with nothing anywhere mentioning DNS.${CL}"
+    echo -e "  ${YW}       Pick a public resolver below only if this segment's${CL}"
+    echo -e "  ${YW}       gateway does not run one.${CL}"
+    echo ""
+  fi
   echo -e "  ${YW}Not offered: 1.1.1.1 and 8.8.8.8. Both are US Five-Eyes${CL}"
   echo -e "  ${YW}operators; choose 9 if you specifically need them.${CL}"
   echo ""
-  read -rp "  Resolver [1] : " _DNSC
-  case "${_DNSC:-1}" in
-    1)  VM_DNS="9.9.9.9 149.112.112.112" ;;
-    2)  VM_DNS="94.140.14.14 94.140.15.15" ;;
-    3)  VM_DNS="76.76.2.0 76.76.10.0" ;;
-    4)  VM_DNS="185.222.222.222 45.11.45.11" ;;
-    5)  VM_DNS="86.54.11.100 86.54.11.200" ;;
-    6)  VM_DNS="5.1.66.255 185.150.99.255" ;;
-    7)  VM_DNS="91.239.100.100 89.233.43.71" ;;
-    8)  VM_DNS="149.112.121.10 149.112.122.10" ;;
-    9)
-      while true; do
-        read -rp "  DNS servers, space-separated : " VM_DNS
-        VM_DNS="${VM_DNS:-9.9.9.9 149.112.112.112}"
-        _dns_bad=0
-        for _d in $VM_DNS; do
-          _valid_ipv4 "$_d" || { _dns_bad=1; echo -e "  ${RD}'${_d}' is not a valid IPv4 address.${CL}"; }
+  # An IP typed here is unambiguous intent, and the prompt's own wording
+  # invites it. Accepting it is strictly better than discarding it.
+  # Loops so an unrecognised answer re-asks instead of silently choosing.
+  # The menu above is printed once; only the prompt repeats.
+  while :; do
+    _dns_default=1; [[ -n "${VM_GATEWAY:-}" ]] && _dns_default=g
+    read -rp "  Resolver [${_dns_default}] : " _DNSC
+    _DNSC="${_DNSC:-$_dns_default}"
+    if _valid_ipv4 "$_DNSC" 2>/dev/null; then
+      VM_DNS="$_DNSC"
+      msg_ok "Resolver: ${VM_DNS}  (taken as an address, not a menu choice)"
+      _DNSC=__handled__
+    fi
+    case "${_DNSC}" in
+      __handled__) : ;;
+      g|G) VM_DNS="$VM_GATEWAY" ;;
+      1)  VM_DNS="9.9.9.9 149.112.112.112" ;;
+      2)  VM_DNS="94.140.14.14 94.140.15.15" ;;
+      3)  VM_DNS="76.76.2.0 76.76.10.0" ;;
+      4)  VM_DNS="185.222.222.222 45.11.45.11" ;;
+      5)  VM_DNS="86.54.11.100 86.54.11.200" ;;
+      6)  VM_DNS="5.1.66.255 185.150.99.255" ;;
+      7)  VM_DNS="91.239.100.100 89.233.43.71" ;;
+      8)  VM_DNS="149.112.121.10 149.112.122.10" ;;
+      9)
+        while true; do
+          read -rp "  DNS servers, space-separated : " VM_DNS
+          VM_DNS="${VM_DNS:-9.9.9.9 149.112.112.112}"
+          _dns_bad=0
+          for _d in $VM_DNS; do
+            _valid_ipv4 "$_d" || { _dns_bad=1; echo -e "  ${RD}'${_d}' is not a valid IPv4 address.${CL}"; }
+          done
+          [ "$_dns_bad" = "0" ] && break
         done
-        [ "$_dns_bad" = "0" ] && break
-      done
-      case "$VM_DNS" in
-        *1.1.1.1*|*8.8.8.8*|*8.8.4.4*|*1.0.0.1*)
-          msg_warn "  Cloudflare/Google chosen deliberately — noted." ;;
-      esac ;;
-    *)  VM_DNS="9.9.9.9 149.112.112.112"
-        msg_warn "  Unrecognised choice — using Quad9." ;;
-  esac
+        case "$VM_DNS" in
+          *1.1.1.1*|*8.8.8.8*|*8.8.4.4*|*1.0.0.1*)
+            msg_warn "  Cloudflare/Google chosen deliberately — noted." ;;
+        esac ;;
+      *)  # Re-prompt rather than silently choosing. A fallback that prints one
+          # warning line and continues is not a decision: during a twenty-minute
+          # questionnaire that line scrolls away, and the VM is built on a
+          # resolver nobody picked. That is how melroseparkfire ended up on Quad9
+          # after its operator had typed their own gateway address.
+          #
+          # Nothing is lost by asking again — the question is cheap and the
+          # answer shapes whether the site can resolve its own name.
+          msg_warn "  '${_DNSC}' is not one of the choices above."
+          msg_warn "  Enter a number${VM_GATEWAY:+, 'g' for ${VM_GATEWAY},} or an IP address."
+          continue ;;
+    esac
+    break
+  done
   unset _DNSC _dns_bad _d
   msg_ok "DNS: ${VM_DNS}"
   NET_MODE="static"
@@ -628,14 +806,46 @@ _v15_valid_cidr() {
   esac
 }
 # Prompt for a CIDR-or-blank value, re-asking until valid.
-_ask_cidr() {  # $1 prompt text ; echoes validated value (may be empty)
-  local _p="$1" _v
+_ask_cidr() {  # $1 prompt text ; echoes validated COMMA-separated list (may be empty)
+  # Takes a LIST now, not a single value.
+  #
+  # From the melroseparkfire install: the operator typed
+  # "10.20.1.254/24,10.0.0.4/24" — the remote-administration path and the
+  # on-site desktops — and it was rejected as invalid. They retyped with only
+  # the on-site range, which does not cover them, and would have found out by
+  # being unable to SSH in from Arizona.
+  #
+  # Two ranges is the ordinary case for an MSP, nftables sets take a list
+  # natively, and WEB_CIDR was already being BUILT as a comma list elsewhere in
+  # this same file — so the single-value limit here was arbitrary and
+  # inconsistent with its own consumer.
+  #
+  # Each element is still validated individually: one bad entry in a list is a
+  # typo that would otherwise disappear into a set and silently widen or
+  # narrow access.
+  local _p="$1" _v _one _bad _out
   while :; do
     printf '%s' "$_p" >&2
     IFS= read -r _v
     [ -z "$_v" ] && { printf '' ; return 0; }
-    if _v15_valid_cidr "$_v"; then printf '%s' "$_v"; return 0; fi
-    echo -e "  ${RD}Not a valid IPv4 address or CIDR (e.g. 192.168.1.0/24 or 192.168.1.5). Try again or leave blank.${CL}" >&2
+    _v=$(_csv "$_v")
+    _bad=""; _out=""
+    local _oldifs="$IFS"; IFS=','
+    for _one in $_v; do
+      IFS="$_oldifs"
+      [ -z "$_one" ] && { IFS=','; continue; }
+      if _v15_valid_cidr "$_one"; then _out="${_out:+$_out,}$_one"
+      else _bad="${_bad:+$_bad, }$_one"; fi
+      IFS=','
+    done
+    IFS="$_oldifs"
+    if [ -n "$_bad" ]; then
+      echo -e "  ${RD}Not a valid IPv4 address or CIDR: ${_bad}${CL}" >&2
+      echo -e "  ${RD}Expected e.g. 192.168.1.0/24 or 192.168.1.5. Several are fine,${CL}" >&2
+      echo -e "  ${RD}separated by commas. Try again or leave blank.${CL}" >&2
+      continue
+    fi
+    printf '%s' "$_out"; return 0
   done
 }
 _ask_ip_list() {  # $1 prompt ; echoes SPACE-separated validated IPv4s (may be empty)
@@ -716,7 +926,7 @@ echo -e "  ${YW}This restriction works whether traffic is direct OR through a re
 echo -e "  ${YW}Set to your local network CIDR (e.g. 192.168.1.0/24).${CL}"
 echo ""
 echo -e "  ${YW}Your workstation is likely on one of these subnets (from the Proxmox host):${CL}"
-ip -4 addr show scope global 2>/dev/null | awk '/inet /{split($2,a,"/"); print "    " a[1] "  (subnet: " $2 ")"}' | head -5
+_host_subnet_hints 5
 echo ""
 ADMIN_CIDR=$(_ask_cidr "  Local network CIDR for wp-admin?  e.g. 192.168.100.0/24 (blank = open) : ")
 echo ""
@@ -827,7 +1037,11 @@ if [[ -n "$PROXY_IP" && -z "$WEB_CIDR" ]]; then
       # the proxy, because their addresses are not in the list.
       _extra=""
       [[ -n "$ADMIN_CIDR" && "$ADMIN_CIDR" != "$PROXY_IP" ]] && _extra="$ADMIN_CIDR"
-      [[ -n "$ALLOWED_ADMIN_IP" ]] && _extra="${_extra:+$_extra,}$ALLOWED_ADMIN_IP"
+      # _csv, because ALLOWED_ADMIN_IP is SPACE-separated (Apache Require ip)
+      # and this value becomes nftables set elements, which are comma-separated.
+      # Joining the two conventions with a bare comma put a space inside an nft
+      # set and the whole ruleset then failed to load. See lib/00 _csv().
+      [[ -n "$ALLOWED_ADMIN_IP" ]] && _extra=$(_csv "${_extra:+$_extra,}$ALLOWED_ADMIN_IP")
       if [[ -n "$_extra" ]]; then
         echo ""
         echo -e "  ${YW}  Also allow direct access from your admin addresses?${CL}"
@@ -1187,9 +1401,9 @@ _sec_note
 # is the entry whose absence takes every site down at once.
 _CS_DEFAULT=""
 [[ -n "$PROXY_IP" ]] && _CS_DEFAULT="$PROXY_IP"
-[[ -n "$ALLOWED_ADMIN_IP" ]] && _CS_DEFAULT="${_CS_DEFAULT:+$_CS_DEFAULT,}$ALLOWED_ADMIN_IP"
+[[ -n "$ALLOWED_ADMIN_IP" ]] && _CS_DEFAULT=$(_csv "${_CS_DEFAULT:+$_CS_DEFAULT,}$ALLOWED_ADMIN_IP")
 [[ -n "$SSH_CIDR" && "$SSH_CIDR" != "$ALLOWED_ADMIN_IP" ]] \
-  && _CS_DEFAULT="${_CS_DEFAULT:+$_CS_DEFAULT,}$SSH_CIDR"
+  && _CS_DEFAULT=$(_csv "${_CS_DEFAULT:+$_CS_DEFAULT,}$SSH_CIDR")
 
 # Offered separately rather than folded into the default: a /10 is a large
 # trust grant and it should be a deliberate yes, not something accepted by

@@ -50,6 +50,167 @@ msg_ok()    { echo -e "  ${GN}✔${CL}  $*"; }
 msg_warn()  { echo -e "  ${YW}⚠${CL}  $*"; }
 msg_error() { echo -e "  ${RD}✗${CL}  $*" >&2; exit 1; }
 
+# ── List normalisation ───────────────────────────────────────────────────────
+# FORENSIC FIX, from the melroseparkfire install (tispve, 2026-10-17).
+#
+# Two list conventions coexist here, both correct for their own consumer:
+#
+#   ALLOWED_ADMIN_IP   SPACE-separated — Apache's `Require ip` takes that natively
+#   WEB_CIDR/SSH_CIDR  COMMA-separated — nftables set elements are comma-separated
+#
+# They met, and nothing converted between them. `_extra` joined ADMIN_CIDR and
+# ALLOWED_ADMIN_IP with a comma, so a two-address admin list produced:
+#
+#   WEB_CIDR = 10.20.10.10,10.0.0.4/24,98.206.9.121 100.87.54.172
+#                                                  ^ a space inside a comma list
+#
+# which lib/03 interpolates into `ip saddr { … }`. A space between two elements
+# of an nft set is a syntax error, so the ENTIRE ruleset fails to load and the
+# VM comes up with no packet filter at all — the exact failure
+# check-expansion-order.py was written for, arriving by a different route.
+#
+# The same join also fed the CrowdSec whitelist default, where it concatenated
+# two addresses into "98.206.9.121100.87.54.172" and the operator had to retype
+# the list by hand.
+#
+# One helper, used wherever a list crosses between the two conventions.
+_csv() {    # any mix of commas/spaces/semicolons -> clean comma-separated
+  printf '%s' "$1" | tr ',;' '  ' | tr -s '[:space:]' '\n' \
+    | grep -v '^$' | paste -sd, - 2>/dev/null
+}
+_ssv() {    # ...and the reverse, for Apache's Require ip
+  printf '%s' "$1" | tr ',;' '  ' | tr -s '[:space:]' ' ' \
+    | sed 's/^ *//;s/ *$//'
+}
+
+# ── Proxmox topology facts ───────────────────────────────────────────────────
+# Collected once, here, and used by lib/01 to VALIDATE answers rather than
+# accept them. Motivated by the melroseparkfire install (tispve, 2026-10-17),
+# which ran every prompt, built the disk image, injected the whole payload, and
+# then died at VM creation on:
+#
+#     storage 'local-vm' does not exist
+#
+# Fifteen minutes, a full questionnaire, and a purge — for a typo the host
+# could have rejected at the prompt. The list of real storages was even printed
+# above that prompt, except it printed nothing (see _pve_storages).
+#
+# These live in lib/ rather than being read from tools/wasp-topology.sh on
+# purpose: lib/ is inside the signed manifest and tools/ is not. An installer
+# that depends on an unsigned file has a verification gap, so the standalone
+# tool keeps its richer reporting and the installer carries the few predicates
+# it needs to refuse a wrong answer.
+
+_pve_storages() {   # active storages that can hold VM images: "name type"
+  # The previous one-liner filtered on $2=="active" and printed $4 as the type.
+  # `pvesm status` columns are:
+  #     Name  Type  Status  Total  Used  Available  %
+  # so $2 is the TYPE, never the string "active", and the filter matched
+  # nothing — the operator saw "Available storages:" followed by a blank line,
+  # then a hardcoded default, then no validation. Three things lining up to
+  # make a typo expensive.
+  command -v pvesm >/dev/null 2>&1 || return 0
+  pvesm status --content images 2>/dev/null \
+    | awk 'NR>1 && $3=="active" {print $1, $2}'
+}
+_storage_exists() { [ -n "$1" ] && _pve_storages | awk '{print $1}' | grep -qxF "$1"; }
+
+_pve_bridges() {    # bridge names on this host
+  if command -v ip >/dev/null 2>&1; then
+    ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'
+  fi
+  # /etc/network/interfaces is the authority for a bridge that is defined but
+  # not currently up, which `ip` would not list.
+  [ -r /etc/network/interfaces ] \
+    && awk '/^iface[[:space:]]+vmbr/ {print $2}' /etc/network/interfaces 2>/dev/null
+}
+_bridge_exists() { [ -n "$1" ] && _pve_bridges | sort -u | grep -qxF "$1"; }
+
+_bridge_is_vlan_aware() {   # 0 = aware
+  # Proxmox ACCEPTS a VLAN tag on a guest attached to a non-VLAN-aware bridge
+  # and delivers the frames UNTAGGED, so the guest comes up on the wrong
+  # segment with no error anywhere. Worth a warning at the prompt that asks
+  # for the tag.
+  [ -r /etc/network/interfaces ] || return 1
+  awk -v b="$1" '
+    $1=="iface" && $2==b {inb=1; next}
+    inb && /^iface[[:space:]]/ {inb=0}
+    inb && /bridge[-_]vlan[-_]aware[[:space:]]+yes/ {found=1}
+    END {exit !found}' /etc/network/interfaces
+}
+
+_guest_net_lines() {   # every guest NIC config line, both VMs and containers
+  local id
+  if command -v qm >/dev/null 2>&1; then
+    qm list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1}' | while read -r id; do
+      qm config "$id" 2>/dev/null | grep -E '^net[0-9]+:'
+    done
+  fi
+  if command -v pct >/dev/null 2>&1; then
+    pct list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1}' | while read -r id; do
+      pct config "$id" 2>/dev/null | grep -E '^net[0-9]+:'
+    done
+  fi
+}
+_vlan_tags_in_use() {
+  _guest_net_lines | sed -n 's/.*[,:= ]tag=\([0-9]*\).*/\1/p' | sort -n -u
+}
+_guest_addrs_in_use() {
+  _guest_net_lines | sed -n 's/.*[,:= ]ip=\([0-9.]*\)\/.*/\1/p' | sort -u
+}
+_vlan_tag_in_use() { [ -n "$1" ] && _vlan_tags_in_use | grep -qx "$1"; }
+_addr_in_use()     { [ -n "$1" ] && _guest_addrs_in_use | grep -qxF "$1"; }
+
+# ── Host interface hints ─────────────────────────────────────────────────────
+# Printed to help the operator pick an address or a CIDR. Two faults in the
+# previous one-liner, both visible in the melroseparkfire install:
+#
+#   1. It labelled the ADDRESS as the subnet:
+#          10.0.0.4  (subnet: 10.0.0.4/24)
+#      The subnet is 10.0.0.0/24. The operator then entered "10.0.0.4/24" at
+#      the SSH and wp-admin CIDR prompts — which is what the installer had just
+#      told them their subnet was. nft and Apache both normalise it, so it
+#      works, but the installer taught the wrong form and the summary then
+#      displayed it back as if it were a network.
+#
+#   2. It offered the NetBird overlay address as a candidate:
+#          100.87.54.172  (subnet: 100.87.54.172/16)
+#      Nothing should ever be assigned on an overlay interface, and a /16 of
+#      CGNAT presented as "your subnet" is an invitation to a wrong answer.
+#
+# Now: compute the real network address, and leave out what cannot be a LAN.
+_host_subnet_hints() {   # $1 = max lines (default 6)
+  ip -4 addr show scope global 2>/dev/null | awk -v max="${1:-6}" '
+    /inet /{
+      split($2, a, "/"); ip=a[1]; pfx=a[2]
+      split(ip, o, ".")
+      # CGNAT (100.64/10) is an overlay — NetBird, Tailscale. Link-local and
+      # loopback are never a LAN either. Excluded rather than ranked down:
+      # a list you have to know to ignore is not a hint.
+      if (o[1]==127) next
+      if (o[1]==169 && o[2]==254) next
+      if (o[1]==100 && o[2]>=64 && o[2]<=127) next
+      # Network address from the prefix, so the label is true.
+      bits = 0 + pfx
+      mask = 0
+      for (i = 0; i < bits; i++) mask = mask + 2^(31-i)
+      addr = o[1]*16777216 + o[2]*65536 + o[3]*256 + o[4]
+      net  = int(addr / 1) ; net = and_mask(addr, mask)
+      n1 = int(net/16777216)%256; n2 = int(net/65536)%256
+      n3 = int(net/256)%256;      n4 = net%256
+      printf "    %-16s on %d.%d.%d.%d/%d\n", ip, n1, n2, n3, n4, bits
+      if (++c >= max) exit
+    }
+    function and_mask(x, m,   r, i, bx, bm) {
+      r = 0
+      for (i = 31; i >= 0; i--) {
+        bx = int(x / 2^i) % 2; bm = int(m / 2^i) % 2
+        if (bx && bm) r = r + 2^i
+      }
+      return r
+    }'
+}
+
 # ── SSH public-key classification ────────────────────────────────────────────
 # Defined here, in the first file sourced, because two places need it and they
 # must agree: lib/01 collects keys and lib/05 writes them to authorized_keys.
@@ -215,9 +376,9 @@ _tag_exists() {   # namespace repo tag  ->  0 ok, 1 definitely missing, 2 unknow
 _check_image_tags() {
   local payload_wp payload_squid unknown=0
   payload_wp=$(sed -n 's|^WP_IMAGE="docker.io/wordpress:\(.*\)"|\1|p' \
-    "${SCRIPT_DIR:-.}/payload/install-wordpress.sh" 2>/dev/null | head -1)
+    "${REPO_DIR:-.}/payload/install-wordpress.sh" 2>/dev/null | head -1)
   payload_squid=$(sed -n 's|.*docker.io/ubuntu/squid:\([a-zA-Z0-9._-]*\).*|\1|p' \
-    "${SCRIPT_DIR:-.}/payload/stages/09-crowdsec-and-backup.sh" 2>/dev/null | head -1)
+    "${REPO_DIR:-.}/payload/stages/09-crowdsec-and-backup.sh" 2>/dev/null | head -1)
 
   if [[ -n "$payload_wp" ]]; then
     _tag_exists library wordpress "$payload_wp"
