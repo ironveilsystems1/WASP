@@ -651,6 +651,29 @@ do_install_file() {
   done
   [ -n "$_zip" ] || { echo "Usage: wp-plugins.sh install-file <file.zip> [--activate] [--sha256 <hash>]" >&2; return 1; }
   [ -f "$_zip" ] || { echo "✗  No such file: ${_zip}" >&2; return 1; }
+  # Case is the usual reason, and the plain error does not say so. An
+  # operator transferred Divi.zip and then asked for divi.zip; both the
+  # transfer and this command reported "No such file", which reads as the
+  # transfer having failed rather than the name being wrong.
+  _dir=$(dirname "${_f}"); _base=$(basename "${_f}")
+  if [ -d "$_dir" ]; then
+    _near=$(ls -1 "$_dir" 2>/dev/null | grep -iFx "$_base" | head -1)
+    if [ -n "$_near" ]; then
+      echo "   Did you mean:  ${_dir}/${_near}" >&2
+      echo "   Filenames are case-sensitive." >&2
+    else
+      _any=$(ls -1 "$_dir" 2>/dev/null | head -5)
+      if [ -n "$_any" ]; then
+        echo "   That directory contains:" >&2
+        printf '%s\n' "$_any" | sed 's/^/     /' >&2
+      else
+        echo "   ${_dir} is empty — did the transfer complete?" >&2
+        echo "   Transfers need:  scp -O <file> admin@vm:.../incoming/" >&2
+        echo "   (-O is required: no SFTP subsystem. rsync is NOT installed" >&2
+        echo "    unless the off-site method is rsync — add it with apk if wanted.)" >&2
+      fi
+    fi
+  fi
   case "$_zip" in *.zip) : ;; *) echo "✗  Not a .zip: ${_zip}" >&2; return 1 ;; esac
   # The path becomes part of a `-v host:container:ro` argument that is expanded
   # UNQUOTED (podman needs the flag and value as separate words). A filename
@@ -721,6 +744,12 @@ do_install_file() {
     return 1
   fi
   echo "  ✔  Installed ${_base} as a ${_kind}"
+  echo ""
+  echo "  To UPDATE this later, run install-file again with the newer zip."
+  echo "  DISALLOW_FILE_MODS removes the update UI as well as the install UI,"
+  echo "  so wp-admin will show no update section even when the licence is"
+  echo "  valid and the vendor is reachable. That is the control working, and"
+  echo "  it is easily misread as an egress fault."
 
   # A locally-supplied zip gets the same post-install verification, and it will
   # almost always report "no published checksums" -- which is the correct and

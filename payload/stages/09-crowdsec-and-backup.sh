@@ -273,10 +273,29 @@ if [ -n "${CROWDSEC_WHITELIST:-}" ]; then
   chmod 644 "$_WL"
   ok "CrowdSec whitelist written: ${CROWDSEC_WHITELIST}"
   ok "  Alerts still raised for these — only the ban is suppressed."
+  # Written in every enforcement mode, and for a different reason in each.
+  # Locally it stops this VM's own firewall dropping you. Upstream it stops a
+  # decision being PROPOSED, which matters more: once a decision reaches the
+  # central LAPI it is shared, and the bouncer there applies it to every site
+  # behind that proxy.
+  if [ "${CS_ENFORCEMENT:-local}" = "upstream" ]; then
+    ok "  Applied before any decision leaves this VM, which is the only place"
+    ok "  it can be stopped — a decision at the central LAPI is already shared"
+    ok "  with every site behind that proxy."
+    warn "  This does NOT cover the engines on the proxy or the firewall. They"
+    warn "  read their own logs and never consult this file, so either can ban"
+    warn "  you while this VM proposed nothing. Put the same addresses there as"
+    warn "  a postoverflow whitelist too."
+  fi
 else
   warn "No CrowdSec whitelist configured."
   warn "  A banned admin address drops SSH too; recovery is via qm terminal."
-  warn "  Add one later: /opt/crowdsec/config/postoverflows/s01-whitelist/"
+  warn "  Add one later: doas wp-hardening.sh crowdsec-whitelist add <ip>"
+  if [ "${CS_ENFORCEMENT:-local}" = "upstream" ]; then
+    warn "  With upstream enforcement this is a wider exposure than it looks:"
+    warn "  a false positive here is sent to the central LAPI and applied to"
+    warn "  every site behind that proxy, not only this one."
+  fi
 fi
 ok "Login brute-force parser + scenario installed"
 # `ok`, not `warn`. These are instructions, not failures — and a warning
@@ -288,50 +307,178 @@ ok "    doas podman exec crowdsec cscli parsers list | grep wpvm"
 ok "    doas podman exec crowdsec cscli scenarios list | grep wpvm"
 ok "acquis.yaml: Apache logs + syslog"
 
+# ── Enforcement topology ──────────────────────────────────────────────────────
+# CS_ENFORCEMENT decides the rest of this section. It exists because of a defect
+# that no amount of local testing could surface:
+#
+#   Behind a reverse proxy, every packet reaches this VM from the proxy's
+#   address. mod_remoteip recovers the real client IP for the Apache log, so the
+#   agent detects correctly and bans the correct address -- at a firewall that
+#   address never sends a packet to. `cscli decisions list` shows the ban, `nft
+#   list set` shows the address, the console shows a remediation component, and
+#   the attacker is not slowed down at all.
+#
+# The old behaviour made this worse rather than better: production REFUSED TO
+# CERTIFY a VM whose local bouncer was not running and registered. So the
+# strictest profile required the one configuration that cannot work behind a
+# proxy, and then read its presence as proof of enforcement. A fail-closed gate
+# on an inert control is not fail-closed; it is a gate that cannot fail.
+#
+#   local       — bouncer here. Correct for direct-access installs. Behind a
+#                 proxy it enforces nothing, so production blocks it.
+#   upstream    — agent reports to a central LAPI; enforcement is that LAPI's
+#                 bouncer, at the proxy or the edge firewall. No local bouncer,
+#                 because installing one only manufactures evidence.
+#   detect-only — declared, recorded, blocked in production. Honest.
+#
+# Default is `local`, which is what a direct-access install wants and what every
+# existing VM already has, so nothing changes for them.
+CS_ENFORCEMENT="${CS_ENFORCEMENT:-local}"
+case "$CS_ENFORCEMENT" in
+  local|upstream|detect-only) : ;;
+  *) warn "CS_ENFORCEMENT='${CS_ENFORCEMENT}' is not a known mode — treating as 'local'."
+     CS_ENFORCEMENT="local" ;;
+esac
+
+# Agent-only mode needs BOTH a LAPI URL and credentials registered on it. A URL
+# with no credentials produces an agent that starts cleanly, authenticates
+# nowhere, and reports nothing -- which looks identical to working. Fall back to
+# detect-only and say so, rather than pretending the agent is reporting.
+if [ "$CS_ENFORCEMENT" = "upstream" ] \
+   && { [ -z "${CS_LAPI_URL:-}" ] || [ -z "${CS_LAPI_LOGIN:-}" ] || [ -z "${CS_LAPI_PASSWORD:-}" ]; }; then
+  warn "Upstream enforcement selected but the LAPI is not fully specified."
+  warn "  Need a URL, a machine login and its password — the login must already"
+  warn "  exist on that LAPI (cscli machines add). Running detection only until"
+  warn "  it is finished with:  doas wp-hardening.sh cs-lapi <url> <login> <pw>"
+  CS_ENFORCEMENT="detect-only"
+  CS_LAPI_INCOMPLETE=1
+fi
+
 podman rm -f crowdsec 2>/dev/null || true
-podman run -d \
-  --name    crowdsec \
-  --restart always \
-  --network host \
-  --cap-drop ALL \
-  --cap-add  DAC_OVERRIDE \
-  --cap-add  SETUID \
-  --cap-add  SETGID \
-  --cap-add  CHOWN \
-  --security-opt no-new-privileges:true \
-  --read-only \
-  --tmpfs /tmp:size=32M,noexec,nosuid,nodev \
-  --tmpfs /var/run:size=16M,noexec,nosuid,nodev \
-  --pids-limit 100 \
-  --memory=512m \
-  --label io.containers.autoupdate=image \
-  -e COLLECTIONS="crowdsecurity/apache2 crowdsecurity/wordpress crowdsecurity/linux crowdsecurity/sshd crowdsecurity/http-cve crowdsecurity/appsec-wordpress" \
-  -v /opt/crowdsec/config:/etc/crowdsec:rw \
-  -v /opt/crowdsec/data:/var/lib/crowdsec/data:rw \
-  -v /opt/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro \
-  -v /home/wpuser/wp/logs:/var/log/wordpress:ro \
-  -v /var/log/messages:/var/log/host/messages:ro \
-  "${CROWDSEC_IMAGE}"
+
+# One copy of the run command, taking the mode-specific flags as arguments.
+#
+# Deliberately a function rather than `set -- <extra flags>` before the run:
+# this file is SOURCED by install-wordpress.sh, so `set --` would rewrite the
+# dispatcher's own positional parameters for everything sourced after it. The
+# dispatcher re-execs itself with "$@" at line 8 and does not read them again
+# today, so it would most likely be harmless -- and "most likely harmless,
+# depending on a line in another file" is how every silent defect in this
+# project started. A function has its own positional scope and cannot reach out.
+#
+# In upstream mode the container runs as an agent with its local API server off,
+# using the image's own documented variables rather than a hand-edited
+# config.yaml: a sed into a file inside a mounted volume is reverted by any
+# image rebuild without a word, which is the failure mode the bouncer-init
+# checksum elsewhere in this project exists to catch.
+_cs_engine_run() {
+  podman run -d \
+    --name    crowdsec \
+    --restart always \
+    --network host \
+    --cap-drop ALL \
+    --cap-add  DAC_OVERRIDE \
+    --cap-add  SETUID \
+    --cap-add  SETGID \
+    --cap-add  CHOWN \
+    --security-opt no-new-privileges:true \
+    --read-only \
+    --tmpfs /tmp:size=32M,noexec,nosuid,nodev \
+    --tmpfs /var/run:size=16M,noexec,nosuid,nodev \
+    --pids-limit 100 \
+    --memory=512m \
+    --label io.containers.autoupdate=image \
+    -e COLLECTIONS="crowdsecurity/apache2 crowdsecurity/wordpress crowdsecurity/linux crowdsecurity/sshd crowdsecurity/http-cve crowdsecurity/appsec-wordpress" \
+    "$@" \
+    -v /opt/crowdsec/config:/etc/crowdsec:rw \
+    -v /opt/crowdsec/data:/var/lib/crowdsec/data:rw \
+    -v /opt/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro \
+    -v /home/wpuser/wp/logs:/var/log/wordpress:ro \
+    -v /var/log/messages:/var/log/host/messages:ro \
+    "${CROWDSEC_IMAGE}"
+}
+
+if [ "$CS_ENFORCEMENT" = "upstream" ]; then
+  ts "CrowdSec — agent only, reporting to ${CS_LAPI_URL}"
+  _cs_engine_run \
+    -e DISABLE_LOCAL_API=true \
+    -e LOCAL_API_URL="${CS_LAPI_URL}" \
+    -e AGENT_USERNAME="${CS_LAPI_LOGIN}" \
+    -e AGENT_PASSWORD="${CS_LAPI_PASSWORD}"
+else
+  _cs_engine_run
+fi
+
+# Record the declared topology where every later tool can read it, rather than
+# re-deriving it from whether a bouncer happens to be installed. cs-doctor,
+# validate-wordpress.sh and the commission check all need to know what this VM
+# was BUILT to do before they can judge what it is doing.
+mkdir -p /etc/wp-install 2>/dev/null || true
+{
+  printf 'enforcement=%s\n' "$CS_ENFORCEMENT"
+  printf 'proxy_ip=%s\n'    "${PROXY_IP:-}"
+  printf 'lapi_url=%s\n'    "${CS_LAPI_URL:-}"
+  printf 'lapi_login=%s\n'  "${CS_LAPI_LOGIN:-}"
+} > /etc/wp-install/crowdsec-topology
+chmod 600 /etc/wp-install/crowdsec-topology
+
+# The resolved image reference, recorded so `wp-hardening.sh cs-lapi` can
+# re-create this container on the SAME image rather than falling back to a
+# floating tag. CROWDSEC_IMAGE here is already digest-pinned when
+# USE_DIGEST_PINNING is on, and silently swapping a pinned digest for :latest
+# during a credential fix would discard the pinning this install spent effort
+# establishing — and do it at the moment nobody is looking at image versions.
+printf '%s\n' "${CROWDSEC_IMAGE}" > /etc/wp-install/crowdsec-image
+chmod 644 /etc/wp-install/crowdsec-image
 
 ts "Waiting for CrowdSec LAPI"
+# `cscli lapi status` asks whichever LAPI this engine is configured against, so
+# in upstream mode this is a real end-to-end test of URL, credentials, routing
+# and firewall in one call -- exactly the thing worth confirming before the
+# install claims the agent is reporting anywhere.
 LAPI_READY=0
 for i in $(seq 1 30); do
   PRUN exec crowdsec cscli lapi status >/dev/null 2>&1 && { LAPI_READY=1; break; }
   sleep 5
 done
-[ "$LAPI_READY" = "1" ] && ok "LAPI up" || warn "LAPI not confirmed — continuing"
-
-ts "Locking LAPI to 127.0.0.1:8080"
-CFG=/opt/crowdsec/config/config.yaml
-for i in $(seq 1 12); do [ -f "$CFG" ] && break || sleep 5; done
-if [ -f "$CFG" ]; then
-  grep -qE '^\s*listen_uri:' "$CFG" \
-    && sed -i -E 's|^(\s*listen_uri:).*|\1 127.0.0.1:8080|' "$CFG"
-  PRUN restart crowdsec >/dev/null 2>&1; sleep 3
-  ok "LAPI → 127.0.0.1:8080"
+if [ "$LAPI_READY" = "1" ]; then
+  [ "$CS_ENFORCEMENT" = "upstream" ] \
+    && ok "Agent authenticated to ${CS_LAPI_URL}" \
+    || ok "LAPI up"
+elif [ "$CS_ENFORCEMENT" = "upstream" ]; then
+  warn "Agent could NOT reach ${CS_LAPI_URL} — detection is reporting nowhere."
+  warn "  Check, in this order:"
+  warn "    1. the login exists there:  cscli machines list   (on the LAPI host)"
+  warn "    2. the LAPI listens off loopback — a default install binds"
+  warn "       127.0.0.1:8080 and is unreachable from this VM however correct"
+  warn "       the credentials are"
+  warn "    3. this VM is permitted to that host on 8080"
+  warn "  Then:  doas wp-hardening.sh cs-lapi '${CS_LAPI_URL}' '${CS_LAPI_LOGIN}' <pw>"
 else
-  warn "config.yaml not found — restrict LAPI manually"
+  warn "LAPI not confirmed — continuing"
 fi
+
+# Binding the LAPI to loopback is right for a self-contained VM and wrong for an
+# agent-only one, where there is no local LAPI to bind. Skipping the edit also
+# avoids writing a listen_uri the running engine ignores, which would read on
+# inspection as a LAPI that exists here.
+if [ "$CS_ENFORCEMENT" = "upstream" ]; then
+  ok "No local LAPI on this VM — decisions live on ${CS_LAPI_URL}"
+else
+  ts "Locking LAPI to 127.0.0.1:8080"
+  CFG=/opt/crowdsec/config/config.yaml
+  for i in $(seq 1 12); do [ -f "$CFG" ] && break || sleep 5; done
+  if [ -f "$CFG" ]; then
+    grep -qE '^\s*listen_uri:' "$CFG" \
+      && sed -i -E 's|^(\s*listen_uri:).*|\1 127.0.0.1:8080|' "$CFG"
+    PRUN restart crowdsec >/dev/null 2>&1; sleep 3
+    ok "LAPI → 127.0.0.1:8080"
+  else
+    warn "config.yaml not found — restrict LAPI manually"
+  fi
+fi
+
+if [ "$CS_ENFORCEMENT" = "local" ]; then
 
 ts "Generating bouncer API key"
 PRUN exec crowdsec cscli bouncers delete firewall-bouncer >/dev/null 2>&1 || true
@@ -378,23 +525,60 @@ else
   BOUNCER_REGISTERED=0
 fi
 
-# FORENSIC FIX (new-audit High finding, confirmed accurate): this used to
-# only ever `warn` when the bouncer never came up or never registered —
-# unlike the Alpine-image and digest-pinning checks elsewhere in this
-# install, which both fail closed under DEPLOYMENT_PROFILE=production.
-# CrowdSec's engine only DETECTS and decides bans; the bouncer is what
-# actually ENFORCES them via nftables. A "successful" install with the
-# engine up but no working bouncer silently downgrades the whole layer to
-# detection-only — decisions get made, nothing blocks them — which is a
-# materially different security posture than what production mode
-# promises. Standard mode keeps the original warn-and-continue (a
-# transient LAPI-registration hiccup shouldn't brick a homelab install);
-# production mode now matches the fail-closed pattern used everywhere else
-# in this codebase for the same class of "did the thing we just installed
-# actually come up" question.
-if [ "${DEPLOYMENT_PROFILE:-production}" = "production" ] \
-   && { [ "$BOUNCER_UP" != "1" ] || [ "$BOUNCER_REGISTERED" != "1" ]; }; then
-  err "cs-firewall-bouncer is not running and registered with CrowdSec's LAPI — refusing to continue under DEPLOYMENT_PROFILE=production, since CrowdSec would be detecting bans without enforcing any of them. Check: podman logs crowdsec ; rc-service cs-firewall-bouncer status. Retry once fixed, or re-run under DEPLOYMENT_PROFILE=standard if this is a lab install."
+else
+  # upstream or detect-only: no local bouncer, deliberately.
+  BOUNCER_UP=0
+  BOUNCER_REGISTERED=0
+  rc-service cs-firewall-bouncer stop  >/dev/null 2>&1 || true
+  rc-update del cs-firewall-bouncer default >/dev/null 2>&1 || true
+  if [ "$CS_ENFORCEMENT" = "upstream" ]; then
+    ok "No local bouncer — enforcement belongs to the LAPI's own bouncer"
+    ok "  A bouncer here would add this VM's nftables entries for client"
+    ok "  addresses that never send it a packet: convincing evidence of"
+    ok "  blocking, and no blocking."
+  else
+    warn "No local bouncer and no upstream LAPI — detection only."
+  fi
+fi
+
+# ── Production gate: is anything actually enforcing? ──────────────────────────
+# This gate used to read "is the local bouncer running and registered", and
+# refuse production if not. Correct for a VM clients reach directly. Behind a
+# reverse proxy it is worse than no gate at all, because the configuration it
+# demands is the one that cannot work -- it bans real client addresses at a
+# firewall those clients never send packets to -- so a passing gate certified
+# detection-only as enforcing.
+#
+# The question is now "does enforcement exist SOMEWHERE on this traffic path",
+# and each mode answers it differently:
+#
+#   local, no proxy     — the local bouncer must be up and registered. Same
+#                         gate as before, for the case where it was right.
+#   local, behind proxy — blocked. The bans cannot match the traffic.
+#   upstream            — the agent must have authenticated to the LAPI. If it
+#                         has not, this VM's detection reaches nobody, which is
+#                         detection-only wearing a better label.
+#   detect-only         — blocked by definition. Declared, not discovered.
+#
+# block_production, not err: see install-wordpress.sh. A fail-closed control
+# that aborts mid-stage leaves the operator with fewer diagnostic tools exactly
+# when a problem exists -- that was learned from this stage calling err() and
+# skipping stage 10 entirely.
+if [ "${DEPLOYMENT_PROFILE:-production}" = "production" ]; then
+  case "$CS_ENFORCEMENT" in
+    local)
+      if [ -n "${PROXY_IP:-}" ]; then
+        block_production "CrowdSec is set to enforce locally, but this VM sits behind a reverse proxy at ${PROXY_IP}. Every request arrives from that address, so a ban on the real client address matches no packet this VM ever sees: the decision is written, nftables holds the address, and the attacker is unaffected. Re-run with upstream enforcement and a central LAPI, or accept detection-only explicitly — but do not leave a local bouncer standing in for enforcement that is not happening."
+      elif [ "$BOUNCER_UP" != "1" ] || [ "$BOUNCER_REGISTERED" != "1" ]; then
+        block_production "cs-firewall-bouncer is not running and registered with CrowdSec's LAPI. The engine detects and decides bans; the bouncer is what enforces them in nftables, so without it this VM is detection-only. Check: podman logs crowdsec ; rc-service cs-firewall-bouncer status — then doas wasp-triage.sh --recheck-blockers"
+      fi ;;
+    upstream)
+      if [ "$LAPI_READY" != "1" ]; then
+        block_production "This VM is configured to report to a central CrowdSec LAPI at ${CS_LAPI_URL}, and the agent could not authenticate to it. Detection is running and reaching nobody, so no bouncer anywhere will act on what this site sees. Confirm the machine login exists there (cscli machines list), that the LAPI listens off 127.0.0.1, and that this VM is permitted to it on 8080 — then doas wp-hardening.sh cs-lapi '${CS_LAPI_URL}' '${CS_LAPI_LOGIN}' <password>"
+      fi ;;
+    detect-only)
+      block_production "CrowdSec enforcement is set to detect-only: this site raises alerts and nothing blocks. That was declared rather than discovered, which is the right way round, but it is not a production posture. Point the agent at a LAPI whose bouncer sits where the client connection terminates — doas wp-hardening.sh cs-lapi <url> <login> <password> — or remove this blocker if enforcement genuinely lives somewhere this VM cannot see.${CS_LAPI_INCOMPLETE:+ (Upstream was selected but the LAPI details were incomplete.)}" ;;
+  esac
 fi
 
 install -m 0755 "${PAYLOAD_DIR}/init.d/crowdsec-container" /etc/init.d/crowdsec-container

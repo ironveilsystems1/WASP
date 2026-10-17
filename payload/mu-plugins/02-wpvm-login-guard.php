@@ -44,6 +44,38 @@ defined('WPVM_LOGIN_LOCKOUT_SECS') || define('WPVM_LOGIN_LOCKOUT_SECS', 900);   
 defined('WPVM_LOGIN_WINDOW_SECS')  || define('WPVM_LOGIN_WINDOW_SECS', 1200);      // count within 20 min
 defined('WPVM_LOGIN_MAX_LOCKOUT')  || define('WPVM_LOGIN_MAX_LOCKOUT', 86400);     // cap at 24 h
 
+/*
+ * ── The slow-drip window ─────────────────────────────────────────────────
+ *
+ * Everything above counts within a 20-minute ROLLING window, and that window
+ * resets after 20 minutes of quiet. An attacker who stays under it is never
+ * counted at all:
+ *
+ *   4 attempts, wait 21 minutes, 4 more, indefinitely
+ *     -> 288 guesses per username per day, no lockout, ever
+ *
+ *   1 attempt per IP per hour across a 1000-host botnet
+ *     -> 24,000 guesses per day, no IP or username near a threshold
+ *
+ * CrowdSec does not close this either — its scenario counts 6 failures in 10
+ * minutes, a tighter window still. Short windows are correct for stopping a
+ * burst and blind to patience.
+ *
+ * So there is a SECOND counter with a long window and a high threshold. It
+ * does not replace the fast one; they answer different questions. The fast
+ * counter asks "is someone hammering this account right now". This one asks
+ * "has this account accumulated more failures in a day than any real person
+ * would".
+ *
+ * 20 failures in 24 hours is deliberately generous. A person who has forgotten
+ * their password tries three or four times, gives up, and uses the reset link.
+ * Reaching 20 in a day means either a genuine attack or a broken integration
+ * retrying with stale credentials — and both are worth knowing about.
+ */
+defined('WPVM_LOGIN_DRIP_MAX')    || define('WPVM_LOGIN_DRIP_MAX', 20);
+defined('WPVM_LOGIN_DRIP_WINDOW') || define('WPVM_LOGIN_DRIP_WINDOW', 86400);   // 24 h
+defined('WPVM_LOGIN_DRIP_LOCK')   || define('WPVM_LOGIN_DRIP_LOCK', 3600);      // 1 h
+
 /**
  * The client address, as Apache determined it.
  *
@@ -214,10 +246,29 @@ add_action('wp_login_failed', function ($username) {
      * -- one guess each against hundreds of accounts -- is still bounded. */
     $ip_fails = (int) get_transient(wpvm_login_ipkey('att'));
     set_transient(wpvm_login_ipkey('att'), $ip_fails + 1, WPVM_LOGIN_WINDOW_SECS);
+
+    // ── Long-window drip counter ────────────────────────────────────────────
+    // Deliberately NOT reset on success. An attacker who finally guesses right
+    // should not erase the evidence of the thousand attempts that preceded it,
+    // and a legitimate user does not accumulate twenty failures in a day.
+    $drip_key = wpvm_login_key('drip', $username);
+    $drip     = (int) get_transient($drip_key);
+    set_transient($drip_key, $drip + 1, WPVM_LOGIN_DRIP_WINDOW);
+    if ($drip + 1 >= WPVM_LOGIN_DRIP_MAX) {
+        set_transient(wpvm_login_key('lock', $username),
+                      time() + WPVM_LOGIN_DRIP_LOCK, WPVM_LOGIN_DRIP_LOCK);
+        // Logged as 'lockout', NOT 'drip-lockout'. The CrowdSec grok pattern uses
+                    // %{WORD:wpvm_event}, which does not match a hyphen — a new event name
+                    // would have failed to parse and silently dropped the line. The
+                    // distinguishing detail goes in the trailing field, which is free-form.
+                    wpvm_login_log('lockout', $username,
+            'reason=slow-drip failures=' . ($drip + 1) . ' window=' . WPVM_LOGIN_DRIP_WINDOW
+            . ' duration=' . WPVM_LOGIN_DRIP_LOCK);
+    }
     if ($ip_fails + 1 >= WPVM_LOGIN_MAX_ATTEMPTS * 6) {
         set_transient(wpvm_login_ipkey('lock'), time() + WPVM_LOGIN_LOCKOUT_SECS,
                       WPVM_LOGIN_LOCKOUT_SECS);
-        wpvm_login_log('spray-lockout', $username,
+        wpvm_login_log('lockout', $username,
             'ip_failures=' . ($ip_fails + 1) . ' scope=address');
     }
 

@@ -7,7 +7,7 @@
 #
 # WHY THIS EXISTS
 #
-# Several releases in the 2026.08.12 series shipped defects that leave a VM
+# Several releases before 10.0 shipped defects that leave a VM
 # running and looking healthy while a control is silently absent. On a fleet
 # that is already deployed, "redeploy everything" is not a plan — it is a week
 # of client downtime for problems that mostly patch in place.
@@ -170,7 +170,7 @@ elif nft list ruleset 2>/dev/null | grep -qE 'dport \{ ?25,? ?465,? ?587'; then
 else
   _finding CRIT "WordPress may be unable to send ANY email." \
     "A relay is configured (${_smtp_host}) but no SMTP allow rule is in the live ruleset. Password resets, order confirmations, malware alerts and the heartbeat all fail, silently, with every other mail check passing." \
-    "Verify with: doas wp-mail.sh doctor   (look for 'TCP 587'). Re-run the installer on 2026.08.12v or later, which fixes the rule ordering."
+    "Verify with: doas wp-mail.sh doctor   (look for 'TCP 587'). Re-run the installer on release 10.0 or later, which fixes the rule ordering."
 fi
 
 # ── 3. Can anything alert? ──────────────────────────────────────────────────

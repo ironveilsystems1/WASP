@@ -190,6 +190,7 @@ menu_security() {
     3) Test egress is enforced       ${DIM}wasp-egress.sh test${R}
     4) CrowdSec whitelist            ${DIM}wp-hardening.sh crowdsec-whitelist list${R}
    17) Is CrowdSec actually blocking? ${DIM}wp-hardening.sh crowdsec-doctor${R}
+   18) Report bans to a central LAPI ${DIM}wp-hardening.sh cs-lapi <url> <login> <pw>${R}
     5) Plugin vulnerability scan     ${DIM}wp-plugins.sh vulns${R}
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
@@ -209,6 +210,17 @@ EOF
       3) _have wasp-egress.sh && run "Egress enforcement test" 0 wasp-egress.sh test || _missing wasp-egress.sh ;;
       4) _have wp-hardening.sh && run "CrowdSec whitelist" 0 wp-hardening.sh crowdsec-whitelist list || _missing wp-hardening.sh ;;
       17) _have wp-hardening.sh && run "CrowdSec remediation chain (live test)" 0 wp-hardening.sh crowdsec-doctor || _missing wp-hardening.sh ;;
+      18) # Needs three arguments, so prompt rather than offering a bare run
+          # that would print usage and look broken.
+          printf '  LAPI URL (e.g. http://10.20.10.10:8080/) : '; read -r _lu
+          printf '  Machine login (registered on that LAPI)  : '; read -r _ll
+          printf '  Machine password : '; stty -echo 2>/dev/null; read -r _lp; stty echo 2>/dev/null; echo ""
+          if [ -z "$_lu" ] || [ -z "$_ll" ] || [ -z "$_lp" ]; then
+            echo "  All three are needed — nothing changed."
+          else
+            _have wp-hardening.sh && run "Point CrowdSec at a central LAPI" 1 wp-hardening.sh cs-lapi "$_lu" "$_ll" "$_lp" || _missing wp-hardening.sh
+          fi
+          unset _lu _ll _lp ;;
       5) _have wp-plugins.sh && run "Plugin vulnerabilities" 0 wp-plugins.sh vulns || _missing wp-plugins.sh ;;
       6) _have wp-malware-scan.sh && run "Malware quick scan" 0 wp-malware-scan.sh quick || _missing wp-malware-scan.sh ;;
       7) _have wp-malware-scan.sh && run "Malware full scan" 0 wp-malware-scan.sh full || _missing wp-malware-scan.sh ;;
@@ -260,6 +272,7 @@ menu_updates() {
 
   ${B}Updates${R}  ${DIM}(each scans for CVEs and can roll back)${R}
     1) Check what's available        ${DIM}update.sh check${R}
+   22) Newer versions upstream?      ${DIM}update.sh upstream${R}
     2) Current versions / status     ${DIM}update.sh status${R}
     3) ${RED}[!]${R} Update everything            ${DIM}update.sh all${R}
     4) ${RED}[!]${R} Update WordPress             ${DIM}update.sh wp${R}
@@ -273,6 +286,7 @@ EOF
     _have update.sh || { _missing update.sh; return; }
     case "$c" in
       1) run "Update check" 0 update.sh check ;;
+      22) _have update.sh && run "Upstream currency" 0 update.sh upstream || _missing update.sh ;;
       2) run "Update status" 0 update.sh status ;;
       3) run "Update everything" 1 update.sh all ;;
       4) run "Update WordPress" 1 update.sh wp ;;

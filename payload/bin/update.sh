@@ -2116,6 +2116,14 @@ show_check_summary() {
   _report_one "WordPress" "$WP_REGISTRY" "${WP_TAG:-$PINNED_WP_VER}" "$WP_DIGEST"
   _report_one "MariaDB"   "$DB_REGISTRY" "${DB_TAG:-$PINNED_DB_VER}" "$DB_DIGEST"
   _report_one "CrowdSec"  "$CS_REGISTRY" "${CS_TAG:-$PINNED_CS_VER}" "$CS_DIGEST"
+
+  # digest-check answers "did the pinned tag move". It cannot answer "is there
+  # a newer release", and an operator reading a clean report reasonably assumes
+  # both. Say so, and name the command that asks the other question.
+  echo ""
+  echo "  Note: the above compares the PINNED tags against their current"
+  echo "  digests — it detects a tag being re-published, not a new release."
+  echo "  For upstream currency:  doas update.sh upstream"
   # Squid only when egress filtering put it there; silent otherwise so a
   # non-egress deployment's status is not cluttered with an absent component.
   if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx squid; then
@@ -2603,6 +2611,96 @@ acquire_lock() {
   return 1
 }
 
+# ── Upstream currency: is there a NEWER version, not just a changed digest? ───
+#
+# digest-check answers "has the pinned tag been re-published?" — a rebuild, or a
+# supply-chain swap. It is the right question for integrity and it is blind to
+# the one an operator also needs: is there a newer release at all.
+#
+# Reported from the field: CrowdSec published a new version and `update.sh
+# check` reported everything current, because v1.7.8's digest had not moved.
+# Nothing was wrong; the check simply was not asking.
+#
+# This enumerates tags from the registry and reports anything newer than the
+# pin. It does NOT update anything. Digest pinning remains the mechanism — the
+# point is to stop an operator having to remember to check three upstreams by
+# hand, which is how a pin quietly becomes a stale pin.
+#
+# Pre-release tags are excluded. A pattern is derived from the shape of the
+# current pin so WordPress's "7.1-php8.4-apache" is compared against other
+# php8.4-apache builds rather than against every tag in the repository.
+_newer_tags() {   # registry, pinned_tag
+  _reg="$1"; _pin="$2"
+  case "$_pin" in
+    *-php*-apache)                       # wordpress: 7.1-php8.4-apache
+      _suffix="-${_pin#*-}"              #            -php8.4-apache
+      _pat="^[0-9]+(\.[0-9]+)*${_suffix}$" ;;
+    v[0-9]*)                             # crowdsec: v1.7.8
+      _pat='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    [0-9]*.[0-9]*)                       # mariadb: 11.4
+      _pat='^[0-9]+\.[0-9]+$' ;;
+    *) return 0 ;;
+  esac
+
+  _tags=$(skopeo list-tags "docker://${_reg}" 2>/dev/null \
+          | sed -n 's/.*"\([^"]*\)".*/\1/p' | grep -E "$_pat" 2>/dev/null) || return 0
+  [ -n "$_tags" ] || return 0
+
+  # sort -V puts the highest last. Compare only against the pin's own shape.
+  _latest=$(printf '%s\n%s\n' "$_tags" "$_pin" | sort -V -u | tail -1)
+  [ "$_latest" = "$_pin" ] && return 0
+  printf '%s' "$_latest"
+}
+
+do_upstream_check() {
+  echo ""
+  echo "Upstream currency — is a newer version published?"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  This asks a DIFFERENT question from digest-check. That one asks"
+  echo "  whether the pinned tag changed underneath you; this asks whether a"
+  echo "  newer release exists. Both matter and neither substitutes."
+  echo ""
+  if ! command -v skopeo >/dev/null 2>&1; then
+    echo "  skopeo not available — cannot enumerate tags." >&2
+    return 1
+  fi
+
+  _found=0
+  for _spec in \
+    "WordPress|${WP_REGISTRY}|${WP_TAG:-$PINNED_WP_VER}" \
+    "MariaDB|${DB_REGISTRY}|${DB_TAG:-$PINNED_DB_VER}" \
+    "CrowdSec|${CS_REGISTRY}|${CS_TAG:-$PINNED_CS_VER}"
+  do
+    _name=${_spec%%|*}; _rest=${_spec#*|}
+    _reg=${_rest%%|*}; _pin=${_rest#*|}
+    _new=$(_newer_tags "$_reg" "$_pin")
+    if [ -n "$_new" ]; then
+      printf '  %-10s pinned %-22s NEWER AVAILABLE: %s\n' "$_name" "$_pin" "$_new"
+      _found=$((_found+1))
+    else
+      printf '  %-10s pinned %-22s current\n' "$_name" "$_pin"
+    fi
+  done
+
+  echo ""
+  if [ "$_found" -gt 0 ]; then
+    echo "  ${_found} component(s) have a newer release upstream."
+    echo ""
+    echo "  Nothing has been changed. Moving to a new version is deliberate:"
+    echo "    doas update.sh wp <tag>          # validates on a candidate first"
+    echo "    doas update.sh db <tag>"
+    echo "    doas update.sh crowdsec <tag>"
+    echo ""
+    echo "  VERIFY THE TAG EXISTS before pinning it. A tag that was never"
+    echo "  published fails fifteen minutes into an install with"
+    echo "  'manifest unknown', and this project has shipped that mistake:"
+    echo "    skopeo inspect --format '{{.Digest}}' docker://<registry>:<tag>"
+    return 1
+  fi
+  echo "  Every pinned component is the newest published release of its shape."
+  return 0
+}
+
 case "${1:-check}" in
   os)          acquire_lock || exit 1; do_os_update ;;
   wp)          acquire_lock || exit 1; do_wp_update "${2:-}" ;;
@@ -2611,6 +2709,7 @@ case "${1:-check}" in
   squid)       acquire_lock || exit 1; do_squid_update "${2:-}" ;;
   all)         acquire_lock || exit 1; do_all_updates ;;
   digest-check|digest|pin) acquire_lock || exit 1; do_digest_check ;;
+  upstream|newer|currency)     do_upstream_check ;;
   versions|check-versions|ver) do_versions ;;
   upgrade|upgrade-all)         acquire_lock || exit 1; do_upgrade ;;
   trivy|scan)
@@ -2620,5 +2719,5 @@ case "${1:-check}" in
       [ -n "$running" ] && scan_image "$running"
     done ;;
   check|status|"") show_check_summary ;;
-  *) echo "Usage: update.sh [check|status|versions|upgrade|os|wp [VER]|db [VER]|crowdsec [VER]|squid [VER]|digest-check|all|trivy]"; exit 1 ;;
+  *) echo "Usage: update.sh [check|status|upstream|versions|upgrade|os|wp [VER]|db [VER]|crowdsec [VER]|squid [VER]|digest-check|all|trivy]"; exit 1 ;;
 esac

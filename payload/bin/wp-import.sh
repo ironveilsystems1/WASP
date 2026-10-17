@@ -73,18 +73,23 @@ Getting a backup onto this VM
      more than most WordPress sites, and a browser upload avoids the
      command line entirely.
 
-  2. SFTP — familiar, works from FileZilla/WinSCP/Cyberduck
-  ─────────────────────────────────────────────────────────
-       Host      : $(hostname) (${VM_STATIC_IP:-this VM's address})
-       Port      : 22
-       User      : ${ADMIN_USER:-<your admin user>}
-       Directory : ${INBOX}
+  2. SCP FROM YOUR WORKSTATION — the -O is required, not optional
+  ───────────────────────────────────────────────────────────────
+       scp -O backup.zip ${ADMIN_USER:-admin}@${VM_STATIC_IP:-vm-ip}:${INBOX}/
 
-     Drag the file in. SSH here only accepts a key, so use the same key
-     you use for the terminal.
+     SSH here only accepts a key, so use the same key you use for the
+     terminal.
 
-     From a command line instead:
-       scp backup.zip ${ADMIN_USER:-admin}@${VM_STATIC_IP:-vm-ip}:${INBOX}/
+     Without -O you get:
+         subsystem request failed on channel 0
+     which reads like a network fault and is not one. This VM's
+     sshd_config is written with no 'Subsystem sftp', so there is no
+     sftp-server to answer, and OpenSSH 9+ uses SFTP for scp by
+     default. -O forces the original SCP protocol, which needs none.
+
+     The same absence means a GUI client — FileZilla, WinSCP,
+     Cyberduck — CANNOT drag a file in here. They all speak SFTP.
+     Use scp -O, option 1, or option 3.
 
   3. DIRECT LINK — Dropbox, Drive, WeTransfer, anywhere with a URL
   ────────────────────────────────────────────────────────────────
@@ -96,7 +101,7 @@ Getting a backup onto this VM
 
   4. FROM THE PROXMOX HOST — if the file is already there
   ───────────────────────────────────────────────────────
-       scp /path/to/backup.zip root@${VM_STATIC_IP:-vm-ip}:${INBOX}/
+       scp -O /path/to/backup.zip root@${VM_STATIC_IP:-vm-ip}:${INBOX}/
 
   ── Then ──────────────────────────────────────────────────────────
        wp-import.sh list

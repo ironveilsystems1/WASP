@@ -370,6 +370,17 @@ WP_VOL_ARGS="-v /home/wpuser/wp/html:/var/www/html"
 SMTP_MU_DIR="/home/wpuser/wp/html/wp-content/mu-plugins"
 mkdir -p "${SMTP_MU_DIR}"
 install -m 0644 "${PAYLOAD_DIR}/mu-plugins/01-wpvm-smtp.php" "${SMTP_MU_DIR}/01-wpvm-smtp.php"
+# The contact handler. Shipped because the alternative is a contact-form
+# plugin -- tens of thousands of lines, an admin UI, a submissions table
+# and a supply-chain dependency, to email three fields. Those plugins are
+# also over-represented in WordPress vulnerability disclosures, because
+# they accept unauthenticated input by definition.
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/05-wasp-contact.php" \
+  "${SMTP_MU_DIR}/05-wasp-contact.php" 2>/dev/null || true
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/06-wasp-username-privacy.php" \
+  "${SMTP_MU_DIR}/06-wasp-username-privacy.php" 2>/dev/null || true
+chown 33:33 "${SMTP_MU_DIR}/06-wasp-username-privacy.php" 2>/dev/null || true
+chown 33:33 "${SMTP_MU_DIR}/05-wasp-contact.php" 2>/dev/null || true
 # Login rate-limiting. Unconditional and in the same block as the SMTP
 # transport, for the same reason: it has nothing to do with the custom-slug
 # prompt, and burying it in that conditional is exactly how the SMTP plugin
@@ -632,7 +643,7 @@ fi
 # Relying on a later tool to repair this is not a design, it is a coincidence
 # that happened to work. Re-install here, idempotently, at the first moment the
 # docroot is settled.
-for _mu in 01-wpvm-smtp.php 03-wpvm-mfa-enforce.php; do
+for _mu in 01-wpvm-smtp.php 03-wpvm-mfa-enforce.php 05-wasp-contact.php 06-wasp-username-privacy.php; do
   [ -f "${PAYLOAD_DIR}/mu-plugins/${_mu}" ] || continue
   if [ ! -f "${SMTP_MU_DIR}/${_mu}" ]; then
     install -m 0644 "${PAYLOAD_DIR}/mu-plugins/${_mu}" "${SMTP_MU_DIR}/${_mu}"

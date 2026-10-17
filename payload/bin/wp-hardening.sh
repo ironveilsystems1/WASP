@@ -56,7 +56,15 @@ feature_state() {
                    "$APACHE_CONF" 2>/dev/null | grep -q BLOCKED && echo BLOCKED || echo OPEN ;;
     uploads-php) grep -q 'wp-content/uploads' "$APACHE_CONF" 2>/dev/null && echo BLOCKED || echo OPEN ;;
     debug)       PRUN exec wordpress php -r 'echo (defined("WP_DEBUG") && WP_DEBUG)?"ON":"OFF";' 2>/dev/null || echo UNKNOWN ;;
-    file-mods)   PRUN exec wordpress php -r 'echo (defined("DISALLOW_FILE_MODS") && DISALLOW_FILE_MODS)?"BLOCKED":"ALLOWED";' 2>/dev/null || echo UNKNOWN ;;
+    file-mods)
+      # Report the CONSEQUENCE, not just the flag. "BLOCKED" tells an operator
+      # nothing about why wp-admin has no update section — and that specific
+      # confusion has already cost a real session, with a correct licence, a
+      # working egress allowlist and a vendor that was reachable.
+      _fm=$(PRUN exec wordpress php -r 'echo (defined("DISALLOW_FILE_MODS") && DISALLOW_FILE_MODS)?"BLOCKED":"ALLOWED";' 2>/dev/null || echo UNKNOWN)
+      printf '%s' "$_fm"
+      [ "$_fm" = "BLOCKED" ] && printf '%s' "  (no install OR update UI in wp-admin — use wp-plugins.sh install-file)"
+      echo ;;
     php-exec)    PRUN exec wordpress php -r 'echo function_exists("system")?"ALLOWED":"BLOCKED";' 2>/dev/null || echo UNKNOWN ;;
   esac
 }
@@ -85,6 +93,7 @@ show_status() {
   echo "          cti [ip|--status] | cti-key <key> [budget] | cti-watch"
   echo "          lynis [run] | disk | disk-check | tls [domain]"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
+  echo "          cs-doctor | cs-lapi <url> <login> <password>"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
 }
 
@@ -250,6 +259,55 @@ case "${1:-status}" in
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     _cs_fail=0
 
+    # What this VM was BUILT to do. Without it, every check below is answering
+    # "is the local bouncer enforcing" — a question with no correct answer on a
+    # VM behind a reverse proxy, where the local bouncer cannot enforce and its
+    # health therefore proves nothing either way.
+    _cs_mode="local"; _cs_proxy=""; _cs_lapi=""; _cs_login=""
+    if [ -r /etc/wp-install/crowdsec-topology ]; then
+      while IFS='=' read -r _k _v; do
+        case "$_k" in
+          enforcement) _cs_mode="${_v:-local}" ;;
+          proxy_ip)    _cs_proxy="$_v" ;;
+          lapi_url)    _cs_lapi="$_v" ;;
+          lapi_login)  _cs_login="$_v" ;;
+        esac
+      done < /etc/wp-install/crowdsec-topology
+    elif [ -r /etc/wp-install/vars.sh ]; then
+      # Built before this file existed. Infer, and say that it is inferred.
+      _cs_proxy=$(sed -n 's/^PROXY_IP=["'"'"']*\([^"'"'"']*\).*/\1/p' /etc/wp-install/vars.sh 2>/dev/null | head -1)
+      [ -n "$_cs_proxy" ] && _cs_mode="local-inferred"
+    fi
+
+    case "$_cs_mode" in
+      upstream)
+        echo "  Topology:  detect here, enforce upstream at ${_cs_lapi}"
+        echo "             No local bouncer by design — behind ${_cs_proxy} one"
+        echo "             would ban addresses that never reach this VM." ;;
+      detect-only)
+        echo "  Topology:  DETECTION ONLY — nothing this VM knows of blocks."
+        _cs_fail=$((_cs_fail+1)) ;;
+      local-inferred)
+        echo "  Topology:  no record of how this VM was built (pre-10.4 install)."
+        echo "             A proxy is configured at ${_cs_proxy}, so the local"
+        echo "             bouncer below very likely enforces nothing: it bans"
+        echo "             real client addresses, and every packet arrives from"
+        echo "             the proxy. Step 7 will still pass — it injects a"
+        echo "             decision and watches nftables, which proves the"
+        echo "             plumbing, not that any attacker is stopped."
+        echo "             Confirm with step 8." ;;
+      *)
+        if [ -n "$_cs_proxy" ]; then
+          echo "  Topology:  local enforcement, behind a proxy at ${_cs_proxy}."
+          echo "             Only correct if that proxy preserves the client"
+          echo "             source address at layer 3, or clients also reach"
+          echo "             this VM directly. Otherwise see step 8."
+        else
+          echo "  Topology:  direct access, local enforcement. Steps below apply."
+        fi ;;
+    esac
+    echo ""
+
     printf "  %-38s " "1. Engine container running"
     if podman ps --filter 'name=^crowdsec$' --filter status=running --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec; then
       echo "yes"
@@ -273,7 +331,23 @@ case "${1:-status}" in
     fi
 
     printf "  %-38s " "4. Bouncer service running"
-    if rc-service cs-firewall-bouncer status >/dev/null 2>&1; then echo "yes"
+    if [ "$_cs_mode" = "upstream" ] || [ "$_cs_mode" = "detect-only" ]; then
+      # Inverted on purpose. In these modes a RUNNING local bouncer is the
+      # fault, not the fix: it writes this VM's nftables full of client
+      # addresses that never send it a packet, and that set is then read as
+      # evidence of blocking.
+      if rc-service cs-firewall-bouncer status >/dev/null 2>&1; then
+        echo "RUNNING — should not be"
+        echo "     This VM is not supposed to enforce. The entries it is"
+        echo "     writing match no traffic and will be mistaken for"
+        echo "     enforcement by anyone reading them later."
+        echo "     doas rc-service cs-firewall-bouncer stop"
+        echo "     doas rc-update del cs-firewall-bouncer default"
+        _cs_fail=$((_cs_fail+1))
+      else
+        echo "absent (correct for this topology)"
+      fi
+    elif rc-service cs-firewall-bouncer status >/dev/null 2>&1; then echo "yes"
     else echo "NO"; _cs_fail=$((_cs_fail+1)); echo "     doas rc-service cs-firewall-bouncer restart"; fi
 
     printf "  %-38s " "5. Bouncer has pulled recently"
@@ -311,40 +385,213 @@ case "${1:-status}" in
     fi
 
     printf "  %-38s " "6. nftables has the crowdsec set"
-    if nft list ruleset 2>/dev/null | grep -qi "crowdsec"; then echo "yes"
+    if [ "$_cs_mode" = "upstream" ] || [ "$_cs_mode" = "detect-only" ]; then
+      if nft list ruleset 2>/dev/null | grep -qi "crowdsec"; then
+        echo "present — leftover from a local bouncer"
+        echo "     Harmless in itself and misleading to read. Clear it:"
+        echo "     doas nft delete table inet crowdsec"
+        else echo "absent (correct for this topology)"; fi
+    elif nft list ruleset 2>/dev/null | grep -qi "crowdsec"; then echo "yes"
     else echo "NO"; _cs_fail=$((_cs_fail+1))
          echo "     The bouncer creates its own set. Absent means it has never"
          echo "     successfully written a rule."; fi
 
     # ── The only test that actually proves it ────────────────────────────────
     echo ""
-    echo "  7. Live test: does a decision become a firewall entry?"
-    _tip="192.0.2.222"   # TEST-NET-1, RFC 5737 — never routable, safe to ban
-    podman exec crowdsec cscli decisions add --ip "$_tip" --duration 2m --reason "wasp crowdsec-doctor test" >/dev/null 2>&1
-    _ok=0
-    for _i in 1 2 3 4 5 6 7 8 9 10; do
-      sleep 2
-      if nft list ruleset 2>/dev/null | grep -q "$_tip"; then _ok=1; break; fi
-    done
-    podman exec crowdsec cscli decisions delete --ip "$_tip" >/dev/null 2>&1 || true
-    if [ "$_ok" = 1 ]; then
-      echo "     PASS — the ban reached nftables in ~$((_i * 2))s."
-      echo "     Remediation is working regardless of what the console shows."
+    if [ "$_cs_mode" = "upstream" ]; then
+      echo "  7. Live test: does a decision reach the upstream LAPI?"
+      _tip="192.0.2.222"   # TEST-NET-1, RFC 5737 — never routable, safe to ban
+      podman exec crowdsec cscli decisions add --ip "$_tip" --duration 2m --reason "wasp crowdsec-doctor test" >/dev/null 2>&1
+      if podman exec crowdsec cscli decisions list -o raw 2>/dev/null | grep -q "$_tip"; then
+        echo "     PASS — the decision was accepted by ${_cs_lapi}."
+      else
+        echo "     FAIL — the decision did not appear on ${_cs_lapi}."
+        echo "     Detection here is reaching nobody."
+        _cs_fail=$((_cs_fail+1))
+      fi
+      podman exec crowdsec cscli decisions delete --ip "$_tip" >/dev/null 2>&1 || true
+      echo ""
+      echo "     This VM cannot prove the rest. A decision accepted by the LAPI"
+      echo "     is dropped only if that host's bouncer is enforcing, and that"
+      echo "     is checked there, not here:"
+      echo "       on the LAPI host    cscli bouncers list     (needs a recent"
+      echo "                                                   Last API pull)"
+      echo "       on OPNsense         pfctl -t crowdsec_blocklists -T show"
+      echo "       on a Linux bouncer  nft list set inet crowdsec crowdsec-blacklists"
+      echo "     A registered bouncer is not an enforcing one — a row with no"
+      echo "     Last API pull has never authenticated."
+    elif [ "$_cs_mode" = "detect-only" ]; then
+      echo "  7. Live test: skipped — nothing here enforces, by declaration."
+      echo "     To change that:  doas wp-hardening.sh cs-lapi <url> <login> <pw>"
     else
-      echo "     FAIL — a decision was added and never appeared in nftables"
-      echo "     within 20s. Detection may work, but nothing is being blocked."
-      _cs_fail=$((_cs_fail+1))
+      echo "  7. Live test: does a decision become a firewall entry?"
+      _tip="192.0.2.222"   # TEST-NET-1, RFC 5737 — never routable, safe to ban
+      podman exec crowdsec cscli decisions add --ip "$_tip" --duration 2m --reason "wasp crowdsec-doctor test" >/dev/null 2>&1
+      _ok=0
+      for _i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 2
+        if nft list ruleset 2>/dev/null | grep -q "$_tip"; then _ok=1; break; fi
+      done
+      podman exec crowdsec cscli decisions delete --ip "$_tip" >/dev/null 2>&1 || true
+      if [ "$_ok" = 1 ]; then
+        echo "     PASS — the ban reached nftables in ~$((_i * 2))s."
+        echo "     Remediation is working regardless of what the console shows."
+      else
+        echo "     FAIL — a decision was added and never appeared in nftables"
+        echo "     within 20s. Detection may work, but nothing is being blocked."
+        _cs_fail=$((_cs_fail+1))
+      fi
+    fi
+
+    # ── 8. The question steps 1-7 cannot ask ─────────────────────────────────
+    # Every step above can pass on a VM where no attacker is ever blocked. Step
+    # 7 injects a decision and watches the local nftables, which proves the
+    # plumbing works -- and says nothing about whether traffic from a banned
+    # address ever arrives here to be dropped. Behind a reverse proxy it never
+    # does. This is the step that looks at that.
+    if [ -n "$_cs_proxy" ]; then
+      echo ""
+      echo "  8. Can a local ban match real traffic?"
+      _seen=$(awk '{print $1}' /home/wpuser/wp/logs/access.log 2>/dev/null \
+              | grep -vxF "$_cs_proxy" | grep -cE '^[0-9]+\.' 2>/dev/null)
+      _seen="${_seen:-0}"
+      if [ "$_cs_mode" = "local" ] || [ "$_cs_mode" = "local-inferred" ]; then
+        if [ "$_seen" -gt 0 ]; then
+          echo "     YES — ${_seen} log lines from addresses other than"
+          echo "     ${_cs_proxy}, so clients do reach this VM directly and a"
+          echo "     local ban can drop them."
+        else
+          echo "     NO — every request in the access log arrived from"
+          echo "     ${_cs_proxy}. A ban on a client address therefore matches"
+          echo "     nothing this firewall ever sees. Steps 3-7 can all pass"
+          echo "     while no attacker is slowed down at all."
+          echo "     Move enforcement to where the client connection ends:"
+          echo "       doas wp-hardening.sh cs-lapi <url> <login> <password>"
+          _cs_fail=$((_cs_fail+1))
+        fi
+      else
+        echo "     n/a — this VM does not enforce (see Topology)."
+      fi
     fi
 
     echo ""
     if [ "$_cs_fail" -eq 0 ]; then
-      echo "  Chain is intact. If the console still shows 0 remediation"
-      echo "  components, that is a console sync question, not an enforcement"
-      echo "  one — it reflects what the enrolled engine last reported and can"
-      echo "  lag. Re-check it after the next pull."
+      if [ "$_cs_mode" = "upstream" ]; then
+        echo "  Detection is healthy and reporting to ${_cs_lapi}."
+        echo "  Whether anything is BLOCKED depends on that host's bouncer,"
+        echo "  which is verified there — see the commands under step 7."
+      else
+        echo "  Chain is intact. If the console still shows 0 remediation"
+        echo "  components, that is a console sync question, not an enforcement"
+        echo "  one — it reflects what the enrolled engine last reported and can"
+        echo "  lag. Re-check it after the next pull."
+      fi
     else
       echo "  ${_cs_fail} problem(s) above. Attackers may be detected and NOT blocked."
     fi
+    ;;
+
+  cs-lapi)
+    # Point this VM's agent at a central LAPI after install, or repair the
+    # credentials. Exists because the install cannot always know them: the
+    # machine has to be registered ON the LAPI host first, and that is often a
+    # different person's job or a different sitting.
+    _u="${2:-}"; _l="${3:-}"; _p="${4:-}"
+    if [ -z "$_u" ] || [ -z "$_l" ] || [ -z "$_p" ]; then
+      echo "Usage: wp-hardening.sh cs-lapi <lapi-url> <machine-login> <password>"
+      echo ""
+      echo "  Register the machine first — these run on the LAPI host, not here:"
+      echo "    on the LAPI host       cscli machines add <login> --password '<pw>'"
+      echo "    on NPMplus (container) podman exec crowdsec cscli machines add …"
+      echo ""
+      echo "  Then point this VM at it, e.g.:"
+      echo "      doas wp-hardening.sh cs-lapi http://10.20.10.10:8080/ wp01 's3cret'"
+      echo ""
+      echo "  The URL must be reachable from this VM. A stock CrowdSec install"
+      echo "  binds its LAPI to 127.0.0.1:8080, which is not reachable from"
+      echo "  anywhere else however correct the credentials are — publishing it"
+      echo "  is a change on that host, not here."
+      exit 1
+    fi
+    _topo=/etc/wp-install/crowdsec-topology
+    _proxy=""
+    [ -r "$_topo" ] && _proxy=$(sed -n 's/^proxy_ip=//p' "$_topo" | head -1)
+
+    # Resolve the image BEFORE destroying the container that knows it.
+    # Order matters: the running container's own image first (true even on a
+    # VM built before the recorded file existed), then the recorded value.
+    # No ":latest" fallback — this install digest-pins its images, and quietly
+    # substituting a floating tag during a credential fix would throw that away
+    # at the one moment nobody is thinking about image versions.
+    _img=$(podman inspect --format '{{.ImageName}}' crowdsec 2>/dev/null)
+    case "$_img" in ''|'<no value>') _img=$(cat /etc/wp-install/crowdsec-image 2>/dev/null) ;; esac
+    if [ -z "$_img" ]; then
+      echo "✗  Cannot determine which CrowdSec image this VM runs, and will not"
+      echo "   guess a tag. Nothing has been changed."
+      echo "   Find it with:  doas podman images | grep crowdsec"
+      echo "   Record it:     echo '<image@sha256:...>' | doas tee /etc/wp-install/crowdsec-image"
+      exit 1
+    fi
+    podman rm -f crowdsec >/dev/null 2>&1 || true
+    # Re-create with the agent-only variables. Every other flag is taken from
+    # the existing container's definition rather than retyped, because a
+    # second copy of a 20-flag hardened run command is a copy that drifts.
+    if ! podman run -d --name crowdsec --restart always --network host \
+      --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID \
+      --cap-add CHOWN --security-opt no-new-privileges:true --read-only \
+      --tmpfs /tmp:size=32M,noexec,nosuid,nodev \
+      --tmpfs /var/run:size=16M,noexec,nosuid,nodev \
+      --pids-limit 100 --memory=512m --label io.containers.autoupdate=image \
+      -e COLLECTIONS="crowdsecurity/apache2 crowdsecurity/wordpress crowdsecurity/linux crowdsecurity/sshd crowdsecurity/http-cve crowdsecurity/appsec-wordpress" \
+      -e DISABLE_LOCAL_API=true -e LOCAL_API_URL="$_u" \
+      -e AGENT_USERNAME="$_l" -e AGENT_PASSWORD="$_p" \
+      -v /opt/crowdsec/config:/etc/crowdsec:rw \
+      -v /opt/crowdsec/data:/var/lib/crowdsec/data:rw \
+      -v /opt/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro \
+      -v /home/wpuser/wp/logs:/var/log/wordpress:ro \
+      -v /var/log/messages:/var/log/host/messages:ro \
+      "$_img" >/dev/null 2>&1; then
+      echo "✗  Could not start the agent on ${_img}. The previous container is"
+      echo "   gone — check: doas podman logs crowdsec"
+      exit 1
+    fi
+    echo "Waiting for the agent to authenticate…"
+    _up=0
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      sleep 5
+      podman exec crowdsec cscli lapi status >/dev/null 2>&1 && { _up=1; break; }
+    done
+    if [ "$_up" != "1" ]; then
+      echo "✗  The agent could not authenticate to ${_u}."
+      echo "   On the LAPI host:   cscli machines list      (is '${_l}' there?)"
+      echo "   On the LAPI host:   is it listening off 127.0.0.1?"
+      echo "   From here:          nc -z \${host} 8080"
+      echo "   Nothing has been lost — re-run this command with corrections."
+      exit 1
+    fi
+    mkdir -p /etc/wp-install
+    {
+      printf 'enforcement=upstream\n'
+      printf 'proxy_ip=%s\n'   "$_proxy"
+      printf 'lapi_url=%s\n'   "$_u"
+      printf 'lapi_login=%s\n' "$_l"
+    } > "$_topo"
+    chmod 600 "$_topo"
+    # The local bouncer is now actively harmful: it would fill this VM's
+    # nftables with addresses no packet arrives from, and be read as proof of
+    # blocking by the next person to look.
+    rc-service cs-firewall-bouncer stop >/dev/null 2>&1 || true
+    rc-update del cs-firewall-bouncer default >/dev/null 2>&1 || true
+    nft delete table inet crowdsec >/dev/null 2>&1 || true
+    echo "✔  Agent reporting to ${_u} as ${_l}"
+    echo "✔  Local bouncer stopped and its nftables table removed"
+    echo ""
+    echo "   Enforcement now lives on that LAPI's bouncer. Confirm it there:"
+    echo "     on the LAPI host     cscli bouncers list   — needs a recent"
+    echo "                                                  Last API pull"
+    echo "   Then re-check this VM:  doas wp-hardening.sh cs-doctor"
+    echo "   If a production blocker was recorded for enforcement:"
+    echo "       doas wasp-triage.sh --recheck-blockers"
     ;;
 
   crowdsec-whitelist)

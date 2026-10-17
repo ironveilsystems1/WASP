@@ -551,10 +551,37 @@ case "${1:-status}" in
     _configured || { _bad "Off-site backup is not configured. Run: doas wasp-offsite-backup.sh init"; exit 1; }
     _new="${2:-}"
     if [ -z "$_new" ]; then
-      echo "Current destination: ${OFFSITE_DEST}"
+      # Show the operator THEIR OWN value broken into its parts, rather than
+      # describing an abstract format they then have to map onto it. "Format:
+      # remote:bucket/prefix" is accurate and requires the reader to work out
+      # which part of their existing string is which -- at the exact moment
+      # they are changing something they cannot easily verify.
+      _rem=${OFFSITE_DEST%%:*}
+      _rest=${OFFSITE_DEST#*:}
+      _bkt=${_rest%%/*}
+      case "$_rest" in
+        */*) _pfx=${_rest#*/} ;;
+        *)   _pfx="" ;;
+      esac
+
+      echo "Current destination:  ${OFFSITE_DEST}"
       echo ""
-      echo "Format: remote:bucket/prefix   (the part before ':' is the rclone"
-      echo "remote name and normally stays as it is)"
+      echo "  which is made up of:"
+      printf '    %-9s %-22s %s\n' "remote"  "${_rem}"          "the rclone remote — normally leave this alone"
+      printf '    %-9s %-22s %s\n' "bucket"  "${_bkt}"          "your bucket at the storage provider"
+      printf '    %-9s %-22s %s\n' "prefix"  "${_pfx:-(none)}"  "a folder path inside the bucket; nothing depends on it"
+      echo ""
+      echo "  To change only the bucket to (say) 'testpress', enter:"
+      echo "      ${_rem}:testpress${_pfx:+/${_pfx}}"
+      echo ""
+      echo "  Before you do — two things that fail identically to a typo:"
+      echo "    * the bucket must already exist; object storage will not create it"
+      echo "    * the API token must be scoped to THAT bucket. A token scoped to"
+      echo "      the old one returns 403 against the new one, not 404, because"
+      echo "      the provider will not confirm a bucket exists to a caller that"
+      echo "      cannot see it. It looks exactly like wrong credentials."
+      echo ""
+      echo "  Press Enter alone to cancel."
       printf '  New destination: '
       read -r _new
     fi
@@ -704,6 +731,16 @@ case "${1:-status}" in
     _hdr "Replace object-storage credentials"
     _note "The current keys stay in place until both new values are entered."
     _note "Nothing is written if you cancel."
+    echo ""
+    # Name the provider's own labels. R2, B2 and AWS each call these something
+    # slightly different, and an operator copying from a dashboard is matching
+    # words, not concepts.
+    echo "  On Cloudflare R2 these appear when you create the token, once:"
+    echo "    Access Key ID       -> 32 hex characters"
+    echo "    Secret Access Key   -> 64 hex characters"
+    echo "  Paste the VALUE only. Provider panels put the label beside it and"
+    echo "  both get copied; a value containing a space or a colon is refused"
+    echo "  below rather than written and left to fail a day later."
     echo ""
     printf '  Access key ID     : '
     read -r _ak
