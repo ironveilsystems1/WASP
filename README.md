@@ -1176,6 +1176,36 @@ doas wasp-egress.sh discovery                   # what the site actually reaches
 Nothing is allowed that you did not ask for. Every entry is a destination a
 compromised WordPress may reach, so a builder you do not run is pure surface.
 
+## Letting an outside developer in, briefly
+
+A web developer who needs wp-admin for a few days is a routine request with a
+routinely permanent outcome: the IP goes into the allowlist, the work
+finishes, and the entry stays — because removing it is a separate task nobody
+is assigned and nothing reminds anyone of. Allowlists accrete, and every
+stale entry is a way into wp-admin that no longer has an owner.
+
+```sh
+doas wasp-temp-access.sh grant webdev 2 203.0.113.10 198.51.100.7
+doas wasp-temp-access.sh list            # what is open, and when it closes
+doas wasp-temp-access.sh revoke webdev   # close it early
+```
+
+The grant and its revocation are created by the same command. The expiry is
+scheduled the moment access opens and does not depend on anyone remembering.
+
+It writes **both** admin layers, which is the part that catches people out.
+Admin is gated by the IP allowlist *and* by the GeoIP country test, and those
+combine rather than override (see ARCHITECTURE.md §9.1). A developer outside
+your permitted country added only to the allowlist still gets a 403, and it
+looks exactly like the grant failing. It also refuses windows longer than 30
+days and CIDRs wider than /16, config-tests before reloading Apache, and
+rolls the grant back if the public site stops answering.
+
+An IP exemption is not a login. They still need a WordPress account, with the
+least role that does the job, and if MFA is enforced it applies to them. The
+expiry closes the door; it does not take back the key — delete the account
+when the engagement ends.
+
 ## Capturing a session for review
 
 When something needs a second pair of eyes — a failed install, a control misbehaving, "did this do what I think" — the most useful thing to hand over is exactly what you ran and exactly what the machine saw. `wasp-capture.sh` records that and bundles it into one file you can attach in a browser.

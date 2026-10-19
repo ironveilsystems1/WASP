@@ -475,8 +475,29 @@ NFTEOF
 REQUIRE_ADMIN=""
 if [[ -n "$ADMIN_CIDR" || -n "$ALLOWED_ADMIN_IP" ]]; then
   _allow=""
-  [[ -n "$ADMIN_CIDR" ]]       && _allow+=$'\n'"            Require ip ${ADMIN_CIDR}"
-  [[ -n "$ALLOWED_ADMIN_IP" ]] && _allow+=$'\n'"            Require ip ${ALLOWED_ADMIN_IP}"
+  # ── _ssv, not the raw value ────────────────────────────────────────────────
+  # Apache's `Require ip` takes a SPACE-separated list. A comma is a syntax
+  # error: "ip address '...' appears to be invalid: The specified network mask
+  # is invalid."
+  #
+  # ADMIN_CIDR became a comma list when _ask_cidr was taught to accept several
+  # ranges -- which was itself prompted by the melroseparkfire operator being
+  # rejected for entering two. The prompt was fixed, the nftables consumers
+  # were converted with _csv, and this one site, which needs the opposite
+  # convention, was left alone.
+  #
+  # The result on the next install: wp-security.conf did not parse, Apache
+  # never started, every request to the VM was refused, and the failure
+  # surfaced two stages later as "GeoIP setup failed" because the GeoIP step
+  # rebuilds the Apache layer and runs a config test. The real cause was three
+  # screens up in the log.
+  #
+  # _ssv exists in lib/00 for exactly this, with "for Apache's Require ip" in
+  # its own comment. Two conventions sitting side by side is what makes
+  # forgetting one of them easy, so both sites are converted explicitly here
+  # rather than relying on whatever the caller happened to pass.
+  [[ -n "$ADMIN_CIDR" ]]       && _allow+=$'\n'"            Require ip $(_ssv "$ADMIN_CIDR")"
+  [[ -n "$ALLOWED_ADMIN_IP" ]] && _allow+=$'\n'"            Require ip $(_ssv "$ALLOWED_ADMIN_IP")"
 
   if [[ -n "$PROXY_IP" ]]; then
     # FAIL-CLOSED FIX (found in the field: an admin logged in over cellular

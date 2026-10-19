@@ -211,6 +211,84 @@ _host_subnet_hints() {   # $1 = max lines (default 6)
     }'
 }
 
+# ── Administration-source hints ──────────────────────────────────────────────
+# A DIFFERENT question from _host_subnet_hints above, and the two want opposite
+# answers out of the same data.
+#
+#   _host_subnet_hints answers "what address should this VM have", so an
+#   overlay address is noise and is excluded.
+#
+#   This answers "where will you be administering FROM", and for a remote
+#   operator the overlay is the whole answer.
+#
+# Printing nothing at the SSH prompt was the worst of the three options. From
+# the melroseparkfire install: the SSH CIDR question — the one prompt in this
+# installer whose wrong answer costs you the login path — printed no hints at
+# all, while the wp-admin question thirty lines later printed the full host
+# interface list. The operator, remote over NetBird, had nothing to answer
+# from.
+#
+# THE TRAP THIS EXISTS TO NAME
+#
+# An overlay peer reaching a host that is NOT itself a peer goes through a
+# routed subnet advertised by one that is. Both common overlays NAT that
+# traffic BY DEFAULT — NetBird's "Masquerade" toggle on a network route,
+# Tailscale's --snat-subnet-routes. The destination therefore sees the ROUTING
+# PEER's address, not the operator's overlay address.
+#
+# So the two plausible answers are mutually exclusive, each locks you out if
+# the other is true, and nothing the installer printed previously let you tell
+# them apart. Both get listed; where the VM address is already known the
+# masqueraded source is COMPUTED rather than described, because "it depends on
+# your routing" is not an answer anyone can type into a prompt.
+_overlay_addrs() {
+  ip -4 addr show scope global 2>/dev/null | awk '
+    /inet /{ split($2, a, "/"); split(a[1], o, ".")
+      if (o[1]==100 && o[2]>=64 && o[2]<=127)
+        printf "    %-16s overlay (NetBird/Tailscale, 100.64.0.0/10)\n", a[1] }'
+}
+
+# True when an overlay-owned NAT rule exists. Scoped to rules the overlay
+# itself owns: a bare search for "masquerade" matches any NAT'd bridge on a
+# Proxmox host and would fire on every install.
+#
+# The first cut of this piped one grep into another — overlay-named lines, then
+# masquerade — and never fired on a host that was plainly masquerading. In nft
+# syntax the chain NAME and the masquerade RULE are on different lines:
+#
+#     chain netbird-rt-nat { type nat hook postrouting priority srcnat;
+#       ip saddr 100.64.0.0/10 ip daddr 10.20.101.0/24 counter masquerade
+#
+# so no single line holds both and the intersection is empty. That failure is
+# silent and points the wrong way: the operator is told no masquerading was
+# detected, on a host that masquerades, and locks themselves out by allowing
+# only the overlay range. Match the BLOCK, not the line.
+_overlay_masquerades() {
+  # iptables-save is flat — chain name and -j target share one line.
+  iptables-save -t nat 2>/dev/null \
+    | grep -iE 'netbird|tailscale|ts-postrouting' \
+    | grep -qiE 'masquerade|snat' && return 0
+  # nft nests. Enter at the overlay-named table or chain, track brace depth,
+  # and look for the rule anywhere inside it.
+  nft list ruleset 2>/dev/null | awk '
+    !inblk && /netbird|tailscale|ts-postrouting/ && /\{/ { inblk = 1; depth = 0 }
+    inblk {
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (tolower($0) ~ /masquerade|snat/) { found = 1; exit }
+      if (depth <= 0) inblk = 0
+    }
+    END { exit(found ? 0 : 1) }'
+}
+
+# The address this host would use as source when talking to $1 — i.e. exactly
+# what the VM sees when traffic to it is masqueraded through here.
+_route_src_to() {  # $1 = destination IPv4 ; echoes an address or nothing
+  [ -n "${1:-}" ] || return 0
+  ip -4 route get "$1" 2>/dev/null \
+    | awk '{ for (i=1;i<=NF;i++) if ($i=="src") { print $(i+1); exit } }'
+}
+
 # ── SSH public-key classification ────────────────────────────────────────────
 # Defined here, in the first file sourced, because two places need it and they
 # must agree: lib/01 collects keys and lib/05 writes them to authorized_keys.

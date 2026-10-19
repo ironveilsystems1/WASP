@@ -311,6 +311,58 @@ flowchart TD
     style DONE2 fill:#1f2937,stroke:#22c55e,color:#fff
 ```
 
+### 6.1 A replacement container must inherit the deployment's shape
+
+The cutover above replaces a container by name. Everything that made the
+original container what it is — its environment, its topology — has to be
+reproduced, and anything the update hardcodes instead is a bug that only
+appears on deployments shaped differently from the author's.
+
+CrowdSec is the live example. It runs in one of two topologies:
+
+- **local LAPI** — the engine and its API both on this VM
+- **agent-only** — the agent reports to a LAPI on another host, created with
+  `-e DISABLE_LOCAL_API=true -e LOCAL_API_URL=http://<host>:8080/`
+
+`update.sh` hardcoded the first. On an agent-only install the replacement
+came up as a full local API node, re-registered itself against `127.0.0.1`,
+and the health check waited for a LAPI that was never going to answer. The
+update could not succeed at any timeout — while reporting `LAPI not
+responding`, which reads as *the remote LAPI is down* rather than *this
+container was built wrong*.
+
+`do_cs_update` now reads `DISABLE_LOCAL_API`, `LOCAL_API_URL` and
+`DISABLE_AGENT` off the running container and carries them forward, and the
+suite enumerates every such variable the installer can set, failing if one is
+not inherited. The general rule: **read the shape off what is running, do not
+assume it.**
+
+Two related properties of this path, both learned the same way:
+
+**The health-check wait must allow for first-start work.** A version change
+migrates config and the local database before the API answers. Thirty seconds
+was not enough, so the update rolled back on containers that were merely
+starting. It is three minutes now, and it gives up early if the container has
+actually exited.
+
+**The rollback must not destroy the evidence.** It removed the failed
+container immediately, taking with it the only record of why. The logs,
+`cscli lapi status` and the exit code are now written to
+`/var/log/wasp-crowdsec-upgrade-failed.log` before the container goes.
+
+### 6.2 Trivy stages through the cache directory, not `/tmp`
+
+`--cache-dir` governs where the vulnerability database is **kept**; `TMPDIR`
+governs where it is **staged** during download. On Alpine `/tmp` is a tmpfs
+sized from RAM — commonly 256 MB — against gigabytes free on the real disk.
+The database does not fit, every download fails, and the error names the
+*vulnerability database* rather than the disk.
+
+Because the production profile correctly refuses to update on an incomplete
+scan, this silently blocks **every** security update on the VM. `update.sh`
+therefore points `TMPDIR` at `${TRIVY_CACHE_DIR}/tmp`, which is on real disk
+by definition, and says so explicitly if it cannot.
+
 ---
 
 ## 7. Site import
@@ -426,7 +478,7 @@ graph LR
     P --> P5["install-file &lt;zip&gt; — local file,<br/>SHA-256 recorded, never a URL,<br/>never staged in the web root"]
 
     T --> M["wp-malware-scan.sh"]
-    M --> M1["PHP in uploads — highest signal"]
+    M --> M1["PHP in uploads — highest signal,<br/>uploads-scoped ruleset only"]
     M --> M2["core vs pinned image"]
     M --> M3["YARA rules, tiered"]
     M --> M4["database analysis"]
@@ -445,6 +497,11 @@ graph LR
     EG --> EG2["test — proves the firewall enforces it"]
     EG --> EG3["discovery — what got blocked, classified by hand"]
     EG --> EG4["maintenance windows that close themselves"]
+
+    T --> TA["wasp-temp-access.sh"]
+    TA --> TA1["grant &lt;label&gt; &lt;days&gt; &lt;ip…&gt;<br/>writes BOTH admin layers"]
+    TA --> TA2["revocation scheduled at grant time,<br/>not left to memory"]
+    TA --> TA3["refuses &gt;30 days or CIDRs wider than /16"]
 
     T --> IM["wp-import.sh"]
     IM --> IM1["inspect — reads the index, extracts nothing"]
@@ -499,7 +556,40 @@ graph LR
     style EG2 fill:#1f2937,stroke:#22c55e,color:#fff
     style IM3 fill:#1f2937,stroke:#22c55e,color:#fff
     style N3 fill:#1f2937,stroke:#22c55e,color:#fff
+    style TA2 fill:#1f2937,stroke:#22c55e,color:#fff
 ```
+
+### 8.1 A detector that cannot be wrong is not a detector
+
+Two properties the day-2 tools are held to, both added after they were found
+missing on a live VM.
+
+**A rule runs only where it is valid.** `wpvm_php_in_nonphp_extension`
+matches `<?php`, which is high signal inside `wp-content/uploads` and pure
+noise anywhere else. Run against the whole tree it flagged 48 legitimate
+files including `wp-config.php` and the project's own mu-plugins. Scope is
+now enforced by *which paths are scanned* — uploads-scoped rules live in
+`wp-malware-uploads.yar` and are only ever pointed at uploads and cache —
+rather than by a comment in the rule's `meta` block, which the scanner never
+reads. A scanner whose output is entirely false positives trains the operator
+to ignore it, which is worse than having no scanner.
+
+**A verdict must be capable of being negative.** The same scan summarised
+those 48 findings as `suspicious 0`, because the findings loop sat on the
+right-hand side of a pipe and its counters incremented in a subshell. A real
+detection would have summarised as zero too. Related: `install-file` printed
+`✔ Activated (verified)` for two plugins that were not active, because it
+asked whether *anything* was active rather than whether *that* was. When a
+check can only ever pass, it is decoration — and worse than nothing, because
+it is read as evidence.
+
+**Time-boxed access expires without anyone remembering.** "Let the developer
+in for a couple of days" is a routine request with a routinely permanent
+outcome, because removing the entry is a separate task nobody is assigned.
+`wasp-temp-access.sh` schedules the revocation at the moment the grant is
+made, as a cron entry the revoke path removes, and writes both admin
+authorization layers (see 9.1) so an out-of-country contractor does not hit a
+403 that looks like the grant failing.
 
 ## 9. The login path, layer by layer
 
@@ -512,9 +602,12 @@ different assumption failing, so defeating one does not defeat the next:
 2. **mod_remoteip** restores the real client IP, but only from the one proxy
    address declared trusted, so every IP-based decision below it is made on a
    value an attacker cannot forge per-request.
-3. **The 8G firewall, GeoIP and wp-admin IP restriction** (all in `.htaccess`,
-   still before PHP) reject scanners, disallowed countries, and admin access
-   from unapproved networks.
+3. **The 8G firewall, GeoIP and wp-admin IP restriction** (still before PHP)
+   reject scanners, disallowed countries, and admin access from unapproved
+   networks. The 8G rules live in `.htaccess`; the GeoIP and IP-restriction
+   gates are Apache `conf-enabled` fragments, and they interact in a way that
+   is not obvious — see 9.1, which exists because getting it wrong silently
+   disables the IP restriction entirely.
 4. **The login guard** (`02-wpvm-login-guard.php`) throttles password guessing
    on the `authenticate` filter and removes WordPress's username-enumeration
    leak, and feeds every outcome to CrowdSec for banning at layer 1.
@@ -538,6 +631,57 @@ installed through `wp-plugins.sh` from the WordPress.org directory. The
 enforcement lives in a separate mu-plugin so the plugin can update freely and so
 the enforcement cannot be switched off from the admin panel an intruder would
 reach first.
+
+### 9.1 Why the two admin gates must be written together
+
+Admin access is decided by **two** Apache authorization blocks in different
+files, and they do not combine the way reading either one suggests:
+
+| File | Block | Asserts |
+|---|---|---|
+| `wp-security.conf` | `<DirectoryMatch "…wp-admin">`, `<Files "wp-login.php">` | the IP allowlist |
+| `geoip.conf` | `<Location />` | the country test, on **every** URL |
+
+Apache applies configuration sections in a fixed order:
+
+```
+<Directory>  →  <DirectoryMatch>  →  <Files>  →  <Location>
+```
+
+`<Location>` is applied **last**. And `mod_authz_core`'s `AuthMerging`
+defaults to `Off`, which means a later section's authorization logic
+**replaces** an earlier section's rather than combining with it.
+
+So a site-wide `<Location />` carrying `Require` directives silently discards
+the wp-admin allowlist. That is not a hypothetical: it shipped, and on a live
+client VM the admin IP restriction had never once been consulted. The only
+surviving control was the country test — plus the RFC1918 exemptions inside
+it, which granted access to anything presenting a private address with no
+country check at all.
+
+The failure has the worst possible shape. Testing from a disallowed country
+returns 403, which reads as the restriction working. Only testing from an
+**allowed country but a disallowed address** reveals it, and that is not the
+test anyone thinks to run.
+
+`wp-geoip-setup.sh` therefore emits `AuthMerging And` inside that block, and
+`test-fail-closed.sh` fails if any generated `<Location>`/`<LocationMatch>`
+carrying `Require` directives omits it.
+
+Two consequences worth holding on to:
+
+**Granting access means writing both files.** A contractor outside the
+permitted country added only to the allowlist still gets a 403, and it looks
+exactly like the grant failing. `wasp-temp-access.sh` writes both, which is
+most of why it exists.
+
+**The exemption lists are deliberately different.** The country block exempts
+loopback, RFC1918 and `100.64.0.0/10` — CGNAT, where NetBird and Tailscale
+live — because none of those have a country in GeoLite2 and would otherwise
+be denied outright. That is permissive by design: it only satisfies the
+country layer. The allowlist layer is where breadth actually grants admin,
+and it should name specific addresses. `100.64.0.0/10` in the *allowlist*
+means every peer on the overlay reaches wp-admin, which is rarely intended.
 
 ---
 

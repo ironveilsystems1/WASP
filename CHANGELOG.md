@@ -81,6 +81,630 @@ CGNAT presented as "your subnet". Now the real network address is computed, and
 overlay, link-local and loopback are left out — a list you have to know to
 ignore is not a hint.
 
+### The one prompt that can cost you the login path printed no hints at all
+
+Asked from Arizona, over NetBird, at the live prompt: *"what should I input,
+there are no ip examples"*.
+
+Correct — the SSH CIDR question printed nothing, while the wp-admin CIDR
+question thirty lines later printed the full host interface list. Backwards:
+a wrong wp-admin answer is an annoyance, a wrong SSH answer is the login path.
+
+It is also the question whose answer is least guessable, because of a trap
+nothing in the installer named. An overlay peer reaching a host that is **not**
+itself a peer goes through a routed subnet advertised by one that is, and both
+common overlays NAT that traffic **by default** — NetBird's `Masquerade` toggle
+on a network route, Tailscale's `--snat-subnet-routes`. The VM then sees the
+*routing peer's* address, never the operator's `100.x`. So the two plausible
+answers are mutually exclusive and **each one locks you out if the other is
+true**:
+
+| what you allow | masquerade on | masquerade off |
+|---|---|---|
+| `100.64.0.0/10` only | locked out | works |
+| the host's LAN only | works | locked out |
+
+The prompt now prints the host's interfaces, lists the overlay address it
+deliberately excludes from VM-address hints — same data, opposite correct
+answer — detects whether an overlay-owned NAT rule exists, and where the VM
+address is already known **computes** the masqueraded source rather than
+describing it:
+
+```
+  ⚠ This host NATs overlay traffic (a masquerading NetBird/Tailscale route).
+  ⚠   A remote peer therefore reaches the VM as 10.20.1.254 — its own 100.x
+  ⚠   address is rewritten and never arrives. Allowing only the overlay
+  ⚠   range would lock you out. 10.20.1.254/32 is the precise answer.
+```
+
+When no NAT rule is found it says *not detected*, which is weaker than *off*,
+and says so.
+
+**The detector was wrong on its first cut**, found by testing it against a
+ruleset that plainly masqueraded and watching it report nothing. It piped
+overlay-named lines into a masquerade grep, but nft puts the chain name and the
+rule on different lines:
+
+```
+chain netbird-rt-nat { type nat hook postrouting priority srcnat;
+  ip saddr 100.64.0.0/10 ip daddr 10.20.101.0/24 counter masquerade
+```
+
+so no single line held both and the intersection was always empty. It now
+matches the block. Six behavioural tests cover it, including the two
+false-positive directions (a forward-only overlay, and an ordinary NAT'd
+Proxmox bridge), and the suite fails when the single-line grep is restored.
+
+### Squid asked a resolver the firewall never opened
+
+Two halves of one control, written from the same variable name, on opposite
+sides of the disk image:
+
+```sh
+# lib/03 — Proxmox host. Opens the firewall from Squid to these and nothing else.
+for _d in ${VM_DNS:-9.9.9.9 149.112.112.112}; do
+      ip saddr 10.89.10.2 ip daddr ${_d} udp dport 53 accept
+
+# payload/stages/09 — inside the VM. Writes squid.conf's resolvers.
+_sq_dns="${VM_DNS:-9.9.9.9 149.112.112.112}"
+```
+
+Identical expression, identical fallback — and `lib/06` injected
+`VM_STATIC_IP` but never `VM_DNS`. So the host had the value and the VM did
+not, the fallback fired on one side only, and the firewall permitted the
+operator's resolver while Squid asked Quad9.
+
+Every Squid lookup went into a drop:
+
+```
+TCP_TUNNEL/503 0 CONNECT api.wordpress.org:443 HIER_NONE/- -   (30010 ms)
+NONE_NONE_ABORTED/000                                          ( 3002 ms)
+```
+
+and WordPress reported *"An unexpected error occurred. Something may be wrong
+with WordPress.org or this server's configuration"* — which is precisely the
+symptom `squid.conf`'s own comment warns about, written after a previous
+resolver failure that was *"indistinguishable from a policy denial"*.
+
+**It only appears when the operator picks a resolver other than the default.**
+Choose Quad9 and both sides agree by accident. The melroseparkfire install
+chose the segment gateway — the better answer, and the one that exposed it.
+
+Nothing in the install reported a fault. The site served, Apache was healthy,
+CrowdSec was fine; only *outbound* calls failed, so it presented as a plugin
+install failing rather than as a broken control.
+
+`VM_DNS` is now injected, and the test is general rather than specific: every
+`${VM_*}` a payload stage or tool reads must be something `lib/06` put there.
+A payload reading a variable only the host sets is reading its own fallback,
+and this is the second time that shape has cost a day — the resolver leak
+above is the same lesson from the other direction.
+
+### A comma list reached Apache, and Apache does not take commas
+
+A regression introduced by this same release, which makes it the most
+instructive one here.
+
+`_ask_cidr` was taught to accept several ranges because the melroseparkfire
+operator typed two and was rejected. The prompt was fixed. The nftables
+consumers were converted with `_csv`. **The one consumer that needs the
+opposite convention was not touched:**
+
+```sh
+_allow+=$'\n'"            Require ip ${ADMIN_CIDR}"
+```
+
+Apache's `Require ip` takes a **space**-separated list. A comma is a syntax
+error, so `wp-security.conf` stopped parsing, Apache never started, and every
+request to the VM was refused — which NPMplus reported as a 502 on a VM that
+otherwise looked healthy.
+
+**It surfaced two stages and three screens away from its cause:**
+
+```
+=== GeoIP country filtering — building mod_maxminddb image layer ===
+  ⚠   GeoIP setup failed — full detail in /var/log/wp-geoip.log
+```
+
+```
+ip address '100.64.0.0/10,10.20.1.0/24,10.0.0.0/24' appears to be invalid:
+The specified network mask is invalid.
+```
+
+GeoIP rebuilds the Apache layer and runs a config test, so it was the first
+step to *validate* the file rather than merely write it. Nothing between the
+broken write and that test noticed.
+
+`_ssv()` has existed in `lib/00` the whole time, directly below `_csv()`, with
+`# ...and the reverse, for Apache's Require ip` in its own comment. Both sites
+now convert explicitly. Three tests: `_ssv` behaviour, a guard at each call
+site, and a negative check that **no** `Require ip ${VAR}` remains — the raw
+form is the bug and it reads as correct.
+
+**Two conventions side by side is the design that makes this easy to get
+wrong.** Keeping them is still right — nftables and Apache genuinely differ —
+but every new consumer of a list value is a chance to pick the wrong one, and
+only a test at the call site catches it.
+
+### The VM booted with the hypervisor's resolver, not the operator's
+
+The most expensive of the set, and latent since the static-addressing option
+was added. Two faults compounding:
+
+**`lib/04` copies the Proxmox host's `/etc/resolv.conf` into the image** so
+`apk` can resolve inside the chroot. Correct, and nothing replaced it
+afterwards.
+
+**`lib/05` wrote the operator's choice as `dns-nameservers` in
+`/etc/network/interfaces`** — which is a Debian `resolvconf` extension.
+**Alpine's busybox ifupdown parses that line and discards it.** No error, no
+warning, `/etc/resolv.conf` never touched. The answer went into a file nothing
+on the system reads.
+
+So the VM resolved with whatever the hypervisor happened to be using, while the
+installer printed the operator's choice twice:
+
+```
+✔  DNS: 10.20.101.1
+✔  Static IP: 10.20.101.10/24 ... DNS: 10.20.101.1
+```
+
+On melroseparkfire the host runs NetBird, which owns that file and points it at
+`100.87.54.172`. The VM has no route to `100.64.0.0/10`, and the site's own
+firewall blocks `SITE_NETS → PRIVATE_NETS` — which that alias includes. Every
+lookup timed out:
+
+```
+FATAL: apk failed — networking up?
+```
+
+Fifteen minutes into an unattended build, with a one-line log, on a VM whose
+address, route and gateway were all provably correct.
+
+**Latent across 96 deployments.** Before NetBird took that file over, the
+host's resolver was a routable LAN address, so the leak was invisible and
+harmless — the VM resolved fine, just not through the resolver anyone chose. A
+host running systemd-resolved (`127.0.0.53`) would have exposed it the same
+way.
+
+`/etc/resolv.conf` is now written directly, in both addressing modes, and the
+leaked copy is replaced rather than left. An unreachable resolver is refused
+before the VM ships:
+
+```
+⚠ Refusing to ship this VM with an unreachable resolver: 100.87.54.172
+⚠   Loopback and CGNAT/overlay addresses belong to the host that
+⚠   generated them, not to this VM. It would boot, look healthy,
+⚠   and fail at the first apk fetch with no mention of DNS.
+```
+
+Six behavioural tests, driven against a mounted image seeded with the exact
+NetBird file: the choice lands, the leak is gone, CGNAT and loopback are both
+refused, DHCP clears the host copy too, and a second resolver is not dropped.
+All five relevant cases fail when the write is removed.
+
+**Existing VMs built before this are worth checking.** They are not
+necessarily broken — but their resolver is the hypervisor's, not the one
+recorded at install time:
+
+```sh
+qm guest exec <vmid> -- cat /etc/resolv.conf
+```
+
+### An explicit "yes" could be discarded by the next answer, silently
+
+From the melroseparkfire install, and the worst of the three because the
+installer printed a confirmation that then became false.
+
+The operator was asked whether to add the CGNAT overlay range, answered **y**,
+and was told:
+
+```
+✔    Overlay range included — your remote source address is covered.
+```
+
+The next prompt offered a default assembled from everything answered so far —
+`10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10` — and they typed two
+on-site addresses. That answer **replaces** the default rather than adding to
+it, so the overlay range, the SSH source and the public admin IP all went in
+one keystroke, with the confirmation line still on screen above it.
+
+Replacing is the right behaviour for an editable default. Doing it silently is
+not, because this default is not a suggestion — it is the set of answers
+already given, one of them an explicit yes to a separate question.
+
+Under `upstream` enforcement the cost is not theoretical: a ban this VM
+proposes is applied by the bouncer to every site behind the shared LAPI, and
+the entries that vanished are precisely the remote-administration paths. The
+prompt now names what went and offers it back:
+
+```
+  ⚠ Your answer replaced the default rather than adding to it.
+  ⚠   These were offered and are now NOT whitelisted:
+  ⚠     10.20.10.10
+  ⚠     98.206.9.121
+  ⚠     10.20.1.254/32
+  ⚠     100.64.0.0/10   ← you answered YES to this one prompt ago
+  ⚠   You chose upstream enforcement, so a ban proposed here is applied
+  ⚠   by the bouncer to every site behind that LAPI — including from
+  ⚠   whichever of these addresses you administer through.
+    Add them back alongside what you typed? [Y/n] :
+```
+
+The existing proxy-specific check stays — its failure mode is every site at
+once, which earns its own wording.
+
+Five behavioural tests, driven with that install's exact answers. Two of them
+guard the directions that make a warning worthless: declining must leave a
+deliberately narrow answer untouched, and an unchanged default must raise
+nothing at all.
+
+**The first cut of those tests failed against working code.** They piped the
+answer into the block — `printf '%s\n' "$2" | . "$_w0"` — and the right-hand
+side of a pipe runs in its own subshell, so the block's assignment to
+`CROWDSEC_WHITELIST` was discarded and every case read as "dropped silently".
+A herestring fixes it. Worth recording because the false result pointed at the
+code rather than the harness.
+
+### The reverse-proxy question is now asked before the rules it governs
+
+Same defect, different shape, found while fixing the one above: the installer
+held what the operator needed and asked anyway.
+
+The proxy address was asked **34 lines after** both address restrictions it
+determines. Behind a proxy, `mod_remoteip` substitutes the real client address,
+so the Layer 2 `Require ip` rules match the **client** and not the proxy — and
+that sentence appeared on screen only once both answers had already been given.
+
+Asked first now, which lets both later prompts be concrete instead of
+conditional. The Layer 1 web question recommends the address itself:
+
+```
+  ➜ You named a proxy, so 10.20.10.10 is the answer here: the VM then
+  ➜   answers 80/443 for the proxy alone and nothing can reach WordPress
+  ➜   by addressing this VM directly.
+```
+
+and the wp-admin question names the obvious wrong answer before it is typed,
+along with the failure it produces:
+
+```
+  ⚠ With the proxy at 10.20.10.10, Apache matches this against the REAL
+  ⚠   client address out of X-Forwarded-For — not against the proxy.
+  ⚠   So answer with where you browse FROM. Entering 10.20.10.10 here
+  ⚠   would admit every visitor the proxy forwards, which is everyone.
+  ➜   If the proxy does not send X-Forwarded-For, every request looks
+  ➜   like it came from 10.20.10.10 and wp-admin returns 403 to you too.
+  ➜   Confirm after first boot:  wp-hardening.sh proxy-check
+```
+
+The wp-admin prompt also lists the overlay address, for the same reason the SSH
+prompt does: it is excluded from VM-address hints because nothing should be
+assigned on an overlay interface, but this question asks where you browse from,
+and for a remote operator that *is* the overlay.
+
+The ordering is asserted structurally rather than left to review — the suite
+compares the line numbers of the three prompts and fails if the proxy question
+moves back below them. 98 fail-closed tests.
+
+### The deferred MFA installer reported a clear it had not performed
+
+Found while answering "how do I get MFA active on 500". Stage 10 defers the
+Two Factor plugin install — it cannot run before the WordPress setup wizard
+finishes — and records a production blocker saying so. `wasp-mfa-deferred.sh`
+then installs the plugin on the first run after setup completes and removes
+that blocker.
+
+It removed nothing. The blocker stage 10 writes reads:
+
+```
+MFA was requested but the Two Factor plugin cannot be installed until
+WordPress setup is completed
+```
+
+and the clear filtered on `Two Factor plugin is not active` — which is
+`validate-wordpress.sh`'s failure text for a different condition entirely.
+The two were never the same string.
+
+What makes this worse than a no-op is the shape of the failure. `grep -v`
+with no match emits the whole file, `[ -s ]` on that is true, and the file
+is moved back over itself unchanged — down the branch that logs:
+
+```
+MFA blocker cleared; other blockers remain
+```
+
+So the plugin installs, MFA works, the log says the blocker is gone, and the
+VM refuses to certify forever over a condition that was resolved minutes
+after boot. A false all-clear costs more than a missing one: it sends the
+operator looking at the wrong half of the system.
+
+The clear now checks the blocker is present before claiming to have removed
+it, and says plainly when it is not. The pattern lives in one variable that
+the suite compares against stage 10's literal, so the two cannot drift apart
+again without a test failing.
+
+### `install-file`'s "did you mean" hint could never fire
+
+The hint exists because a case-mismatched transfer (`Divi.zip` sent,
+`divi.zip` asked for) reports "No such file" from both the transfer and the
+install, which reads as a failed transfer rather than a wrong name.
+
+Two faults in one block meant it never once reached an operator:
+
+- it sat **below** the existence check, which returns first — so it ran only
+  when the file *did* exist, which is exactly when there is nothing to hint at
+- it read `$_f`, a stale global left behind by the Wordfence feed cache
+  function fifty lines up, so the directory it listed was the vulnerability
+  cache rather than the operator's inbox
+
+Neither is visible from outside: the symptom is a hint that simply never
+appears, which looks identical to not having written one. The block now lives
+inside the failing branch and reads the path the operator supplied. Both
+faults are asserted separately — one for the variable, one for reachability.
+
+### The MFA verification command could not verify MFA
+
+Stage 10's blocker closed with an instruction, repeated as menu item 14
+("MFA / Two Factor status"):
+
+```
+Verify with: wp-plugins.sh status
+```
+
+`show_status` lists plugins with updates **available** and plugins that are
+**inactive**. A successfully installed, activated, up-to-date Two Factor is
+in neither list. So the documented way to confirm MFA printed nothing
+whether MFA was working perfectly or absent entirely — and nothing is also
+what a broken install prints.
+
+A subcommand that does not exist fails loudly and gets found in a day. One
+that exists and cannot answer the question asked is the silent kind: the
+operator reads the empty output as the answer. This is the third fault in
+the same feature, alongside the blocker that never cleared and the log line
+that said it had.
+
+There is now a `wp-plugins.sh mfa` subcommand that reports what was actually
+being asked — whether the enforcement mu-plugin is installed, whether
+enforcement is on, and whether the Two Factor plugin is active — and names
+the lockout risk explicitly when enforcement is on without an active plugin.
+The blocker text and menu item 14 both point at it.
+
+Two assertions guard this. One compares every `wp-plugins.sh <sub>` the
+payload *recommends to an operator* against the dispatch table, so a
+recommendation can no longer name a command that does not exist. The other
+pins the MFA route specifically, since `status` exists and would pass the
+first check while still being the wrong answer.
+
+### `update.sh` status printed a blank where the bouncer state belongs
+
+```
+  Firewall : 2 nft tables
+  Bouncer  :
+```
+
+`rc-service cs-firewall-bouncer status` emits nothing when the service does
+not exist, and the line printed that nothing. In agent-only mode — the VM
+reports to a LAPI on another host and the bouncer runs there, in front of
+that host's own proxy — no local bouncer is the *correct* state. The report
+made the correct state indistinguishable from a broken one, and cost a
+diagnostic round trip on a VM that was working.
+
+It now names the mode: a local service's status if there is one, "agent-only,
+reporting to a remote LAPI" when the credentials point off-box, and "not
+installed" otherwise. The remote test reads the URL out of
+`local_api_credentials.yaml` and checks it is not loopback — written with
+`sed` and a plain ERE rather than the negative lookahead it wants, because
+busybox grep has no PCRE and the lookahead version would have failed open
+on every VM.
+
+### A prompt with no stdin reported itself as a declined answer
+
+```
+root@tispve:~# qm guest exec 500 -- update.sh crowdsec v1.8.1
+  Update CrowdSec to v1.8.1? [y/N]:    Skipped.
+```
+
+`ask_yn` was `read ans` with no EOF handling. `qm guest exec` gives the
+process no stdin, so `read` returned immediately with an empty answer and
+the caller printed `Skipped.` — character for character what it prints when
+the operator types `n`.
+
+So the update did not happen, and it was reported as a choice the operator
+had made. They had no way to see that the question was never answerable.
+
+The prompt now says so, and says explicitly that nothing was skipped by
+choice. It still returns false, because no stdin must never mean yes.
+
+Deliberately **not** given a `--yes` flag. One of these gates asks whether
+to proceed *without a completed CVE scan*; an unattended mode that can
+answer that one is a worse failure than having no unattended mode. A test
+asserts no such flag appears, alongside one that runs `ask_yn` with stdin
+closed and fails if it ever returns true.
+
+### The wp-admin IP allowlist had never been enforced on a GeoIP install
+
+**The only defect in this series with live exposure rather than bad
+reporting.** Found on a client VM, 2026-10-18, by an operator who noticed
+the admin slug was reachable from US cell service but blocked from a VPN in
+another country, and correctly read that as "GeoIP is working, the IP
+restriction is not."
+
+`geoip.conf` wraps its country test in `<Location />`:
+
+```apache
+<Location />
+    <RequireAny>
+        Require ip 10.0.0.0/8
+        ...
+        <RequireAll>
+            Require env MM_COUNTRY_CODE
+            Require env AllowCountry
+        </RequireAll>
+    </RequireAny>
+</Location>
+```
+
+Apache applies sections in a fixed order — `<Directory>`, `<DirectoryMatch>`,
+`<Files>`, then `<Location>` — and `mod_authz_core`'s `AuthMerging` defaults
+to `Off`, meaning a later section's authorization logic **replaces** an
+earlier one's rather than combining with it.
+
+`wp-security.conf` restricts admin with `<DirectoryMatch "...wp-admin">` and
+`<Files "wp-login.php">`. Both are applied *before* this `<Location />`,
+which matches every URL on the site. So the GeoIP block replaced them
+outright. The only surviving control on wp-admin was the country test —
+plus `Require ip 10.0.0.0/8`, which grants access to anything presenting an
+RFC1918 address with no country check at all.
+
+Two features, each correct alone, silently cancelling one of them out.
+
+What makes this the dangerous shape rather than merely a bug: testing it
+from abroad returns 403, which reads as the restriction working. It never
+consulted the allowlist. The generated config, the installer's prompts and
+the comments inside `wp-security.conf` all describe a control that was not
+running.
+
+`AuthMerging And` in the generated block requires both to pass, which is
+what the config always claimed. Verified on the affected VM: an allowed
+request became the expected 403.
+
+Guarded structurally — any generated `<Location>`/`<LocationMatch>` carrying
+`Require` directives must declare `AuthMerging And`, so the next site-wide
+rule cannot reintroduce this.
+
+### install-file reported activations that had not happened
+
+Two installs in a row printed `✔ Activated (verified)`. Both were inactive.
+Three faults stacked so the message could not come out false:
+
+- the slug came from the **zip file name** — `elementorpro432.zip` yielded
+  `elementorpro432`, where the real slug is `elementor-pro`; a plugin's
+  directory name has no reliable relationship to its file name
+- `|| true` discarded the resulting error
+- the check asked whether *anything* was active, not whether *this* was —
+  always true for a theme, and true here for plugins because another plugin
+  already was
+
+The slug now comes from diffing wp-cli's own list across the install, with
+the zip's top-level directory as fallback for a re-install; the error is
+kept and printed; and the verification names the slug it checked.
+
+### install-file could not read its own input
+
+The wp-cli container runs `--user 33:33`. A zip fetched with curl or scp is
+commonly mode 600 root, so the mount succeeded and uid 33 could not read it:
+
+```
+PCLZIP_ERR_READ_OPEN_FAIL (-2) : Unable to read archive
+```
+
+which names neither permissions nor the container user, and sends the
+operator back to inspect a download that was fine. The staged file is now
+made readable, and when it cannot be, the message says why.
+
+### The malware scanner reported zero findings while printing 48
+
+```
+[SUSPECT]  php_in_nonphp_extension: /…/wp-config.php
+…48 lines…
+  critical 0   high 0   suspicious 0   info 0
+```
+
+Two independent faults.
+
+The findings loop was the right-hand side of a pipe, so `_crit`/`_high`/
+`_susp` ran in a **subshell** and every counter increment was discarded when
+the pipe closed. A genuine detection would have summarised as zero too — and
+the summary is the line an operator reads.
+
+And `wpvm_php_in_nonphp_extension` matches `<?php`. Its own meta says
+"Scanned only against uploads and media paths", but it was run against the
+whole tree, so it flagged every legitimate PHP file on the site including
+`wp-config.php` and WASP's own mu-plugins. A scanner whose output is
+entirely false positives trains the operator to ignore it, which is worse
+than no scanner.
+
+The loop now reads from a file, keeping counters in scope. Uploads-scoped
+rules live in `wp-malware-uploads.yar` and are run only against
+`wp-content/uploads` and `cache` — scope enforced by which paths are
+scanned, not by a comment in a meta block. A test asserts stage 10 actually
+installs that ruleset, since one the installer never copies is one that
+silently never runs.
+
+### A 256 MB /tmp silently blocked every security update
+
+Found on a client VM, 2026-10-18:
+
+```
+FATAL  failed to download vulnerability DB: ... write
+/tmp/getter1810505020/archive: no space left on device
+✗  DEPLOYMENT_PROFILE=production requires a COMPLETED scan. Refusing to
+   update on an unknown security state.
+```
+
+`--cache-dir` governs where Trivy **keeps** its vulnerability database.
+It does not govern where Trivy **stages the download**, which goes through
+`TMPDIR`. On Alpine `/tmp` is a tmpfs sized from RAM — 256 MB on this VM,
+against 14.1 GB free on the real disk. The database is several hundred MB,
+so it could never fit and never would.
+
+The misdirection is the expensive part. The failure announces itself as a
+*vulnerability database* error, so it reads as Trivy being broken or the
+proxy blocking the download. `df` on `/` shows ample space. Nothing in the
+message mentions `/tmp`, and nothing suggests disk at all.
+
+And because the production profile correctly refuses to update on an
+incomplete scan, the consequence was that **no security update could be
+applied to the VM** — CrowdSec, WordPress, MariaDB, all blocked, by a tmpfs.
+
+Trivy now stages through the cache directory, which is on real disk by
+definition since the database has to live there anyway. The relocation is
+skipped unless the directory is genuinely writable — pointing `TMPDIR` at a
+path that cannot be created would break `mktemp` for the whole script, which
+is a worse failure than the one being fixed. If relocation fails and `/tmp`
+is under 1 GB, it says so in those terms before the scan runs, rather than
+leaving an accurate-but-misleading symptom to be decoded.
+
+Worth recording what went *right*: the production gate refused to treat
+"the scanner did not run" as "the scanner found nothing". That distinction
+is the whole point of the fail-closed design, and it held.
+
+### The CrowdSec upgrade rolled back on a container that was merely starting
+
+```
+ → Stopping CrowdSec cleanly before replacement.
+✗  LAPI not responding — rolling back.
+```
+
+The post-replacement health check waited `6 × 5s` — thirty seconds. A
+version jump (v1.7.8 → v1.8.1) migrates config and the local database on
+first start, and the entrypoint reconciles its COLLECTIONS list before the
+API answers. On a modest VM that is comfortably past thirty seconds, so the
+update rolled back every time on a container that was doing exactly what it
+should.
+
+The rollback itself worked correctly — the previous container was restored
+and intrusion protection stayed up. But it then **destroyed the new
+container**, which held the only evidence of why the upgrade failed. The
+operator was left with one line, nothing to investigate, and a next attempt
+that would fail identically because nothing had been learned.
+
+The wait is now three minutes, it says what it is waiting for rather than
+sitting mute, and it gives up early if the container has actually exited
+rather than waiting out the full timeout on something already dead.
+
+On failure the container's logs, `cscli lapi status` and the exit code are
+appended to `/var/log/wasp-crowdsec-upgrade-failed.log` and the last twelve
+lines printed, *before* the rollback removes the container.
+
+The guard asserts the wait VALUE rather than the loop text — the count lives
+in a variable now, and a test grepping for `seq 1 6` would sail straight past
+someone lowering it back. The first version of that test did exactly that,
+and only the negative test caught it.
+
+149 fail-closed tests.
+
 ---
 
 ## Unreleased — release signing, scripted

@@ -902,7 +902,74 @@ echo -e "  ${YW}  from, not to the whole LAN because that is easier.${CL}"
 echo -e "  ${YW}  Leaving it blank is defensible only if something in front of this VM${CL}"
 echo -e "  ${YW}  is already doing the same job.${CL}"
 _sec_note
+# ── What to answer with ──────────────────────────────────────────────────────
+# This prompt used to print nothing at all, while the wp-admin CIDR question
+# below printed the full interface list. Backwards: this is the one whose wrong
+# answer costs the login path. See _admin_source_hints notes in lib/00.
+echo -e "  ${YW}The source address the VM will see, from this host's interfaces:${CL}"
+_host_subnet_hints 5
+_OVL=$(_overlay_addrs)
+if [ -n "$_OVL" ]; then
+  printf '%s\n' "$_OVL"
+  echo ""
+  if _overlay_masquerades; then
+    _SRC=$(_route_src_to "${VM_STATIC_IP:-}")
+    msg_warn "This host NATs overlay traffic (a masquerading NetBird/Tailscale route)."
+    if [ -n "$_SRC" ]; then
+      msg_warn "  A remote peer therefore reaches the VM as ${_SRC} — its own 100.x"
+      msg_warn "  address is rewritten and never arrives. Allowing only the overlay"
+      msg_warn "  range would lock you out. ${_SRC}/32 is the precise answer."
+    else
+      msg_warn "  A remote peer therefore reaches the VM as one of this host's own"
+      msg_warn "  addresses above, not as its 100.x address. Allowing only the"
+      msg_warn "  overlay range would lock you out."
+    fi
+  else
+    msg_info "An overlay is present; no masquerading route rule was detected, so a"
+    msg_info "  remote peer should arrive as its own 100.x address. Not detected is"
+    msg_info "  weaker than off — list both that range and the address above if you"
+    msg_info "  have not confirmed it."
+  fi
+  echo ""
+fi
+unset _OVL _SRC
 SSH_CIDR=$(_ask_cidr "  Restrict SSH (22) to a CIDR?           (blank = any)  : ")
+
+# ── Asked HERE, not after the wp-admin questions ─────────────────────────────
+# It used to be asked 34 lines later, which meant the operator answered BOTH
+# address questions before being told the one fact that decides what the right
+# answer is: behind a proxy, mod_remoteip substitutes the real client address,
+# so the Layer 2 rules match the CLIENT and not the proxy. The explanation
+# arrived after the questions it governed.
+#
+# Same defect as the missing SSH hints above, in a different shape: the
+# installer held what the operator needed and asked anyway.
+echo ""
+echo -e "  ${BLD}Reverse proxy (asked first — both answers below depend on it):${CL}"
+echo -e "  ${YW}If WordPress sits behind NPMplus / nginx / Caddy, Apache sees the${CL}"
+echo -e "  ${YW}proxy's address on every request instead of the visitor's. Naming the${CL}"
+echo -e "  ${YW}proxy here loads mod_remoteip and trusts its X-Forwarded-For header,${CL}"
+echo -e "  ${YW}which is what makes the wp-admin IP rules below mean anything at all.${CL}"
+echo -e "  ${YW}Blank = this VM is reached directly.${CL}"
+# The old "Layer 2b — mod_remoteip" header lived here and said the same thing
+# as the preface above. It was also numbered for the position this question
+# used to hold, after Layer 2; it is asked before Layer 1 now.
+# Presettable from the environment. Added for multi-tenant rollouts: ten sites
+# behind the same proxy means answering the same three questions ten times, and
+# the tenth answer is the one that gets mistyped. A preset also means the value
+# is reviewable in a runbook rather than living only in someone's terminal
+# history.
+#
+# WASP_PROXY_IP rather than PROXY_IP: a bare, common name in the environment of
+# a root shell on a Proxmox host is too easy to inherit by accident from an
+# unrelated export, and inheriting this one silently widens what Apache trusts.
+# install.sh validates it before anything is built — see its contract preflight.
+if [[ -n "${WASP_PROXY_IP:-}" ]]; then
+  PROXY_IP="$WASP_PROXY_IP"
+  msg_ok "Reverse proxy IP from WASP_PROXY_IP: ${PROXY_IP}"
+else
+  PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
+fi
 _sec_head
 echo -e "  ${YW}  Almost every site should leave this BLANK. A public website that${CL}"
 echo -e "  ${YW}  only answers a single network is not a public website — visitors,${CL}"
@@ -918,6 +985,13 @@ echo -e "  ${YW}  is what protects the login page while leaving the site public.
 echo -e "  ${YW}  Leaving it blank is not 'no protection': CrowdSec, the 8G firewall,${CL}"
 echo -e "  ${YW}  the wp-admin IP rules and the login rate limiter all still apply.${CL}"
 _sec_note
+# Now that the proxy is known, the recommendation can be the address itself
+# rather than a description of one.
+if [[ -n "$PROXY_IP" ]]; then
+  msg_info "You named a proxy, so ${PROXY_IP} is the answer here: the VM then"
+  msg_info "  answers 80/443 for the proxy alone and nothing can reach WordPress"
+  msg_info "  by addressing this VM directly."
+fi
 WEB_CIDR=$(_ask_cidr "  Restrict Web (80/443) to a CIDR?       (blank = any)  : ")
 [[ -z "$WEB_CIDR" ]] && msg_warn "Web ports open to any IP — Layer 2 (Apache) still enforces wp-admin"
 echo ""
@@ -927,6 +1001,24 @@ echo -e "  ${YW}Set to your local network CIDR (e.g. 192.168.1.0/24).${CL}"
 echo ""
 echo -e "  ${YW}Your workstation is likely on one of these subnets (from the Proxmox host):${CL}"
 _host_subnet_hints 5
+# The overlay belongs in THIS list too. It is excluded from the VM-address
+# hints because nothing should be assigned on an overlay interface — but the
+# question here is where the operator browses from, and for a remote one the
+# answer is the overlay. Same data, opposite correct answer.
+_overlay_addrs
+echo ""
+# Which address this rule is matched against is decided by the proxy answer,
+# which is now already given. Said plainly, because entering the proxy's own
+# address here is the obvious wrong answer and it fails in the quiet direction.
+if [[ -n "$PROXY_IP" ]]; then
+  msg_warn "With the proxy at ${PROXY_IP}, Apache matches this against the REAL"
+  msg_warn "  client address out of X-Forwarded-For — not against the proxy."
+  msg_warn "  So answer with where you browse FROM. Entering ${PROXY_IP} here"
+  msg_warn "  would admit every visitor the proxy forwards, which is everyone."
+  msg_info "  If the proxy does not send X-Forwarded-For, every request looks"
+  msg_info "  like it came from ${PROXY_IP} and wp-admin returns 403 to you too."
+  msg_info "  Confirm after first boot:  wp-hardening.sh proxy-check"
+fi
 echo ""
 ADMIN_CIDR=$(_ask_cidr "  Local network CIDR for wp-admin?  e.g. 192.168.100.0/24 (blank = open) : ")
 echo ""
@@ -944,27 +1036,6 @@ echo -e "  ${YW}  thinking about — you can add more later with:${CL}"
 echo -e "  ${YW}    wp-hardening.sh admin-rule${CL}"
 ALLOWED_ADMIN_IP=$(_ask_ip_list "  Additional IP(s) for wp-admin (blank = none) : ")
 echo ""
-echo -e "  ${BLD}Layer 2b — mod_remoteip (only needed if behind a reverse proxy):${CL}"
-echo -e "  ${YW}If WordPress is behind NPM / nginx / Caddy, Apache sees the proxy IP${CL}"
-echo -e "  ${YW}not the real client IP. Enter the proxy's internal IP so Apache trusts${CL}"
-echo -e "  ${YW}its X-Forwarded-For header for accurate wp-admin IP checks.${CL}"
-# Presettable from the environment. Added for multi-tenant rollouts: ten sites
-# behind the same proxy means answering the same three questions ten times, and
-# the tenth answer is the one that gets mistyped. A preset also means the value
-# is reviewable in a runbook rather than living only in someone's terminal
-# history.
-#
-# WASP_PROXY_IP rather than PROXY_IP: a bare, common name in the environment of
-# a root shell on a Proxmox host is too easy to inherit by accident from an
-# unrelated export, and inheriting this one silently widens what Apache trusts.
-# install.sh validates it before anything is built — see its contract preflight.
-if [[ -n "${WASP_PROXY_IP:-}" ]]; then
-  PROXY_IP="$WASP_PROXY_IP"
-  msg_ok "Reverse proxy IP from WASP_PROXY_IP: ${PROXY_IP}"
-else
-  PROXY_IP=$(_ask_single_ip "  Reverse proxy IP (e.g. 192.168.1.50, blank = direct access) : ")
-fi
-
 # Flag the combination that turns a mod_remoteip failure into "allow everyone".
 # A proxy on the LAN is normally inside the operator's own admin CIDR, and when
 # that is true the wp-admin restriction cannot fail safely on its own -- if the
@@ -1413,6 +1484,9 @@ if [[ -n "$_CS_DEFAULT" ]]; then
   read -rp "  Add the CGNAT overlay range 100.64.0.0/10 as well? [y/N] : " _CSO
   case "${_CSO:-n}" in
     y|Y) _CS_DEFAULT="${_CS_DEFAULT},100.64.0.0/10"
+         # Recorded, because this is an explicit yes and the next prompt can
+         # silently discard it. See the dropped-entry check below.
+         _CS_OVERLAY_OPTIN=1
          msg_ok "  Overlay range included — your remote source address is covered." ;;
     *)   msg_info "  Not included. If you administer this over an overlay, add your"
          msg_info "  own address below, or later with crowdsec-whitelist add." ;;
@@ -1467,7 +1541,66 @@ while [[ -z "$CROWDSEC_WHITELIST" ]]; do
   msg_ok "CrowdSec will never ban: ${CROWDSEC_WHITELIST}"
   break
 done
-unset _CSW _CS_DEFAULT _bad _clean _e _oldIFS
+unset _CSW _bad _clean _e _oldIFS
+
+# ── Entries the typed answer dropped ─────────────────────────────────────────
+# This prompt REPLACES the default; it does not add to it. That is the right
+# behaviour for an editable default and the wrong behaviour to leave silent,
+# because the default is assembled from answers already given — the proxy, the
+# admin addresses, the SSH source — and one of them was an explicit yes to a
+# separate question two prompts earlier.
+#
+# From the melroseparkfire install: the operator answered y to the CGNAT
+# question, saw "Overlay range included — your remote source address is
+# covered", then typed two addresses here and lost 100.64.0.0/10, the SSH
+# source and the public admin IP in one keystroke. The confirmation line stayed
+# on screen, now false, and under upstream enforcement those entries are
+# exactly the remote-administration paths a shared LAPI would blackhole.
+#
+# So: name what went, and offer to put it back. The proxy keeps its own check
+# below because its failure mode is different — every site at once.
+if [[ -n "${_CS_DEFAULT:-}" && -n "$CROWDSEC_WHITELIST" ]]; then
+  _CS_DROPPED=""
+  _oldIFS="$IFS"; IFS=','
+  for _e in $_CS_DEFAULT; do
+    IFS="$_oldIFS"
+    [[ -z "$_e" ]] && { IFS=','; continue; }
+    printf '%s' ",${CROWDSEC_WHITELIST}," | grep -qF ",${_e}," \
+      || _CS_DROPPED="${_CS_DROPPED:+$_CS_DROPPED,}$_e"
+    IFS=','
+  done
+  IFS="$_oldIFS"
+  if [[ -n "$_CS_DROPPED" ]]; then
+    echo ""
+    msg_warn "Your answer replaced the default rather than adding to it."
+    msg_warn "  These were offered and are now NOT whitelisted:"
+    _oldIFS="$IFS"; IFS=','
+    for _e in $_CS_DROPPED; do
+      IFS="$_oldIFS"
+      if [[ "$_e" == "100.64.0.0/10" && -n "${_CS_OVERLAY_OPTIN:-}" ]]; then
+        msg_warn "    ${_e}   ← you answered YES to this one prompt ago"
+      else
+        msg_warn "    ${_e}"
+      fi
+      IFS=','
+    done
+    IFS="$_oldIFS"
+    [[ "$CS_ENFORCEMENT" == "upstream" ]] && {
+      msg_warn "  You chose upstream enforcement, so a ban proposed here is applied"
+      msg_warn "  by the bouncer to every site behind that LAPI — including from"
+      msg_warn "  whichever of these addresses you administer through."
+    }
+    read -rp "  Add them back alongside what you typed? [Y/n] : " _CSK
+    case "${_CSK:-y}" in
+      n|N) msg_ok "Left out, deliberately." ;;
+      *)   CROWDSEC_WHITELIST=$(_csv "${_CS_DROPPED},${CROWDSEC_WHITELIST}")
+           msg_ok "CrowdSec will never ban: ${CROWDSEC_WHITELIST}" ;;
+    esac
+    unset _CSK
+  fi
+  unset _CS_DROPPED
+fi
+unset _CS_DEFAULT _CS_OVERLAY_OPTIN _e _oldIFS
 
 # The one omission worth a second look. Offered as the default above, so
 # leaving it out took a deliberate edit — which is sometimes right, and is

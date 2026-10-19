@@ -217,6 +217,37 @@ Then enter the vendor API key in wp-admin. Without it the theme is frozen at
 the version you installed — which for a page builder means no security fixes,
 and that is the client's problem to be told about, not one to discover later.
 
+**When an outside web developer needs access**, use `wasp-temp-access.sh`
+rather than editing the allowlist by hand. "Let them in for a couple of days"
+is a routine request with a routinely permanent outcome: the IP goes in, the
+work finishes, and the entry stays — because removing it is a separate task
+nobody is assigned and nobody is reminded of. Allowlists accrete, and every
+stale entry is a route into wp-admin that no longer has an owner.
+
+```sh
+doas wasp-temp-access.sh grant webdev 2 139.135.49.52 124.29.239.165
+doas wasp-temp-access.sh list            # what is open, and when it closes
+doas wasp-temp-access.sh revoke webdev   # close it early
+```
+
+The grant and its revocation are created by the same command. The expiry is
+scheduled at the moment access opens and does not depend on anyone
+remembering.
+
+It writes **both** admin layers, which is the part that catches people out.
+Admin is gated by the IP allowlist in `wp-security.conf` *and* the country
+test in `geoip.conf`, and since those merge with `AuthMerging And` both must
+pass. A contractor outside the permitted country who is added only to the
+allowlist gets a 403 that looks exactly like the grant failing. It also
+refuses windows longer than 30 days and CIDRs wider than /16, verifies the
+public site still answers after reloading Apache, and rolls the grant back
+if it does not.
+
+An IP exemption is not a login. They still need a WordPress account, and if
+MFA is enforced it applies to them — create the account with the least role
+that lets them do the work, and remove it when the engagement ends. The IP
+expiry closes the door; it does not delete the key.
+
 **Enable admin MFA as part of onboarding.** If the VM was provisioned with MFA
 enforcement, confirm the Two Factor plugin is active and walk the client's
 administrators through enrolling — an authenticator app plus **printed backup

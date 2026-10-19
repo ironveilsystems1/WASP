@@ -46,6 +46,24 @@ WP_ADMIN_SLUG=$(_vars_q "$WP_ADMIN_SLUG")
 CROWDSEC_ENROLL_KEY=$(_vars_q "$CROWDSEC_ENROLL_KEY")
 NET_MODE=$(_vars_q "$NET_MODE")
 VM_STATIC_IP=$(_vars_q "$VM_STATIC_IP")
+# VM_DNS is injected because TWO HALVES OF ONE CONTROL read it, on opposite
+# sides of the disk image:
+#
+#   lib/03, on the Proxmox host  — opens the firewall from Squid to exactly
+#                                  these resolvers and nothing else
+#   stage 09, inside the VM      — writes dns_nameservers into squid.conf
+#
+# Both spell the fallback the same way (${VM_DNS:-9.9.9.9 149.112.112.112}),
+# which is what hid this: on the host the variable is set, in the VM it was
+# not, so the firewall permitted the operator's resolver while Squid asked
+# Quad9. Every lookup was dropped. Squid reported HIER_NONE/503 after a 3s and
+# a 30s timeout, WordPress reported "something may be wrong with WordPress.org
+# or this server's configuration", and nothing anywhere said DNS.
+#
+# It only appears when the operator picks a resolver OTHER than the default —
+# choosing Quad9 makes both sides agree by accident. The melroseparkfire
+# install chose the segment gateway, which is the better answer.
+VM_DNS=$(_vars_q "${VM_DNS:-}")
 GEOIP_ENABLED=$(_vars_q "${GEOIP_ENABLED:-0}")
 GEOIP_MODE=$(_vars_q "${GEOIP_MODE:-}")
 GEOIP_WHITELIST=$(_vars_q "${GEOIP_WHITELIST:-}")

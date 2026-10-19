@@ -220,8 +220,67 @@ iface eth0 inet static
     gateway ${VM_GATEWAY}
     dns-nameservers ${_dns_arr[*]}
 IFACEEOF
+  # ── /etc/resolv.conf, written directly ─────────────────────────────────────
+  # `dns-nameservers` above is a Debian `resolvconf` extension. Alpine's
+  # busybox ifupdown PARSES IT AND DISCARDS IT -- no error, no warning, and
+  # /etc/resolv.conf is never touched. So on its own that line records the
+  # operator's answer in a file nothing on this system reads.
+  #
+  # What the VM actually used instead was the PROXMOX HOST's resolv.conf,
+  # copied into the image by lib/04 so apk can resolve inside the chroot and
+  # never replaced afterwards.
+  #
+  # From the melroseparkfire install: tispve runs NetBird, which owns
+  # /etc/resolv.conf there and points it at 100.87.54.172. That address leaked
+  # into the VM, which has no route to 100.64.0.0/10 -- and the site's own
+  # firewall blocks SITE_NETS -> PRIVATE_NETS, which includes the CGNAT range.
+  # Every lookup timed out, apk failed on the first mirror fetch, and the
+  # payload never ran. The installer had printed "DNS: 10.20.101.1" twice.
+  #
+  # Latent for 96 deployments: before NetBird took that file over, the host's
+  # resolver was a routable LAN address and the leak was invisible. A host
+  # running systemd-resolved (127.0.0.53) would have exposed it the same way.
+  #
+  # Written here rather than left to ifupdown because this is the only file
+  # that decides what the VM resolves with, and because lib/04 has already
+  # put something wrong in it.
+  {
+    printf '# Written by the WASP installer. Operator-selected resolvers.\n'
+    for _d in "${_dns_arr[@]}"; do
+      [[ -n "$_d" ]] && printf 'nameserver %s\n' "$_d"
+    done
+  } > "$MNT/etc/resolv.conf"
+  chmod 644 "$MNT/etc/resolv.conf"
+
+  # Fail closed on the leak rather than shipping a VM that cannot resolve.
+  # A resolver the VM cannot route to is indistinguishable, from inside, from
+  # a broken network -- and it surfaces as an apk failure fifteen minutes into
+  # an unattended install, which is the most expensive place to find it.
+  _rc_bad=""
+  while read -r _k _v; do
+    [[ "$_k" == "nameserver" ]] || continue
+    case "$_v" in
+      127.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|169.254.*)
+        _rc_bad="${_rc_bad:+$_rc_bad }$_v" ;;
+    esac
+  done < "$MNT/etc/resolv.conf"
+  if [[ -n "$_rc_bad" ]]; then
+    msg_warn "Refusing to ship this VM with an unreachable resolver: ${_rc_bad}"
+    msg_warn "  Loopback and CGNAT/overlay addresses belong to the host that"
+    msg_warn "  generated them, not to this VM. It would boot, look healthy,"
+    msg_warn "  and fail at the first apk fetch with no mention of DNS."
+    msg_error "Pick a resolver this VM can route to and re-run."
+  fi
+  unset _rc_bad _k _v _d
+  msg_ok "Resolver injected: ${_dns_arr[*]} (/etc/resolv.conf)"
   msg_ok "Static network config injected: ${VM_STATIC_IP}/${VM_PREFIX} via ${VM_GATEWAY}"
 else
+  # DHCP: udhcpc writes resolv.conf at boot. The host's leaked copy is still
+  # removed, so a lease failure presents as "no resolver" rather than silently
+  # resolving against an address that belongs to the hypervisor.
+  printf '# Replaced at boot by udhcpc. The installer cleared the host copy.\n' \
+    > "$MNT/etc/resolv.conf"
+  chmod 644 "$MNT/etc/resolv.conf"
   cat > "$MNT/etc/network/interfaces" << 'IFACEEOF'
 auto lo
 iface lo inet loopback
