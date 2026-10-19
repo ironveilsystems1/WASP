@@ -316,7 +316,35 @@ if [ -z "$CS_TAG" ] && [ -z "$CS_DIGEST" ] && [ -n "$RUNNING_CS_RAW" ]; then
 fi
 [ "$_BOOTSTRAPPED" = "1" ] && _save_pinned
 
-ask_yn() { printf "%s [y/N]: " "$1"; read ans; case "$ans" in [Yy]*) return 0;; *) return 1;; esac; }
+# BUG FIX: this was `read ans` with no EOF handling. Run anywhere without
+# stdin -- `qm guest exec`, cron, a pipe, a scheduled task -- `read` returns
+# immediately with an empty answer, and the caller prints "Skipped."
+#
+# That is indistinguishable from the operator having answered No. On a real
+# VM an operator ran `qm guest exec 500 -- update.sh crowdsec v1.8.1`, read
+# "Skipped.", and had no way to tell that the prompt was never answerable in
+# the first place. The update simply did not happen, reported as if it were
+# a choice they had made.
+#
+# Deliberately NOT given a --yes flag. One of these gates is "proceed WITHOUT
+# a completed CVE scan?", and a non-interactive mode that can answer that one
+# is a worse failure than not having a non-interactive mode at all.
+ask_yn() {
+  printf "%s [y/N]: " "$1"
+  if ! read ans; then
+    echo ""
+    echo "  ✗  No input available — this prompt cannot be answered here." >&2
+    echo "     Nothing was skipped by choice; there was no one to ask." >&2
+    echo "" >&2
+    echo "     update.sh is interactive by design: one of its gates asks" >&2
+    echo "     whether to proceed without a completed CVE scan, which must" >&2
+    echo "     stay a human decision. Run it from a terminal:" >&2
+    echo "       qm terminal <vmid>        (stay attached — detaching kills it)" >&2
+    echo "       or the Proxmox web console" >&2
+    return 1
+  fi
+  case "$ans" in [Yy]*) return 0;; *) return 1;; esac
+}
 
 # ── Container-state preflight — stop suppressing critical Podman errors ────
 # PRODUCTION SAFETY FIX (v7-6k): every "swap in a replacement container"
@@ -469,9 +497,52 @@ _resolve_digest() {
 # ── Trivy: container vulnerability scanner ────────────────────────────────
 TRIVY_CACHE_DIR="/var/cache/trivy"
 
+# BUG FIX (found on a live VM, 2026-10-18): --cache-dir governs where Trivy
+# KEEPS its vulnerability database. It does NOT govern where Trivy STAGES the
+# download, which goes through TMPDIR -- and on Alpine /tmp is a tmpfs sized
+# at a fraction of RAM. On the affected VM that was 256 MB against 14.1 GB
+# free on the real disk, so every DB download failed:
+#
+#   failed to download .../db.tar.gz: write /tmp/getter.../archive:
+#   no space left on device
+#
+# The failure then surfaces as a VULNERABILITY DATABASE error, which reads
+# as a Trivy or network problem. The operator checked connectivity and the
+# proxy; the disk was never implicated and `df` on / looks fine. Worse, the
+# production profile correctly refuses to update on an incomplete scan, so a
+# 256 MB tmpfs silently blocked every security update on the VM.
+#
+# Stage through the cache directory instead: it is on real disk by
+# definition, since that is where the database has to live anyway.
+# Only set it if the directory genuinely exists and is writable. Pointing
+# TMPDIR at a path that cannot be created would break mktemp for everything
+# else in this script -- trading a Trivy failure for a broader one.
+TRIVY_TMPDIR="${TRIVY_CACHE_DIR}/tmp"
+if mkdir -p "$TRIVY_TMPDIR" 2>/dev/null && [ -w "$TRIVY_TMPDIR" ]; then
+  export TMPDIR="$TRIVY_TMPDIR"
+else
+  TRIVY_TMPDIR=""
+fi
+
+# If /tmp really is too small and we could not relocate, say so BEFORE the
+# scan fails with a message about vulnerability databases. A named cause
+# beats an accurate-but-misleading symptom.
+_trivy_tmp_warn() {
+  [ -n "$TRIVY_TMPDIR" ] && return 0
+  _tmp_free=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$_tmp_free" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_tmp_free" -ge 1048576 ] && return 0
+  echo "  ⚠  /tmp has only $((_tmp_free / 1024)) MB free and ${TRIVY_CACHE_DIR}/tmp" >&2
+  echo "     could not be created. Trivy stages its database through TMPDIR," >&2
+  echo "     needs roughly 1 GB, and will fail with a 'vulnerability DB'" >&2
+  echo "     error that does not mention disk space. Free /tmp, or run:" >&2
+  echo "       TMPDIR=/var/cache/trivy/tmp update.sh <component>" >&2
+}
+
 setup_trivy() {
   if command -v trivy >/dev/null 2>&1; then
     mkdir -p "${TRIVY_CACHE_DIR}"
+    _trivy_tmp_warn
     return 0
   fi
   echo "  → Installing Trivy (vulnerability scanner)..."
@@ -1943,6 +2014,34 @@ do_cs_update() {
     return 1
   fi
 
+  # BUG FIX (found on a live VM, 2026-10-18): this run command hardcoded a
+  # LOCAL-LAPI topology. Stage 09 and `wp-hardening.sh cs-lapi` both create
+  # the container in AGENT-ONLY mode when the LAPI lives elsewhere:
+  #
+  #   -e DISABLE_LOCAL_API=true
+  #   -e LOCAL_API_URL="http://<lapi-host>:8080/"
+  #
+  # Neither was reproduced here, so the replacement came up as a full local
+  # API node, the entrypoint re-registered it against 127.0.0.1, and the
+  # health check below never saw the LAPI it was waiting for. On an
+  # agent-only install the update could not succeed at ANY timeout -- and it
+  # reported "LAPI not responding", which reads as the remote LAPI being
+  # down rather than as this container being built wrong.
+  #
+  # Inherit from the container actually running rather than assuming a
+  # topology. Anything else re-introduces this the next time the deployment
+  # shape changes.
+  CS_INHERIT_ENV=""
+  for _csv_name in DISABLE_LOCAL_API LOCAL_API_URL DISABLE_AGENT; do
+    _csv_val=$(podman inspect crowdsec-old --format \
+                 '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+               | sed -n "s/^${_csv_name}=//p" | head -1)
+    [ -n "$_csv_val" ] && CS_INHERIT_ENV="${CS_INHERIT_ENV} -e ${_csv_name}=${_csv_val}"
+  done
+  if [ -n "$CS_INHERIT_ENV" ]; then
+    echo "  → Carrying forward the existing CrowdSec topology:${CS_INHERIT_ENV}"
+  fi
+
   CS_OLD_RUNNING="$(podman inspect crowdsec-old --format '{{.State.Running}}' 2>/dev/null)"
   if [ "$CS_OLD_RUNNING" != "false" ]; then
     echo "✗  crowdsec-old is still running — refusing to start a second CrowdSec"
@@ -1956,15 +2055,37 @@ do_cs_update() {
     --tmpfs /tmp:size=32M,noexec,nosuid,nodev --tmpfs /var/run:size=16M,noexec,nosuid,nodev \
     --pids-limit 100 --memory=512m --label io.containers.autoupdate=image \
     -e COLLECTIONS="crowdsecurity/apache2 crowdsecurity/wordpress crowdsecurity/linux crowdsecurity/sshd crowdsecurity/http-cve crowdsecurity/appsec-wordpress" \
+    ${CS_INHERIT_ENV} \
     -v /opt/crowdsec/config:/etc/crowdsec:rw -v /opt/crowdsec/data:/var/lib/crowdsec/data:rw \
     -v /opt/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro \
     -v /home/wpuser/wp/logs:/var/log/wordpress:ro \
     -v /var/log/messages:/var/log/host/messages:ro \
     "${_UPD_PULL_REF}"; then
 
+    # BUG FIX (found on a live VM, 2026-10-18): this waited 6 × 5s = 30
+    # seconds. A version jump (v1.7.8 -> v1.8.1) migrates config and the
+    # local database on first start, and the entrypoint reconciles the
+    # COLLECTIONS list before the API answers -- comfortably past 30s on a
+    # modest VM. The update therefore rolled back every time on a container
+    # that was merely still starting, and the only output was "LAPI not
+    # responding", with the new container destroyed before anyone could ask
+    # it why.
+    #
+    # Three minutes, and say what is happening rather than sitting mute.
     LAPI_UP=0
-    for i in $(seq 1 6); do
-      podman exec crowdsec cscli lapi status >/dev/null 2>&1 && { LAPI_UP=1; break; }; sleep 5
+    _lapi_tries=36
+    echo "  → Waiting for CrowdSec to answer (migrations on a version change"
+    echo "    can take a couple of minutes; up to $((_lapi_tries * 5))s)…"
+    for i in $(seq 1 "$_lapi_tries"); do
+      podman exec crowdsec cscli lapi status >/dev/null 2>&1 && { LAPI_UP=1; break; }
+      # A container that has EXITED will never answer; stop waiting the full
+      # three minutes for something that is already dead.
+      if [ "$(podman inspect crowdsec --format '{{.State.Running}}' 2>/dev/null)" = "false" ]; then
+        echo "  ✗  The new CrowdSec container exited during startup." >&2
+        break
+      fi
+      [ $((i % 6)) -eq 0 ] && echo "    …still starting ($((i * 5))s)"
+      sleep 5
     done
     if [ "$LAPI_UP" = "1" ]; then
       rc-service cs-firewall-bouncer restart 2>/dev/null || true
@@ -1978,6 +2099,25 @@ do_cs_update() {
       _save_pinned
     else
       echo "✗  LAPI not responding — rolling back…"
+      # BUG FIX: the rollback destroyed the new container immediately, so the
+      # ONLY evidence of why the upgrade failed went with it. An operator was
+      # left with one line and nothing to investigate -- and the next attempt
+      # fails identically, because nothing was learned. Capture the logs and
+      # the LAPI error first; they cost nothing and they are the whole
+      # diagnosis.
+      _cs_fail_log=/var/log/wasp-crowdsec-upgrade-failed.log
+      {
+        printf '=== %s: %s -> %s failed to come up ===\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${CS_TAG}" "${target_ver}"
+        echo '--- podman logs crowdsec (tail 60) ---'
+        podman logs --tail 60 crowdsec 2>&1
+        echo '--- cscli lapi status ---'
+        podman exec crowdsec cscli lapi status 2>&1
+        echo '--- container state ---'
+        podman inspect crowdsec --format '{{.State.Status}} exit={{.State.ExitCode}}' 2>&1
+      } >> "$_cs_fail_log" 2>&1
+      echo "   Why it failed was saved to ${_cs_fail_log}:" >&2
+      podman logs --tail 12 crowdsec 2>&1 | sed 's/^/     /' >&2
       podman stop crowdsec 2>/dev/null; podman rm -f crowdsec 2>/dev/null
       # PRODUCTION SAFETY FIX (v7-6k): was `2>/dev/null` on the rename and
       # start, discarding the one result that matters most — this IS the
@@ -2015,7 +2155,23 @@ show_status() {
   podman ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null | sed 's/^/  /' || true
   echo ""
   echo "  Firewall : $(nft list tables 2>/dev/null | grep -c table) nft tables"
-  echo "  Bouncer  : $(rc-service cs-firewall-bouncer status 2>/dev/null | head -1)"
+  # BUG FIX: this printed an EMPTY value whenever the service did not exist,
+  # which is the normal state in agent-only mode (the bouncer lives on the
+  # remote LAPI host, in front of its own proxy). A blank where a status
+  # belongs reads as "broken and unreported" rather than "not applicable
+  # here", and it cost an operator a diagnostic round trip on a VM that was
+  # working correctly. Name the mode instead of printing nothing.
+  if rc-service cs-firewall-bouncer status >/dev/null 2>&1; then
+    echo "  Bouncer  : $(rc-service cs-firewall-bouncer status 2>/dev/null | head -1)"
+  elif _lapi_url=$(sed -n 's|^[[:space:]]*url:[[:space:]]*||p' \
+                     /etc/crowdsec/local_api_credentials.yaml 2>/dev/null | head -1) \
+       && [ -n "$_lapi_url" ] \
+       && ! printf '%s' "$_lapi_url" | grep -qE '://(127\.0\.0\.1|localhost|\[::1\])'; then
+    echo "  Bouncer  : not on this VM — agent-only, reporting to a remote LAPI"
+    echo "             (the bouncer runs on the LAPI host; check it there)"
+  else
+    echo "  Bouncer  : not installed"
+  fi
   echo ""
 }
 

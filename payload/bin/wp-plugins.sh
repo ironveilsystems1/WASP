@@ -650,29 +650,42 @@ do_install_file() {
     shift
   done
   [ -n "$_zip" ] || { echo "Usage: wp-plugins.sh install-file <file.zip> [--activate] [--sha256 <hash>]" >&2; return 1; }
-  [ -f "$_zip" ] || { echo "✗  No such file: ${_zip}" >&2; return 1; }
   # Case is the usual reason, and the plain error does not say so. An
   # operator transferred Divi.zip and then asked for divi.zip; both the
   # transfer and this command reported "No such file", which reads as the
   # transfer having failed rather than the name being wrong.
-  _dir=$(dirname "${_f}"); _base=$(basename "${_f}")
-  if [ -d "$_dir" ]; then
-    _near=$(ls -1 "$_dir" 2>/dev/null | grep -iFx "$_base" | head -1)
-    if [ -n "$_near" ]; then
-      echo "   Did you mean:  ${_dir}/${_near}" >&2
-      echo "   Filenames are case-sensitive." >&2
-    else
-      _any=$(ls -1 "$_dir" 2>/dev/null | head -5)
-      if [ -n "$_any" ]; then
-        echo "   That directory contains:" >&2
-        printf '%s\n' "$_any" | sed 's/^/     /' >&2
+  #
+  # BUG FIX: this hint block sat BELOW the existence check and read `$_f` --
+  # a stale global left behind by the Wordfence feed cache function. Both
+  # faults pointed the same way: it only ran when the file DID exist (when
+  # there is nothing to hint at), and it listed the vulnerability cache
+  # directory rather than the operator's. The hint could never once fire
+  # where it was written to fire. It belongs inside the failing branch, and
+  # it must read the path the operator actually gave.
+  if [ ! -f "$_zip" ]; then
+    echo "✗  No such file: ${_zip}" >&2
+    _dir=$(dirname "$_zip"); _base=$(basename "$_zip")
+    if [ -d "$_dir" ]; then
+      _near=$(ls -1 "$_dir" 2>/dev/null | grep -iFx "$_base" | head -1)
+      if [ -n "$_near" ]; then
+        echo "   Did you mean:  ${_dir}/${_near}" >&2
+        echo "   Filenames are case-sensitive." >&2
       else
-        echo "   ${_dir} is empty — did the transfer complete?" >&2
-        echo "   Transfers need:  scp -O <file> admin@vm:.../incoming/" >&2
-        echo "   (-O is required: no SFTP subsystem. rsync is NOT installed" >&2
-        echo "    unless the off-site method is rsync — add it with apk if wanted.)" >&2
+        _any=$(ls -1 "$_dir" 2>/dev/null | head -5)
+        if [ -n "$_any" ]; then
+          echo "   That directory contains:" >&2
+          printf '%s\n' "$_any" | sed 's/^/     /' >&2
+        else
+          echo "   ${_dir} is empty — did the transfer complete?" >&2
+          echo "   Transfers need:  scp -O <file> admin@vm:.../incoming/" >&2
+          echo "   (-O is required: no SFTP subsystem. rsync is NOT installed" >&2
+          echo "    unless the off-site method is rsync — add it with apk if wanted.)" >&2
+        fi
       fi
+    else
+      echo "   ${_dir} does not exist." >&2
     fi
+    return 1
   fi
   case "$_zip" in *.zip) : ;; *) echo "✗  Not a .zip: ${_zip}" >&2; return 1 ;; esac
   # The path becomes part of a `-v host:container:ro` argument that is expanded
@@ -725,6 +738,24 @@ do_install_file() {
   WPCLI_MOUNT="-v ${_abs}:/tmp/${_base}:ro"
   export WPCLI_MOUNT
 
+  # BUG FIX: the wp-cli container runs as --user 33:33. A zip fetched with
+  # curl or scp is commonly mode 600 and owned by root, so the mount
+  # succeeded and uid 33 then could not read it. WordPress reported:
+  #
+  #   PCLZIP_ERR_READ_OPEN_FAIL (-2) : Unable to read archive
+  #
+  # which names neither permissions nor the container user, and sent an
+  # operator looking at the download instead of the file mode. Make it
+  # readable, and say so rather than doing it silently.
+  if [ ! -r "$_zip" ] || [ "$(stat -c %a "$_zip" 2>/dev/null | tail -c 2)" = "0" ]; then
+    chmod o+r "$_zip" 2>/dev/null \
+      && echo "  ℹ  Made ${_base} world-readable — the wp-cli container runs as uid 33." \
+      || { echo "✗  ${_zip} is not readable by uid 33 and chmod failed." >&2
+           echo "   The container would report PCLZIP_ERR_READ_OPEN_FAIL." >&2
+           echo "   Fix with:  chmod 644 ${_zip}" >&2
+           unset WPCLI_MOUNT; return 1; }
+  fi
+
   # Theme or plugin? A theme zip has style.css at the top of its directory.
   _kind=plugin
   if command -v unzip >/dev/null 2>&1; then
@@ -732,10 +763,17 @@ do_install_file() {
   fi
   echo "  → Installing as a ${_kind} from ${_base}…"
 
+  # Snapshot what exists BEFORE, so the activation step can identify what
+  # arrived rather than guessing a slug from the file name. See the long
+  # note at the activation block for why guessing failed.
+  _pre_list=$(_wp "$_kind" list --field=name 2>/dev/null)
+
   _rc=0
   _out=$(_wp "$_kind" install "/tmp/${_base}" --force 2>&1) || _rc=$?
   printf '%s\n' "$_out" | sed 's/^/  /'
   unset WPCLI_MOUNT
+
+  _post_list=$(_wp "$_kind" list --field=name 2>/dev/null)
 
   if [ "$_rc" -ne 0 ]; then
     echo "✗  Install failed." >&2
@@ -771,13 +809,49 @@ do_install_file() {
   fi
 
   if [ "$_activate" = 1 ]; then
-    _slug_guess=$(printf '%s' "$_out" | sed -n "s/.*'\([a-z0-9-]*\)'.*/\1/p" | head -1)
-    [ -n "$_slug_guess" ] || _slug_guess="${_base%.zip}"
-    _wp "$_kind" activate "$_slug_guess" >/dev/null 2>&1 || true
-    if _wp "$_kind" list --status=active --field=name 2>/dev/null | grep -q .; then
-      echo "  ✔  Activated (verified)"
+    # BUG FIX (three faults, stacked so a guaranteed failure reported
+    # success — observed twice in a row on a live VM, 2026-10-18):
+    #
+    #  1. The slug came from the ZIP FILENAME. wp-cli prints no quoted slug,
+    #     so the sed matched nothing and it fell back to "${_base%.zip}".
+    #     A plugin's directory name has no reliable relationship to its file
+    #     name: elementorpro432.zip installs as "elementor-pro", and
+    #     hello-elementor.zip registers as "hello". Both activations ran
+    #     against names that do not exist.
+    #  2. `|| true` discarded the resulting error.
+    #  3. The check asked whether ANYTHING was active, not whether THIS was.
+    #     For a theme that is always true (one theme is always active); for
+    #     a plugin it was true because another plugin already was.
+    #
+    # So "✔ Activated (verified)" could not come out false. Both plugins
+    # were inactive while the tool reported them verified.
+    #
+    # Ask wp-cli what actually appeared instead of guessing. The pre/post
+    # diff is authoritative regardless of naming convention.
+    _slug=$(printf '%s\n' "$_post_list" | while IFS= read -r _n; do
+              [ -n "$_n" ] || continue
+              printf '%s\n' "$_pre_list" | grep -qxF "$_n" || { printf '%s' "$_n"; break; }
+            done)
+    # Re-installing something already present yields no new entry. Fall back
+    # to the zip's own top-level directory, which IS the slug by WordPress
+    # convention — still never the file name.
+    if [ -z "$_slug" ] && command -v unzip >/dev/null 2>&1; then
+      _slug=$(unzip -l "$_zip" 2>/dev/null \
+              | awk '$NF ~ /\/$/ { n = split($NF, p, "/"); if (n == 2) { print p[1]; exit } }')
+    fi
+    if [ -z "$_slug" ]; then
+      echo "  ⚠  Could not determine the ${_kind} slug — activate from wp-admin." >&2
     else
-      echo "  ⚠  Could not confirm activation — activate from wp-admin." >&2
+      _act_rc=0
+      _act_out=$(_wp "$_kind" activate "$_slug" 2>&1) || _act_rc=$?
+      # Verify THIS slug, not "anything".
+      if _wp "$_kind" list --status=active --field=name 2>/dev/null | grep -qxF "$_slug"; then
+        echo "  ✔  Activated and verified active: ${_slug}"
+      else
+        echo "  ✗  ${_slug} is NOT active after the attempt (rc=${_act_rc})." >&2
+        printf '%s\n' "$_act_out" | sed 's/^/     /' >&2
+        echo "     Activate it from wp-admin, or:  wp-plugins.sh list" >&2
+      fi
     fi
   fi
 
@@ -923,15 +997,20 @@ do_install() {
   fi
 
   if [ "$_activate" = 1 ]; then
-    _wp plugin activate "$_slug" >/dev/null 2>&1 || true
-    # Confirm by asking, not by trusting the exit status of the thing we just
-    # ran. "Installed and activated" was printed on a VM where neither had
-    # happened; a claim about state should be a reading of state.
+    # The verification below is a reading of state, not a trust of exit
+    # status -- "Installed and activated" was once printed on a VM where
+    # neither had happened. Keep wp-cli's output too: discarding it meant an
+    # operator whose activation failed got the verdict with none of the
+    # reason, and had to re-run the call by hand to see it.
+    _act_rc=0
+    _act_out=$(_wp plugin activate "$_slug" 2>&1) || _act_rc=$?
     if _wp plugin is-active "$_slug" >/dev/null 2>&1; then
-      echo "  ✔  Activated (verified)"
+      echo "  ✔  Activated and verified active: ${_slug}"
     else
-      echo "  ⚠  Not active after the activate call — activate from wp-admin," >&2
-      echo "     or retry: wp-plugins.sh install ${_slug} --activate" >&2
+      echo "  ⚠  ${_slug} is NOT active after the activate call (rc=${_act_rc})." >&2
+      printf '%s\n' "$_act_out" | sed 's/^/     /' >&2
+      echo "     Activate from wp-admin, or retry:" >&2
+      echo "       wp-plugins.sh install ${_slug} --activate" >&2
     fi
   else
     echo "  ℹ  Not activated. Activate when ready:  wp-plugins.sh ... (or in wp-admin)"
@@ -945,6 +1024,55 @@ do_install() {
 
 case "${1:-status}" in
   status) show_status ;;
+  # ── MFA state, as a question that can actually be answered ─────────────────
+  #
+  # BUG FIX: stage 10's blocker text and wasp-menu.sh item 14 ("MFA / Two
+  # Factor status") both pointed the operator at `wp-plugins.sh status` to
+  # confirm MFA. That command lists plugins with updates AVAILABLE and
+  # plugins that are INACTIVE. A successfully installed, activated, current
+  # Two Factor appears in neither list -- so the documented verification
+  # produced identical silence whether MFA was working or entirely absent.
+  #
+  # The operator has no way to tell those apart from the output, which is
+  # the worst property a verification command can have. This answers the
+  # question directly instead, and `validate-wordpress.sh` remains the
+  # fuller check.
+  mfa|mfa-status)
+    _MU=/home/wpuser/wp/html/wp-content/mu-plugins/03-wpvm-mfa-enforce.php
+    echo ""
+    echo "MFA — enforcement and plugin state"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ ! -f "$_MU" ]; then
+      echo "  Enforcement mu-plugin : NOT INSTALLED"
+    elif grep -q "define( 'WPVM_MFA_ENFORCE', 1 )" "$_MU" 2>/dev/null; then
+      echo "  Enforcement mu-plugin : INSTALLED, enforcement ON"
+    else
+      echo "  Enforcement mu-plugin : INSTALLED, enforcement OFF"
+    fi
+    if _wp plugin is-active two-factor >/dev/null 2>&1; then
+      echo "  Two Factor plugin     : ACTIVE"
+      _mfa_rc=0
+    elif _wp plugin is-installed two-factor >/dev/null 2>&1; then
+      echo "  Two Factor plugin     : INSTALLED BUT NOT ACTIVE"
+      echo ""
+      echo "  Activate it:  wp-plugins.sh install two-factor --activate"
+      _mfa_rc=1
+    else
+      echo "  Two Factor plugin     : NOT INSTALLED"
+      echo ""
+      echo "  Install it:   wp-plugins.sh install two-factor --activate"
+      _mfa_rc=1
+    fi
+    # The dangerous combination is enforcement ON with no active plugin:
+    # admins past their grace window cannot enrol and cannot log in.
+    if [ -f "$_MU" ] && grep -q "define( 'WPVM_MFA_ENFORCE', 1 )" "$_MU" 2>/dev/null \
+       && [ "${_mfa_rc:-1}" -ne 0 ]; then
+      echo ""
+      echo "  ✗  LOCKOUT RISK: enforcement is on and the plugin is not active."
+      echo "     Admins past the grace window cannot enrol."
+    fi
+    echo ""
+    exit "${_mfa_rc:-1}" ;;
   install|add) shift; do_install "$@" ;;
   install-file|add-file) shift; do_install_file "$@" ;;
   verify|verify-checksums|checksums) shift; do_verify "$@" ;;

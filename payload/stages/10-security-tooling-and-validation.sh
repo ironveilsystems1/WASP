@@ -260,8 +260,19 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wp-hardening.sh" /usr/local/bin/wp-hardening
 # ── Malware / integrity scanning ─────────────────────────────────────────────
 ts "Installing malware and integrity scanning"
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-malware-scan.sh" /usr/local/bin/wp-malware-scan.sh
+# Time-boxed contractor access. Installed alongside the scanners because the
+# request it answers ("let the web developer in for two days") is the one
+# most likely to leave a permanent allowlist entry behind -- the grant and
+# its scheduled revocation are created by the same command or not at all.
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-temp-access.sh" /usr/local/bin/wasp-temp-access.sh
 mkdir -p /etc/wp-install/malware
 install -m 0644 "${PAYLOAD_DIR}/malware/wp-malware.yar" /etc/wp-install/malware/wp-malware.yar
+# Uploads-scoped rules, installed alongside. wp-malware-scan.sh runs these
+# ONLY against wp-content/uploads and cache. They match "<?php", which is
+# correct for a media directory and catastrophic noise anywhere else -- run
+# against the whole tree they flagged 48 legitimate files on a real VM,
+# including wp-config.php and the mu-plugins.
+install -m 0644 "${PAYLOAD_DIR}/malware/wp-malware-uploads.yar" /etc/wp-install/malware/wp-malware-uploads.yar
 mkdir -p /var/lib/wp-quarantine /var/lib/wp-malware-scan
 chmod 700 /var/lib/wp-quarantine
 ok "wp-malware-scan.sh installed (structural / core / yara / db / clamav)"
@@ -387,7 +398,7 @@ if [ "${MFA_ENFORCE:-0}" = "1" ]; then
   # is still a blocker -- but one with a stated resolution path that requires no
   # operator action beyond the setup wizard they already have to do.
   if [ "${DEPLOYMENT_PROFILE:-production}" = "production" ]; then
-    block_production "MFA was requested but the Two Factor plugin cannot be installed until WordPress setup is completed (STEP 1 in the banner below). A deferred installer will install and activate it automatically within 10 minutes of you finishing setup, and will clear this blocker itself. Verify with: wp-plugins.sh status"
+    block_production "MFA was requested but the Two Factor plugin cannot be installed until WordPress setup is completed (STEP 1 in the banner below). A deferred installer will install and activate it automatically within 10 minutes of you finishing setup, and will clear this blocker itself. Verify with: wp-plugins.sh mfa"
   fi
 fi
 # Set the expectation about the first reboot BEFORE it happens. MariaDB takes

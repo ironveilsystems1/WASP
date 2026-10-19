@@ -61,15 +61,34 @@ _rc=0
   _log "Two Factor installed and activated"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$STAMP"
   # Clear the production blocker this was responsible for, if it is the only one.
+  #
+  # BUG FIX: this matched 'Two Factor plugin is not active' -- which is
+  # validate-wordpress.sh's FAILURE text, not the blocker. Stage 10 writes
+  # "MFA was requested but the Two Factor plugin cannot be installed until
+  # WordPress setup is completed". The two never matched, so `grep -v`
+  # returned the file unchanged, `-s` was true, the file was moved back over
+  # itself, and this logged "MFA blocker cleared" having cleared nothing. The
+  # VM stayed uncertified forever with a blocker naming a condition that had
+  # already been resolved -- the worst shape a false all-clear can take.
+  #
+  # The pattern below is asserted against stage 10's literal by
+  # test-fail-closed.sh, so the two cannot drift apart again silently.
+  _MFA_BLOCKER_PAT='Two Factor plugin cannot be installed'
   if [ -f /etc/wp-install/PRODUCTION-BLOCKERS ]; then
-    grep -v 'Two Factor plugin is not active' /etc/wp-install/PRODUCTION-BLOCKERS \
-      > /etc/wp-install/PRODUCTION-BLOCKERS.tmp 2>/dev/null || true
-    if [ -s /etc/wp-install/PRODUCTION-BLOCKERS.tmp ]; then
-      mv -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
-      _log "MFA blocker cleared; other blockers remain"
+    if grep -q "$_MFA_BLOCKER_PAT" /etc/wp-install/PRODUCTION-BLOCKERS 2>/dev/null; then
+      grep -v "$_MFA_BLOCKER_PAT" /etc/wp-install/PRODUCTION-BLOCKERS \
+        > /etc/wp-install/PRODUCTION-BLOCKERS.tmp 2>/dev/null || true
+      if [ -s /etc/wp-install/PRODUCTION-BLOCKERS.tmp ]; then
+        mv -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
+        _log "MFA blocker cleared; other blockers remain"
+      else
+        rm -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
+        _log "MFA blocker cleared; no blockers remain"
+      fi
     else
-      rm -f /etc/wp-install/PRODUCTION-BLOCKERS.tmp /etc/wp-install/PRODUCTION-BLOCKERS
-      _log "MFA blocker cleared; no blockers remain"
+      # Say so rather than claiming a clear. If the blocker text changed, the
+      # operator needs to know the file still has to be dealt with by hand.
+      _log "No MFA blocker found to clear (other blockers, if any, left intact)"
     fi
   fi
   logger -t wasp-mfa "Two Factor plugin installed and activated after WordPress setup"

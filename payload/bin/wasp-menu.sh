@@ -347,7 +347,7 @@ menu_testing() {
    10) Image CVE scan (no change)    ${DIM}update.sh trivy${R}
    11) Mail path works               ${DIM}wp-mail.sh doctor${R}
    12) wp-cli can reach the site     ${DIM}wp-plugins.sh doctor${R}
-   14) MFA / Two Factor status       ${DIM}wp-plugins.sh status${R}
+   14) MFA / Two Factor status       ${DIM}wp-plugins.sh mfa${R}
    18) Install Two Factor NOW        ${DIM}wasp-mfa-deferred.sh --now${R}
    19) Why hasn't MFA installed?     ${DIM}wasp-mfa-deferred.sh --status${R}
    15) WordPress core version        ${DIM}wp-plugins.sh core-version${R}
@@ -370,7 +370,7 @@ EOF
       10) _have update.sh && run "Image CVE scan" 0 update.sh trivy || _missing update.sh ;;
       11) _have wp-mail.sh && run "Mail doctor" 0 wp-mail.sh doctor || _missing wp-mail.sh ;;
       12) _have wp-plugins.sh && run "wp-cli doctor" 0 wp-plugins.sh doctor || _missing wp-plugins.sh ;;
-      14) _have wp-plugins.sh && run "Plugin / MFA status" 0 wp-plugins.sh status || _missing wp-plugins.sh ;;
+      14) _have wp-plugins.sh && run "MFA / Two Factor status" 0 wp-plugins.sh mfa || _missing wp-plugins.sh ;;
       18) _have wasp-mfa-deferred.sh && run "Install Two Factor now" 0 wasp-mfa-deferred.sh --now || _missing wasp-mfa-deferred.sh ;;
       19) _have wasp-mfa-deferred.sh && run "Deferred MFA installer status" 0 wasp-mfa-deferred.sh --status || _missing wasp-mfa-deferred.sh ;;
       15) _have wp-plugins.sh && run "WordPress core version (files vs image)" 0 wp-plugins.sh core-version || _missing wp-plugins.sh ;;

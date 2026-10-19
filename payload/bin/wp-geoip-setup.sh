@@ -239,6 +239,31 @@ cat > /home/wpuser/wp/apache-conf/geoip.conf << GEOIPCONF
     # is the correct wrapper for a site-wide rule: it is valid context and
     # it matches every URL, including ones with no filesystem mapping.
     <Location />
+        # FIX 3 (CRITICAL — found on a live client VM, 2026-10-18): without
+        # this line, THIS BLOCK SILENTLY DISABLES THE wp-admin IP ALLOWLIST.
+        #
+        # Apache applies configuration sections in a fixed order:
+        #   <Directory>  ->  <DirectoryMatch>  ->  <Files>  ->  <Location>
+        #
+        # <Location> is applied LAST, and mod_authz_core's AuthMerging
+        # defaults to Off, which means a later section's authorization logic
+        # REPLACES an earlier section's rather than combining with it.
+        #
+        # wp-security.conf restricts admin with <DirectoryMatch ...wp-admin>
+        # and <Files wp-login.php>. Both are applied BEFORE this <Location />,
+        # which matches every URL on the site. So this block replaced them
+        # outright and the only surviving control on wp-admin was the country
+        # test below -- plus "Require ip 10.0.0.0/8", which grants access to
+        # anything presenting an RFC1918 address with no country check at all.
+        #
+        # The symptom is the dangerous shape: an operator tested from abroad,
+        # got a 403, and concluded the restriction worked. It did not. The
+        # allowlist had never once been consulted. Verified on VM 500: adding
+        # this line turned an allowed request into the expected 403.
+        #
+        # "And" requires BOTH this section's logic and the inherited rules to
+        # pass, which is what the generated config always claimed to do.
+        AuthMerging And
         <RequireAny>
             # FIX 2: private and loopback addresses have NO country in the
             # GeoLite2 database, so they can never satisfy the country test
@@ -257,6 +282,17 @@ cat > /home/wpuser/wp/apache-conf/geoip.conf << GEOIPCONF
             Require ip 10.0.0.0/8
             Require ip 172.16.0.0/12
             Require ip 192.168.0.0/16
+            # FIX 4: 100.64.0.0/10 is CGNAT, and it is where NetBird,
+            # Tailscale and every carrier-grade NAT lives. Those addresses
+            # have no country in GeoLite2 either, so without this line an
+            # operator administering the site over their own overlay is
+            # denied by the country test -- while passing the admin
+            # allowlist, which the installer itself offers 100.64.0.0/10 for.
+            # Harmless before AuthMerging And, because this block was
+            # replacing the admin rules rather than combining with them.
+            # With the merge correct, omitting it locks the operator out of
+            # their own VM over the exact network they built to reach it.
+            Require ip 100.64.0.0/10
             <RequireAll>
                 Require env MM_COUNTRY_CODE
 ${GEOIP_REQUIRE_LINE}
