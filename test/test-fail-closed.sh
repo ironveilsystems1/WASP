@@ -361,6 +361,276 @@ else
 fi
 rm -f "$_c0"
 
+# ── Overlay masquerade detection ─────────────────────────────────────────────
+# Behavioural, not a grep for the function name: the bug this replaces had the
+# function present, called, and silently never true. It piped overlay-named
+# lines into a masquerade grep, but nft puts the chain name and the rule on
+# different lines, so the intersection was always empty.
+#
+# The failure direction is what makes it worth permanent tests. A missed
+# masquerade tells a remote operator their 100.x address will arrive, they
+# allow only the overlay range, and the rule drops the only path they have.
+_m0="$(mktemp)"
+sed -n '/^_overlay_masquerades()/,/^}/p;/^_overlay_addrs()/,/^}/p;/^_route_src_to()/,/^}/p' \
+  "$REPO/lib/00-preflight.sh" > "$_m0"
+if [ -s "$_m0" ]; then
+  # nft's real nesting: name on one line, masquerade two lines in.
+  ( . "$_m0"
+    nft(){ printf 'table ip netbird {\n  chain netbird-rt-nat { type nat hook postrouting priority srcnat;\n    ip saddr 100.64.0.0/10 ip daddr 10.20.101.0/24 counter masquerade\n  }\n}\n'; }
+    iptables-save(){ :; }
+    _overlay_masquerades ) \
+    && _p "a masquerading NetBird route is detected across nft's nesting" \
+    || _f "the masquerade went undetected" \
+          "name and rule are on different lines; a single-line grep finds neither"
+  # Overlay present, no NAT: must NOT warn, or the warning means nothing.
+  ( . "$_m0"
+    nft(){ printf 'table ip netbird {\n  chain netbird-rt-fwd { type filter hook forward priority 0;\n    ip saddr 100.64.0.0/10 counter accept\n  }\n}\n'; }
+    iptables-save(){ :; }
+    _overlay_masquerades ) \
+    && _f "a forward-only overlay was reported as masquerading" \
+          "a warning that always fires is one the operator learns to skip" \
+    || _p "an overlay that does not NAT is not reported as masquerading"
+  # A NAT'd Proxmox bridge is not an overlay route.
+  ( . "$_m0"
+    nft(){ printf 'table ip nat {\n  chain postrouting { type nat hook postrouting priority srcnat;\n    ip saddr 10.20.0.0/16 counter masquerade\n  }\n}\n'; }
+    iptables-save(){ :; }
+    _overlay_masquerades ) \
+    && _f "an ordinary NAT'd bridge was attributed to the overlay" \
+          "this would fire on every Proxmox host that NATs anything" \
+    || _p "a non-overlay masquerade is not attributed to the overlay"
+  # iptables-save is flat — chain and target share a line.
+  ( . "$_m0"
+    nft(){ :; }
+    iptables-save(){ printf -- '-A NETBIRD-RT-NAT-1 -s 100.64.0.0/10 -j MASQUERADE\n'; }
+    _overlay_masquerades ) \
+    && _p "the iptables form is detected too" \
+    || _f "an iptables-managed overlay NAT went undetected" \
+          "hosts on the legacy backend get the wrong advice"
+  # The computed answer: what the VM actually sees.
+  _src=$( . "$_m0"
+    ip(){ echo '10.20.101.10 via 10.20.1.1 dev vmbr1 src 10.20.1.254 uid 0'; }
+    _route_src_to 10.20.101.10 )
+  [ "$_src" = "10.20.1.254" ] \
+    && _p "the masqueraded source address is computed, not guessed" \
+    || _f "_route_src_to did not extract src (got '${_src:-}')" \
+          "without it the operator is told 'it depends on your routing'"
+  # The overlay address must be OFFERED here, having been excluded as a VM
+  # address candidate: the same data, two opposite correct answers.
+  _ovl=$( . "$_m0"
+    ip(){ printf '5: wt0\n    inet 100.87.54.172/16 scope global wt0\n'; }
+    _overlay_addrs )
+  case "$_ovl" in
+    *100.87.54.172*) _p "the overlay address is offered at the admin-source prompt" ;;
+    *) _f "the overlay address is not offered" \
+          "it is excluded from VM-address hints; here it is the likely answer" ;;
+  esac
+else
+  _f "the overlay helpers are missing from lib/00" \
+     "the SSH prompt has nothing to answer a remote operator with"
+fi
+rm -f "$_m0"
+unset _src _ovl
+
+# ── The never-ban prompt replaces its default ────────────────────────────────
+# Behavioural, driven with melroseparkfire's exact answers. The operator
+# answered YES to the CGNAT question, was told "your remote source address is
+# covered", then typed two addresses at the next prompt and lost the overlay
+# range, the SSH source and the public admin IP in one keystroke — while that
+# confirmation line stayed on screen.
+#
+# Under upstream enforcement those are the remote-administration paths a shared
+# LAPI would blackhole, so the silent drop is the expensive kind.
+_w0="$(mktemp)"
+sed -n '/^# ── Entries the typed answer dropped/,/^unset _CS_DEFAULT _CS_OVERLAY_OPTIN/p' \
+  "$REPO/lib/01-interactive-setup.sh" > "$_w0"
+_c1="$(mktemp)"; sed -n '/^_csv()/,/^}/p' "$REPO/lib/00-preflight.sh" > "$_c1"
+if [ -s "$_w0" ] && [ -s "$_c1" ]; then
+  _wlq() { ( . "$_c1"
+    msg_warn(){ :; }; msg_ok(){ :; }; msg_info(){ :; }
+    _CS_DEFAULT="10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10"
+    _CS_OVERLAY_OPTIN=1; CS_ENFORCEMENT="upstream"; PROXY_IP="10.20.10.10"
+    CROWDSEC_WHITELIST="$1"
+    # A herestring, NOT `printf | . "$_w0"`: the right-hand side of a pipe runs
+    # in its own subshell, so the block's assignment to CROWDSEC_WHITELIST
+    # would be discarded and every case would read as "dropped silently".
+    . "$_w0" <<<"$2" >/dev/null 2>&1
+    printf '%s' "$CROWDSEC_WHITELIST" ); }
+  _merged=$(_wlq "10.0.0.160,10.0.0.162" "y")
+  case "$_merged" in
+    *100.64.0.0/10*) _p "the dropped overlay range is offered back" ;;
+    *) _f "100.64.0.0/10 was dropped silently" \
+          "the operator answered YES to it one prompt earlier" ;;
+  esac
+  case "$_merged" in
+    *10.20.1.254/32*) _p "the dropped SSH source is offered back" ;;
+    *) _f "the SSH source was dropped silently" \
+          "upstream enforcement would blackhole the admin path fleet-wide" ;;
+  esac
+  case "$_merged" in
+    *10.0.0.160*) _p "what the operator typed is kept alongside" ;;
+    *) _f "the typed addresses were discarded by the merge" "" ;;
+  esac
+  # Declining must leave the typed answer exactly as given.
+  _kept=$(_wlq "10.0.0.160,10.0.0.162" "n")
+  [ "$_kept" = "10.0.0.160,10.0.0.162" ] \
+    && _p "declining the merge leaves the typed answer untouched" \
+    || _f "declining still altered the list (got '${_kept}')" \
+          "a deliberate narrow answer must survive the offer"
+  # Accepting the default must NOT warn — a prompt that always fires is noise.
+  _same=$(_wlq "10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10" "y")
+  [ "$_same" = "10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10" ] \
+    && _p "an unchanged default raises nothing" \
+    || _f "the check fired on an unchanged default (got '${_same}')" \
+          "a warning that always fires is one the operator learns to skip"
+else
+  _f "the dropped-entry check is missing from lib/01" \
+     "an explicit opt-in can be discarded by the next answer with no notice"
+fi
+rm -f "$_w0" "$_c1"
+unset _merged _kept _same
+
+# ── The resolver the VM actually boots with ──────────────────────────────────
+# lib/04 copies the PROXMOX HOST's /etc/resolv.conf into the image so apk can
+# resolve inside the chroot. Nothing replaced it, and `dns-nameservers` in
+# /etc/network/interfaces does not fix that: it is a Debian resolvconf
+# extension that Alpine's busybox ifupdown parses and discards.
+#
+# From the melroseparkfire install: tispve runs NetBird, which owns that file
+# and points it at 100.87.54.172. The address leaked into the VM, which has no
+# route to 100.64.0.0/10 and whose own firewall blocks SITE_NETS ->
+# PRIVATE_NETS. Every lookup timed out and apk died on the first mirror fetch,
+# fifteen minutes into an unattended build, with the installer having printed
+# "DNS: 10.20.101.1" twice on the way past.
+#
+# Latent across 96 deployments because the host's resolver used to be a
+# routable LAN address. systemd-resolved (127.0.0.53) would expose it too.
+_n0="$(mktemp)"
+sed -n '/^mkdir -p "\$MNT\/etc\/network"$/,/^fi$/p' \
+  "$REPO/lib/05-ssh-and-network-inject.sh" > "$_n0"
+if [ -s "$_n0" ]; then
+  # Status-based, not output-based: msg_error exits, and the >/dev/null that
+  # keeps the block quiet would also swallow anything it printed. The first
+  # cut of this read every refusal as an acceptance for exactly that reason.
+  _dnsq() { # $1 = VM_DNS, $2 = NET_MODE ; prints resolv.conf, exits 9 if refused
+    ( msg_ok(){ :; }; msg_warn(){ :; }; msg_error(){ exit 9; }
+      MNT=$(mktemp -d); trap 'rm -rf "$MNT"' EXIT
+      mkdir -p "$MNT/etc/network"
+      printf '# Generated by NetBird\nnameserver 100.87.54.172\n' > "$MNT/etc/resolv.conf"
+      NET_MODE="${2:-static}" VM_STATIC_IP=10.20.101.10 VM_NETMASK=255.255.255.0
+      VM_PREFIX=24 VM_GATEWAY=10.20.101.1 VM_DNS="$1"
+      . "$_n0" >/dev/null 2>&1
+      cat "$MNT/etc/resolv.conf" ); }
+  _refused() { _dnsq "$1" "${2:-static}" >/dev/null 2>&1; [ "$?" -eq 9 ]; }
+
+  _r=$(_dnsq "10.20.101.1")
+  case "$_r" in
+    *"nameserver 10.20.101.1"*) _p "the operator's resolver reaches /etc/resolv.conf" ;;
+    *) _f "the chosen resolver was not written to /etc/resolv.conf" \
+          "dns-nameservers alone is discarded by busybox ifupdown" ;;
+  esac
+  case "$_r" in
+    *100.87.54.172*) _f "the host's leaked resolver survived into the image" \
+                        "this is the melroseparkfire failure exactly" ;;
+    *NetBird*)       _f "the host's resolv.conf was not replaced" "" ;;
+    *) _p "the Proxmox host's leaked resolv.conf is replaced" ;;
+  esac
+  _refused "100.87.54.172" \
+    && _p "a CGNAT/overlay resolver is refused before the VM ships" \
+    || _f "a CGNAT resolver was accepted" \
+          "the VM cannot route to 100.64.0.0/10; it fails at the first apk fetch"
+  _refused "127.0.0.53" \
+    && _p "a loopback resolver (systemd-resolved) is refused" \
+    || _f "127.0.0.53 was accepted" "that stub belongs to the host, not the VM"
+  _rd=$(_dnsq "" "dhcp")
+  case "$_rd" in
+    *100.87.54.172*) _f "DHCP mode still ships the host's leaked resolver" \
+                        "a failed lease would resolve against the hypervisor" ;;
+    *) _p "DHCP mode clears the host copy too" ;;
+  esac
+  # Two resolvers must both land, not just the first.
+  case "$(_dnsq '9.9.9.9 149.112.112.112')" in
+    *"nameserver 9.9.9.9"*"nameserver 149.112.112.112"*)
+      _p "every selected resolver is written, not only the first" ;;
+    *) _f "the secondary resolver was dropped" "" ;;
+  esac
+else
+  _f "the network injection block is missing from lib/05" \
+     "the VM's resolver would be whatever the hypervisor happened to have"
+fi
+rm -f "$_n0"
+unset _r _rd
+
+# ── Comma vs space: the two list conventions ─────────────────────────────────
+# nftables sets take commas (_csv). Apache's `Require ip` takes spaces (_ssv).
+# Both helpers sit next to each other in lib/00, which is exactly what makes
+# forgetting one of them easy.
+#
+# From the melroseparkfire install: _ask_cidr was taught to accept several
+# ranges, the nftables consumers were converted with _csv, and lib/03's
+# Require ip lines were not. wp-security.conf stopped parsing, Apache never
+# started, every request to the VM was refused, and it surfaced two stages
+# later as "GeoIP setup failed" -- because the GeoIP step rebuilds the Apache
+# layer and runs a config test. The real cause was three screens up.
+_s0="$(mktemp)"; sed -n '/^_ssv()/,/^}/p' "$REPO/lib/00-preflight.sh" > "$_s0"
+if [ -s "$_s0" ]; then
+  _ssvq() { ( . "$_s0"; _ssv "$1" ); }
+  [ "$(_ssvq '100.64.0.0/10,10.20.1.0/24,10.0.0.0/24')" \
+      = "100.64.0.0/10 10.20.1.0/24 10.0.0.0/24" ] \
+    && _p "_ssv converts a comma list to Apache's space form" \
+    || _f "_ssv did not produce a space-separated list" \
+          "Require ip rejects commas: 'The specified network mask is invalid'"
+else
+  _f "_ssv is missing from lib/00" "nothing converts a CIDR list for Apache"
+fi
+rm -f "$_s0"
+
+# ── Variables the VM reads must be variables the VM was given ────────────────
+# From the melroseparkfire install, and the most expensive bug of the set to
+# diagnose because both halves looked correct in isolation:
+#
+#   lib/03, on the Proxmox host  — opens the firewall from Squid to exactly
+#                                  ${VM_DNS:-9.9.9.9 149.112.112.112}
+#   stage 09, inside the VM      — writes dns_nameservers from the SAME
+#                                  expression, with the SAME fallback
+#
+# lib/06 injected VM_STATIC_IP and not VM_DNS. So on the host the variable was
+# set and on the VM it was not, the fallback fired on one side only, and the
+# firewall permitted the operator's resolver while Squid asked Quad9. Every
+# lookup was dropped: HIER_NONE/503 after 3s and 30s timeouts, and WordPress
+# reporting "something may be wrong with WordPress.org or this server's
+# configuration". Nothing anywhere named DNS.
+#
+# Identical fallbacks on both sides are what hid it — and they also mean the
+# bug only appears when the operator picks a resolver other than the default.
+#
+# The rule is general: a payload stage reading ${VM_*} is reading something
+# only lib/06 can put there.
+_vm_missing=""
+for _v in $(grep -rhoE '\$\{VM_[A-Z_]+' "$REPO/payload/stages/" "$REPO/payload/bin/" 2>/dev/null \
+            | sed 's/^\${//' | sort -u); do
+  grep -q "^${_v}=\$(_vars_q" "$REPO/lib/06-vars-and-payload-inject.sh" \
+    || _vm_missing="${_vm_missing} ${_v}"
+done
+if [ -z "$_vm_missing" ]; then
+  _p "every VM_* variable the payload reads is injected by lib/06"
+else
+  _f "payload reads VM_* that lib/06 never injects:${_vm_missing}" \
+     "the in-VM fallback fires while the host used the real value — two halves of one control disagreeing"
+fi
+unset _vm_missing _v
+# Every Require ip built from a variable must go through _ssv. Asserted as a
+# negative too: a raw ${VAR} there is the bug, and it reads as correct.
+# `grep -c` exits 1 when the count is zero, so `|| echo 0` appends a SECOND
+# zero and the comparison breaks on "0\n0". Assign on failure instead.
+_raw=$(grep -c 'Require ip \${' "$REPO/lib/03-dynamic-configs.sh" 2>/dev/null) || _raw=0
+[ "${_raw:-0}" -eq 0 ] \
+  && _p "no Apache Require directive interpolates a list unconverted" \
+  || _f "lib/03 has ${_raw} raw \${VAR} in a Require ip line" \
+        "a comma list there stops Apache parsing its own config"
+unset _raw
+# The two _guard calls for this live in the guards section below, because
+# _guard is not defined yet here. That ordering has caught me twice already.
+
 # Both set-valued rules must be braced, or a list is a syntax error again.
 if grep -qE 'SSH_RULE="ip saddr \{ \$\{SSH_CIDR\} \}' "$REPO/lib/03-dynamic-configs.sh"; then
   _p "the SSH rule braces its CIDR list"
@@ -629,6 +899,35 @@ _guard "cs-doctor asks whether a local ban can match real traffic" \
 # off on the strength of it.
 _guard "lib/01 validates every SSH key it accepts" \
   "lib/01-interactive-setup.sh" "_ssh_key_kind"
+# The SSH CIDR prompt is the one whose wrong answer costs the login path, and
+# it was the one prompt printing no hints at all — while the wp-admin question
+# thirty lines later printed the full interface list.
+_guard "lib/03 converts the wp-admin CIDR for Apache" \
+  "lib/03-dynamic-configs.sh" 'Require ip \$(_ssv "\$ADMIN_CIDR")'
+_guard "lib/03 converts the extra admin IPs for Apache" \
+  "lib/03-dynamic-configs.sh" 'Require ip \$(_ssv "\$ALLOWED_ADMIN_IP")'
+_guard "the SSH CIDR prompt prints the host's interfaces" \
+  "lib/01-interactive-setup.sh" "The source address the VM will see"
+_guard "the SSH CIDR prompt names the masquerade trap" \
+  "lib/01-interactive-setup.sh" "_overlay_masquerades"
+# Ordering, asserted structurally: the proxy answer decides which address the
+# Layer 1 and Layer 2 rules are matched against, so asking it afterwards means
+# the operator answers both before being told what the answers mean.
+_pl=$(grep -n 'PROXY_IP=$(_ask_single_ip' "$REPO/lib/01-interactive-setup.sh" | cut -d: -f1 | head -1)
+_wl=$(grep -n 'WEB_CIDR=$(_ask_cidr'      "$REPO/lib/01-interactive-setup.sh" | cut -d: -f1 | head -1)
+_al=$(grep -n 'ADMIN_CIDR=$(_ask_cidr'    "$REPO/lib/01-interactive-setup.sh" | cut -d: -f1 | head -1)
+if [ -n "$_pl" ] && [ -n "$_wl" ] && [ -n "$_al" ] \
+   && [ "$_pl" -lt "$_wl" ] && [ "$_pl" -lt "$_al" ]; then
+  _p "the proxy is asked before the rules whose meaning it decides"
+else
+  _f "the proxy is still asked after the address questions" \
+     "mod_remoteip changes which address Layer 2 matches; that must be known first"
+fi
+_guard "the wp-admin prompt says the match is the client, not the proxy" \
+  "lib/01-interactive-setup.sh" "not against the proxy"
+_guard "the wp-admin prompt offers the overlay address" \
+  "lib/01-interactive-setup.sh" "^_overlay_addrs$"
+unset _pl _wl _al
 _guard "lib/05 re-validates SSH keys at the write site" \
   "lib/05-ssh-and-network-inject.sh" "_ssh_key_kind"
 _guard "lib/05 refuses to build a VM with no usable key" \
@@ -648,6 +947,375 @@ if grep -nE '^\s*err "cs-firewall-bouncer' "$REPO/payload/stages/09-crowdsec-and
      "stage 10 never runs, so the tools needed to diagnose it are not installed"
 else
   _p "the CrowdSec gate defers rather than aborting mid-stage"
+fi
+
+# ── The deferred MFA installer must actually clear the blocker it names ──────
+#
+# The failure this catches is a FALSE ALL-CLEAR: the script logged "MFA
+# blocker cleared" while the blocker file was moved back over itself
+# unchanged, because the grep pattern was validate-wordpress.sh's failure
+# text rather than the blocker stage 10 writes. Compare the two literals
+# directly -- that is the only assertion that survives either side being
+# reworded.
+_mfa_blocker=$(grep -o 'MFA was requested[^"]*' \
+  "$REPO/payload/stages/10-security-tooling-and-validation.sh" 2>/dev/null | head -1)
+_mfa_pat=$(grep -oE "^\s*_MFA_BLOCKER_PAT='[^']+'" \
+  "$REPO/payload/bin/wasp-mfa-deferred.sh" 2>/dev/null | head -1 | sed "s/.*='//;s/'$//")
+
+if [ -z "$_mfa_blocker" ]; then
+  _f "stage 10's MFA blocker text could not be found" \
+     "the comparison below cannot run, so drift would go unnoticed"
+elif [ -z "$_mfa_pat" ]; then
+  _f "wasp-mfa-deferred.sh has no _MFA_BLOCKER_PAT" \
+     "the clear pattern is inline again and nothing checks it matches"
+elif printf '%s\n' "$_mfa_blocker" | grep -q "$_mfa_pat"; then
+  _p "the deferred MFA installer's pattern matches the blocker stage 10 writes"
+else
+  _f "the MFA clear pattern does not match the blocker text" \
+     "install succeeds, the script logs 'blocker cleared', and the VM stays uncertified"
+fi
+
+# It must not claim a clear it did not perform.
+_guard "wasp-mfa-deferred.sh checks the blocker is present before claiming a clear" \
+  "payload/bin/wasp-mfa-deferred.sh" "No MFA blocker found to clear"
+
+# ── install-file's "did you mean" hint must reach the failing path ───────────
+#
+# It previously sat below the existence check and read a stale global from
+# the Wordfence cache function, so it ran only on SUCCESS and listed the
+# wrong directory. Both faults are invisible from the outside: the hint
+# simply never appeared. Assert the shape that makes it reachable.
+if grep -q 'dirname "\${\?_f}\?"' "$REPO/payload/bin/wp-plugins.sh" 2>/dev/null; then
+  _f "do_install_file's hint reads \$_f (the Wordfence cache path) again" \
+     "the hint lists the vulnerability cache instead of the operator's directory"
+else
+  _p "do_install_file's hint reads the path the operator supplied"
+fi
+_guard "do_install_file hints only when the file is genuinely missing" \
+  "payload/bin/wp-plugins.sh" 'if \[ ! -f "\$_zip" \]; then'
+
+# ── Every recommended wp-plugins.sh subcommand must exist ───────────────────
+#
+# Stage 10's MFA blocker told the operator to "Verify with: wp-plugins.sh
+# status", and menu item 14 ("MFA / Two Factor status") ran the same thing.
+# `status` lists plugins with updates AVAILABLE and plugins that are
+# INACTIVE -- a working, current, activated Two Factor is in neither, so the
+# documented check printed identical silence whether MFA was fine or absent.
+#
+# A subcommand that does not exist at all fails loudly and gets found. One
+# that exists but cannot answer the question asked is the silent kind. This
+# catches the first class outright, and the named-MFA case specifically.
+_disp=$(sed -n '/^case "\${1:-status}" in/,/^esac/p' "$REPO/payload/bin/wp-plugins.sh" 2>/dev/null \
+        | grep -oE '^\s{2}[a-z|-]+\)' | tr -d ' )' | tr '|' '\n' | sort -u)
+# Only lines that PRESENT a command to the operator, not prose that happens
+# to name the script. Prose ("wp-plugins.sh exists for ...") would otherwise
+# contribute English words as imaginary subcommands and bury the real finding.
+_bad_sub=""
+for _s in $(grep -rhoE '(Verify with: |run "[^"]*" [0-9] |\$\{DIM\}|^[[:space:]]*(doas )?)wp-plugins\.sh [a-z-]+' \
+            "$REPO/payload" "$REPO/lib" 2>/dev/null \
+            | grep -oE 'wp-plugins\.sh [a-z-]+$' | awk '{print $2}' | sort -u); do
+  printf '%s\n' "$_disp" | grep -qx "$_s" || _bad_sub="${_bad_sub} ${_s}"
+done
+if [ -n "$_bad_sub" ]; then
+  _f "recommended wp-plugins.sh subcommand(s) do not exist:${_bad_sub}" \
+     "the operator is told to run something that cannot work"
+else
+  _p "every recommended wp-plugins.sh subcommand exists in the dispatch table"
+fi
+
+# The MFA verification route must be one that can actually report MFA state.
+if grep -q 'Verify with: wp-plugins.sh status' \
+     "$REPO/payload/stages/10-security-tooling-and-validation.sh" 2>/dev/null; then
+  _f "the MFA blocker points at \`status\`, which cannot show MFA state" \
+     "a working install and a missing one produce identical silence"
+else
+  _p "the MFA blocker points at a command that reports MFA state"
+fi
+_guard "wp-plugins.sh has an mfa subcommand that checks the plugin is active" \
+  "payload/bin/wp-plugins.sh" 'plugin is-active two-factor'
+_guard "the mfa subcommand names the enforcement-on-without-plugin lockout" \
+  "payload/bin/wp-plugins.sh" "LOCKOUT RISK"
+
+# ── A prompt with no stdin must say so, not look like a declined answer ─────
+#
+# `ask_yn` was `read ans` with no EOF handling. Under `qm guest exec`, cron
+# or any pipe, read returns empty immediately and the caller prints
+# "Skipped." -- identical to the operator having answered No. An operator
+# ran update.sh over guest exec, read "Skipped.", and could not tell the
+# prompt had never been answerable.
+_ay=$(sed -n '/^ask_yn() {/,/^}/p' "$REPO/payload/bin/update.sh" 2>/dev/null)
+if [ -z "$_ay" ]; then
+  _f "ask_yn could not be located in update.sh" "the EOF guard cannot be checked"
+elif printf '%s\n' "$_ay" | grep -q 'if ! read ans'; then
+  _p "ask_yn distinguishes no-stdin from a declined answer"
+else
+  _f "ask_yn does not detect EOF" \
+     "an unanswerable prompt reports 'Skipped.', which reads as the operator's own No"
+fi
+_guard "the no-stdin message says nothing was skipped by choice" \
+  "payload/bin/update.sh" "Nothing was skipped by choice"
+
+# It must stay fail-closed: no stdin means NO, never an implied yes.
+_ayt=$(mktemp); printf '%s\n' "$_ay" > "$_ayt"
+if sh -c ". '$_ayt'; ask_yn 'Update?'" </dev/null >/dev/null 2>&1; then
+  _f "ask_yn returns TRUE with no stdin" \
+     "an unattended run would auto-confirm, including the CVE-scan bypass gate"
+else
+  _p "ask_yn fails closed when there is no stdin"
+fi
+rm -f "$_ayt"
+
+# And no --yes flag may be added: one gate asks whether to proceed WITHOUT a
+# completed CVE scan, and a flag that can answer that is worse than having
+# no unattended mode at all.
+if grep -qE '^\s*(--yes|-y)\)' "$REPO/payload/bin/update.sh" 2>/dev/null \
+   || grep -q 'ASSUME_YES' "$REPO/payload/bin/update.sh" 2>/dev/null; then
+  _f "update.sh gained an unattended-confirm flag" \
+     "it can answer the 'proceed without a CVE scan' gate with no human present"
+else
+  _p "update.sh has no flag that can auto-answer the CVE-scan gate"
+fi
+
+# ── A site-wide <Location> must not outrank the admin restriction ───────────
+#
+# THE ONLY DEFECT IN THIS SERIES WITH LIVE EXPOSURE RATHER THAN BAD REPORTING.
+#
+# Apache applies sections in the order <Directory>, <DirectoryMatch>, <Files>,
+# <Location> -- and AuthMerging defaults to Off, so the LAST section's
+# authorization logic REPLACES the earlier one's. wp-security.conf restricts
+# wp-admin with <DirectoryMatch> and <Files>; geoip.conf's <Location /> is
+# applied after both and matches every URL, so it silently replaced them. The
+# wp-admin IP allowlist had never been enforced on any GeoIP install.
+#
+# Any generated <Location>/<LocationMatch> carrying Require directives must
+# therefore declare AuthMerging And, or it inherits this defect.
+_loc_bad=""
+for _src in "$REPO"/payload/bin/*.sh "$REPO"/lib/*.sh; do
+  [ -f "$_src" ] || continue
+  # Pull each <Location...> ... </Location> block and check any that contain
+  # a Require directive for the AuthMerging declaration.
+  _res=$(awk '
+    /<Location(Match)?[ >]/ { inblk = 1; blk = ""; hasreq = 0; hasmerge = 0 }
+    inblk {
+      blk = blk $0 "\n"
+      if ($0 ~ /^[[:space:]]*Require[[:space:]]/) hasreq = 1
+      if ($0 ~ /^[[:space:]]*AuthMerging[[:space:]]+And/) hasmerge = 1
+    }
+    inblk && /<\/Location(Match)?>/ {
+      if (hasreq && !hasmerge) bad = 1
+      inblk = 0
+    }
+    END { exit(bad ? 1 : 0) }' "$_src" 2>/dev/null; echo $?)
+  [ "$_res" = "1" ] && _loc_bad="${_loc_bad} $(basename "$_src")"
+done
+if [ -n "$_loc_bad" ]; then
+  _f "a site-wide <Location> with Require lacks AuthMerging And:${_loc_bad}" \
+     "it is applied after <DirectoryMatch>/<Files> and REPLACES the wp-admin allowlist"
+else
+  _p "every generated <Location> authz block declares AuthMerging And"
+fi
+
+_guard "the generated geoip.conf merges with the admin rules rather than replacing them" \
+  "payload/bin/wp-geoip-setup.sh" "AuthMerging And"
+
+# Overlay/CGNAT addresses have no country in GeoLite2. The installer offers
+# 100.64.0.0/10 as an admin CIDR for NetBird and Tailscale users, so omitting
+# it here denies the operator over the very network they built to reach the
+# VM -- a lockout that only appears once AuthMerging And makes both layers
+# apply.
+_guard "geoip.conf exempts the overlay/CGNAT range it offers as an admin CIDR" \
+  "payload/bin/wp-geoip-setup.sh" "Require ip 100.64.0.0/10"
+
+# The ordering explanation must survive, because the next person to add a
+# site-wide rule needs to know WHY the line is there.
+_guard "geoip.conf records why AuthMerging is mandatory" \
+  "payload/bin/wp-geoip-setup.sh" "is applied LAST"
+
+# ── install-file must not claim an activation it did not perform ────────────
+#
+# Observed twice in a row on a live VM: both "✔ Activated (verified)". Both
+# inactive. Three faults stacked — the slug came from the ZIP FILE NAME
+# (elementorpro432.zip -> "elementorpro432", real slug "elementor-pro"), the
+# error was discarded with `|| true`, and the check asked whether ANYTHING
+# was active rather than whether THIS was. The message could not come out
+# false, which is the worst property a verification can have.
+if grep -q '_slug_guess="\${_base%.zip}"' "$REPO/payload/bin/wp-plugins.sh" 2>/dev/null; then
+  _f "install-file derives the slug from the zip FILE NAME again" \
+     "a plugin's directory name is unrelated to its file name; activation targets nothing"
+else
+  _p "install-file does not derive the slug from the zip file name"
+fi
+if grep -qE 'activate "\$_slug[a-z_]*" >/dev/null 2>&1 \|\| true' \
+     "$REPO/payload/bin/wp-plugins.sh" 2>/dev/null; then
+  _f "install-file discards the activation error again" \
+     "a failed activation is reported as success"
+else
+  _p "install-file keeps the activation error"
+fi
+_guard "install-file verifies THAT slug is active, not that anything is" \
+  "payload/bin/wp-plugins.sh" 'grep -qxF "\$_slug"'
+_guard "install-file identifies what arrived by diffing wp-cli's own list" \
+  "payload/bin/wp-plugins.sh" "_pre_list="
+
+# ── The staged zip must be readable by the wp-cli container's uid ───────────
+#
+# curl and scp commonly leave mode 600 root. The container runs --user 33:33,
+# so the mount succeeded and the read failed, surfacing as
+# PCLZIP_ERR_READ_OPEN_FAIL — which names neither permissions nor the
+# container user, and sends the operator back to the download.
+_guard "install-file makes the staged zip readable by uid 33" \
+  "payload/bin/wp-plugins.sh" "chmod o+r"
+_guard "install-file names the real cause when it cannot" \
+  "payload/bin/wp-plugins.sh" "PCLZIP_ERR_READ_OPEN_FAIL"
+
+# ── The malware scanner's summary must count what it printed ────────────────
+#
+# A real run printed 48 [SUSPECT] lines and a summary reading
+# "suspicious 0" directly beneath them. The findings loop was the right-hand
+# side of a PIPE, so _crit/_high/_susp ran in a subshell and every counter
+# increment was discarded. A genuine detection would have summarised as zero
+# too — and the summary is the line an operator actually reads.
+if grep -qE "grep -v '\^0x' \| while IFS= read" "$REPO/payload/bin/wp-malware-scan.sh" 2>/dev/null; then
+  _f "the YARA findings loop is on the right of a pipe again" \
+     "counters increment in a subshell and the summary reports zero findings"
+else
+  _p "the YARA findings loop runs in the scanner's own shell"
+fi
+_guard "the YARA loop reads from a file, keeping counters in scope" \
+  "payload/bin/wp-malware-scan.sh" 'done < "\$_ytmp"'
+
+# ── An uploads-scoped rule must not be run against the whole tree ───────────
+#
+# wpvm_php_in_nonphp_extension matches "<?php". Correct for a media
+# directory; against the whole site it flags every legitimate PHP file.
+if grep -q 'php_in_nonphp_extension' "$REPO/payload/malware/wp-malware.yar" 2>/dev/null; then
+  _f "the uploads-only rule is back in the whole-tree ruleset" \
+     "every legitimate .php file on the site is reported as suspect"
+else
+  _p "the uploads-only rule is kept out of the whole-tree ruleset"
+fi
+_guard "uploads-scoped rules exist in their own ruleset" \
+  "payload/bin/wp-malware-scan.sh" "RULES_UPLOADS="
+# A ruleset the installer never copies is a ruleset that silently never runs.
+_guard "stage 10 installs the uploads ruleset onto the VM" \
+  "payload/stages/10-security-tooling-and-validation.sh" "wp-malware-uploads.yar"
+if [ -f "$REPO/payload/malware/wp-malware-uploads.yar" ]; then
+  _p "the uploads ruleset is present in the payload"
+else
+  _f "the uploads ruleset is missing from the payload" \
+     "RULES_UPLOADS never resolves, so those rules silently never run"
+fi
+
+# ── Trivy must stage its database somewhere that can hold it ────────────────
+#
+# --cache-dir governs where Trivy KEEPS the database; TMPDIR governs where it
+# STAGES the download. On Alpine /tmp is a tmpfs sized from RAM -- 256 MB on
+# the affected VM, against 14.1 GB free on the real disk. Every DB download
+# failed with "no space left on device" inside a message about vulnerability
+# databases, so the cause read as Trivy or the network, never as disk.
+#
+# Under the production profile an incomplete scan correctly blocks the
+# update, so a 256 MB tmpfs silently blocked every security update.
+_guard "update.sh stages Trivy's download through the cache dir, not /tmp" \
+  "payload/bin/update.sh" 'TRIVY_TMPDIR="\${TRIVY_CACHE_DIR}/tmp"'
+# Pointing TMPDIR at a path that cannot be created would break mktemp for the
+# whole script -- a worse failure than the one being fixed.
+_guard "the relocation is skipped unless the directory is writable" \
+  "payload/bin/update.sh" '\[ -w "\$TRIVY_TMPDIR" \]'
+_guard "a too-small /tmp is named as disk, before the scan fails" \
+  "payload/bin/update.sh" "does not mention disk space"
+
+# The warning is useless if nothing calls it.
+if grep -q '_trivy_tmp_warn$' "$REPO/payload/bin/update.sh" 2>/dev/null; then
+  _p "the /tmp warning is actually invoked from setup_trivy"
+else
+  _f "_trivy_tmp_warn is defined but never called" \
+     "the operator gets the vulnerability-database message with no mention of disk"
+fi
+
+# ── A failed container upgrade must leave evidence behind ───────────────────
+#
+# The CrowdSec health check waited 6 x 5s = 30 seconds. A version jump
+# migrates config and the local database on first start, so the update rolled
+# back on a container that was merely still coming up -- and the rollback
+# destroyed that container before anyone could ask it why. The operator got
+# "LAPI not responding" and nothing else, so the next attempt failed
+# identically.
+# Assert the VALUE, not the literal loop text: the count lives in a variable,
+# so a grep for "seq 1 6" sails past someone lowering it back.
+_lt=$(grep -oE '^[[:space:]]*_lapi_tries=[0-9]+' "$REPO/payload/bin/update.sh" 2>/dev/null \
+      | grep -oE '[0-9]+$' | head -1)
+if [ -z "$_lt" ]; then
+  _f "the CrowdSec LAPI wait count could not be found" "the bound cannot be checked"
+elif [ "$_lt" -lt 24 ]; then
+  _f "the CrowdSec LAPI wait is only $((_lt * 5))s" \
+     "a version upgrade migrates on first start and rolls back while merely starting"
+else
+  _p "the CrowdSec LAPI wait allows $((_lt * 5))s for first-start migration"
+fi
+_guard "the failed upgrade's logs are captured before the rollback destroys it" \
+  "payload/bin/update.sh" "wasp-crowdsec-upgrade-failed.log"
+_guard "the operator is shown why, not just that it failed" \
+  "payload/bin/update.sh" "podman logs --tail 12 crowdsec"
+# Waiting three minutes on a container that already exited is wasted time.
+_guard "the wait stops early if the new container has exited" \
+  "payload/bin/update.sh" "The new CrowdSec container exited during startup"
+
+# ── Temporary access must expire without anyone remembering ─────────────────
+#
+# "Let the contractor in for two days" is the request most likely to leave a
+# permanent allowlist entry: the work ends, and removing the entry is a
+# separate task nobody owns. The grant therefore schedules its own
+# revocation, or it is not a grant.
+_guard "a grant schedules its own revocation" \
+  "payload/bin/wasp-temp-access.sh" "Revocation scheduled for"
+# Admin is gated by TWO layers since the AuthMerging fix. Writing only one
+# produces a 403 that looks like the grant failed.
+_guard "a grant writes both the allowlist and the country-test layer" \
+  "payload/bin/wasp-temp-access.sh" 'for _f in "\$SEC_CONF" "\$GEO_CONF"'
+_guard "temp access refuses a window longer than a month" \
+  "payload/bin/wasp-temp-access.sh" "Longer than that is not temporary"
+_guard "temp access refuses an over-broad CIDR" \
+  "payload/bin/wasp-temp-access.sh" "not a plausible single address"
+# A bind-mounted single file keeps its inode; sed -i would leave the
+# container reading the original. This cost a live debugging session once.
+_guard "temp access rewrites in place rather than replacing the inode" \
+  "payload/bin/wasp-temp-access.sh" "_write_inplace"
+_guard "temp access verifies the public site still answers after reload" \
+  "payload/bin/wasp-temp-access.sh" "Public site returned"
+# An installer that never copies it means the tool does not exist on the VM.
+_guard "stage 10 installs wasp-temp-access.sh" \
+  "payload/stages/10-security-tooling-and-validation.sh" "wasp-temp-access.sh"
+
+# ── A container replacement must preserve the deployment's topology ─────────
+#
+# do_cs_update's `podman run` hardcoded a local-LAPI shape. Stage 09 and
+# wp-hardening.sh create the container in AGENT-ONLY mode when the LAPI lives
+# on another host (-e DISABLE_LOCAL_API=true -e LOCAL_API_URL=...). Neither
+# was reproduced, so the replacement came up as a full local API node, the
+# entrypoint re-registered it against 127.0.0.1, and the health check never
+# saw the LAPI it waited for. On an agent-only install the update could not
+# succeed at any timeout -- while reporting "LAPI not responding", which
+# reads as the remote LAPI being down rather than this container being built
+# wrong.
+_guard "the CrowdSec replacement inherits the running container's topology" \
+  "payload/bin/update.sh" "CS_INHERIT_ENV="
+_guard "the inherited environment is actually passed to podman run" \
+  "payload/bin/update.sh" '\${CS_INHERIT_ENV}'
+# Every agent-only variable the installer can set must be carried forward;
+# inheriting some and dropping others is the same defect in miniature.
+_cs_missing=""
+for _v in $(grep -rhoE '\-e (DISABLE_LOCAL_API|LOCAL_API_URL|DISABLE_AGENT)' \
+            "$REPO/payload/stages" "$REPO/payload/bin" 2>/dev/null \
+            | awk '{print $2}' | sort -u); do
+  grep -q "for _csv_name in.*${_v}" "$REPO/payload/bin/update.sh" 2>/dev/null \
+    || _cs_missing="${_cs_missing} ${_v}"
+done
+if [ -n "$_cs_missing" ]; then
+  _f "CrowdSec topology variable(s) not carried across an update:${_cs_missing}" \
+     "the replacement container is built with a different shape than the original"
+else
+  _p "every CrowdSec topology variable the installer sets is carried across updates"
 fi
 
 # ── Result ───────────────────────────────────────────────────────────────────
