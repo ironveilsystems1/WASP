@@ -475,6 +475,91 @@ fi
 if want_section security; then
 section security "Security"
 
+# --- PHP version floor: CVE-2026-109618 / CVE-2026-109619 -------------------
+#
+# Two critical unauthenticated RCE flaws in PHP core, patched 21 October 2026
+# and known publicly as "php2shell". Both are reachable over HTTP with no
+# credentials; this stack runs Apache with mod_php, which upstream names as
+# the highest-risk configuration because 109618 can be reached before any
+# application code executes.
+#
+# This check exists because of how WASP pins images. Tags are resolved to a
+# DIGEST at install time, which is the right call for reproducibility and
+# supply-chain integrity -- and it means a VM installed before 21 October
+# keeps running the pre-patch PHP indefinitely, no matter how many times the
+# upstream tag is rebuilt. The pin that protects the install from a tampered
+# image also holds it on a vulnerable one. Nothing else in this validator
+# would notice.
+#
+# So the version is read from the running container rather than inferred from
+# the tag: a tag says what was asked for, the binary says what is serving.
+_php_floor() {   # branch -> first fixed patch release
+  case "$1" in
+    8.2) echo 35 ;;
+    8.3) echo 36 ;;
+    8.4) echo 27 ;;
+    8.5) echo 12 ;;
+    *)   echo "" ;;
+  esac
+}
+
+_phpver=$(podman exec wordpress php -r 'echo PHP_VERSION;' 2>/dev/null \
+          | tr -d '\r' | head -1)
+if [ -z "$_phpver" ]; then
+  warn "PHP version could not be read from the wordpress container" \
+       "Without it this check cannot tell a patched runtime from a vulnerable one, so it reports nothing rather than passing." \
+       "podman exec wordpress php -v"
+else
+  _branch=$(printf '%s' "$_phpver" | cut -d. -f1,2)
+  _patch=$(printf '%s' "$_phpver" | cut -d. -f3 | tr -cd '0-9')
+  _need=$(_php_floor "$_branch")
+  if [ -z "$_need" ]; then
+    # An unlisted branch is either older than everything patched (7.x, 8.0,
+    # 8.1 — all end-of-life and unpatched upstream) or newer than this table.
+    # Both deserve a human, and neither deserves a pass.
+    warn "PHP ${_phpver} is on a branch this check does not know" \
+         "Branches 8.2 / 8.3 / 8.4 / 8.5 have known fixed releases for CVE-2026-109618 and CVE-2026-109619. Anything else is either end-of-life and receiving no upstream fix, or newer than this validator." \
+         "Confirm against https://www.php.net/ChangeLog-8.php"
+  elif [ "${_patch:-0}" -lt "$_need" ]; then
+    fail "PHP ${_phpver} is vulnerable to CVE-2026-109618 / CVE-2026-109619" \
+         "Unauthenticated remote code execution, reachable over plain HTTP, executing as the web worker. This stack serves through Apache mod_php, where 109618 is reachable before any application code runs — no login slug, allow list or mu-plugin sits in front of it. Branch ${_branch} is fixed in ${_branch}.${_need}." \
+         "update.sh digest-check   # the image digest is pinned; it must be re-resolved, not just re-pulled"
+  else
+    pass "PHP ${_phpver} carries the CVE-2026-109618 / 109619 fixes (${_branch}.${_need}+)"
+  fi
+fi
+
+# session.upload_progress is the documented trigger for 109619 and is on by
+# default. Checked separately from the version because it is the one part a
+# site can fix without a new image, and because an operator who cannot patch
+# today still needs to know whether the hedge is actually in place.
+_upl=$(podman exec wordpress php -r 'echo ini_get("session.upload_progress.enabled") ? "on" : "off";' 2>/dev/null | tr -d '\r')
+case "$_upl" in
+  off) pass "session.upload_progress is disabled (removes the CVE-2026-109619 trigger)" ;;
+  on)  warn "session.upload_progress is enabled" \
+            "It is the documented trigger for CVE-2026-109619 and is on by default. WordPress core does not use it. This is a hedge, not a fix — the fix is the PHP version above." \
+            "Add 'session.upload_progress.enabled = Off' to /home/wpuser/wp/php-conf/security.ini, then: podman restart wordpress" ;;
+  *)   : ;;   # unreadable; the version check above is the one that matters
+esac
+
+# The image's own remoteip.conf declares every RFC1918 range an internal proxy.
+# It is masked by a bind mount carried in wp-run-extra.env. Asked of the running
+# container because the install log is not evidence: 10.5 printed "masked" and
+# then rebuilt the container without the mount. Output-based, so a failed exec
+# cannot read as a pass.
+_rim=$(podman exec wordpress sh -c \
+  'if [ -s /etc/apache2/conf-enabled/remoteip.conf ]; then echo active; else echo masked; fi' \
+  2>/dev/null | tr -d '\r') || _rim=""
+case "$_rim" in
+  masked) pass "Image default remoteip.conf is masked" ;;
+  active) fail "The image's default remoteip.conf is active" \
+               "It trusts 10/8, 172.16/12 and 192.168/16 as internal proxies, so Apache accepts X-Forwarded-For from any private address, not only ${PROXY_IP:-the configured proxy}, and an internal client can present any address it likes to the wp-admin allow list." \
+               "wp-hardening.sh proxy-check   # the remedy is the mount in /etc/wp-install/wp-run-extra.env" ;;
+  *)      warn "Could not read remoteip.conf from the wordpress container" \
+               "Without it this check cannot tell a masked file from an active one, so it reports nothing rather than passing." \
+               "podman ps ; podman exec wordpress ls -l /etc/apache2/conf-enabled/remoteip.conf" ;;
+esac
+
 # --- Custom login slug: the end-to-end test this script never had ---
 if [ -n "${WP_ADMIN_SLUG}" ]; then
   # The BARE slug is the login URL. The "-login" suffix was removed because a
@@ -612,7 +697,7 @@ if grep -q 'Require ip' "$APACHE_CONF" 2>/dev/null; then
   # DEDUPLICATE. The same allow list appears in more than one <Directory>
   # block (wp-admin and the custom login slug), and an allow list can now hold
   # several addresses, so a naive concatenation printed
-  # "192.168.100.0/24 72.208.112.108 192.168.100.0/24 72.208.112.108" and read
+  # "192.168.100.0/24 203.0.113.42 192.168.100.0/24 203.0.113.42" and read
   # like a config bug when the config was correct. Split on whitespace, keep
   # first occurrences, and strip any trailing comment the sed picked up.
   _cfg_ips=$(grep 'Require ip' "$APACHE_CONF" 2>/dev/null \
@@ -659,13 +744,34 @@ else
        "rc-service nftables restart ; nft list ruleset | head -40"
 fi
 
-if rc-service cs-firewall-bouncer status 2>/dev/null | grep -q started; then
-  pass "CrowdSec firewall bouncer running"
-else
-  warn "CrowdSec firewall bouncer is not running" \
-       "Detections are logged but bans are never enforced at the firewall." \
-       "rc-service cs-firewall-bouncer restart ; tail -30 /var/log/crowdsec/crowdsec.log"
-fi
+# Judged against what this VM was BUILT to do. Stage 09 installs this bouncer
+# only under CS_ENFORCEMENT=local, so asking the same question of every VM
+# warned on every agent-only tenant, about a service that does not exist there,
+# with a restart command that could not work.
+_bouncer_up=0
+rc-service cs-firewall-bouncer status 2>/dev/null | grep -q started && _bouncer_up=1
+case "${CS_ENFORCEMENT:-local}" in
+  upstream)
+    if [ "$_bouncer_up" = "1" ]; then
+      warn "A local CrowdSec firewall bouncer is running on an agent-only VM" \
+           "Client addresses reach this VM only inside X-Forwarded-For; packets arrive from the proxy. A ban here matches nothing and looks like enforcement." \
+           "rc-service cs-firewall-bouncer stop ; rc-update del cs-firewall-bouncer default"
+    else
+      pass "No local firewall bouncer — enforcement is upstream, by design"
+    fi ;;
+  detect-only)
+    warn "CrowdSec is detect-only" \
+         "Detections are recorded and nothing enforces them. Fix the LAPI credentials, then this VM reports upstream." \
+         "wp-hardening.sh cs-doctor" ;;
+  *)
+    if [ "$_bouncer_up" = "1" ]; then
+      pass "CrowdSec firewall bouncer running"
+    else
+      warn "CrowdSec firewall bouncer is not running" \
+           "Detections are logged but bans are never enforced at the firewall." \
+           "rc-service cs-firewall-bouncer restart ; tail -30 /var/log/crowdsec/crowdsec.log"
+    fi ;;
+esac
 
 if [ "${GEOIP_ENABLED:-0}" = "1" ]; then
   if podman exec wordpress apachectl -M 2>/dev/null | grep -q maxminddb; then

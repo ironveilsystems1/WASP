@@ -140,7 +140,13 @@ DB_IMAGE="docker.io/mariadb:11.4"
 # collection this script enables) and CVE-2026-44981 (a LAPI DoS via
 # unbounded gzip decompression — lower impact here since LAPI is bound to
 # 127.0.0.1 only, but still worth the patch).
-CROWDSEC_IMAGE="docker.io/crowdsecurity/crowdsec:v1.7.8"
+#
+# v1.7.8 → v1.8.1 in 10.6. The two DoS fixes in v1.8.0 are in the HTTP and
+# Kubernetes audit datasources, which this stack does not acquire from, so this
+# is not a security bump. It is fleet parity: agent-only v1.8.1 is what has run
+# against a live attacker in production, and a new VM on v1.7.8 would be the
+# only one on it.
+CROWDSEC_IMAGE="docker.io/crowdsecurity/crowdsec:v1.8.1"
 
 STAGE_FILE=/var/lib/wp-install-stage
 STAGE=$(cat "$STAGE_FILE" 2>/dev/null || echo 1)

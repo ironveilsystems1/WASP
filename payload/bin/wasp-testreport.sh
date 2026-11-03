@@ -307,31 +307,28 @@ cat <<'EOS'
 # ── 15. Perimeter (external validation) ──────────────────────────────────────
 if [ -n "$PERIMETER" ]; then
   section "15. PERIMETER — controls as an outside client sees them"
-  _ph=$(command -v wasp-pentest.sh 2>/dev/null || echo /usr/local/bin/wasp-pentest.sh)
-  if [ ! -x "$_ph" ]; then
-    ok "The external harness is NOT on this VM — which is correct."
-    inf "It lives in tools/wasp-pentest.sh, deliberately outside the payload, so"
-    inf "a compromised VM does not hand an attacker a ready-made scanner. And"
-    inf "the test that matters is from an address NOT on your admin allow list,"
-    inf "which this VM is not. Run it from your Kali box instead:"
-    inf "  scp tools/wasp-pentest.sh kali:~/ && ssh kali"
-    inf "  ./wasp-pentest.sh ${PERIMETER}"
-    inf "  ./wasp-pentest.sh --ip <this-vm-ip> ${PERIMETER}   # also tests WEB_CIDR"
-  else
-    # Running from the VM answers "are the controls working" but NOT "are they
-    # working against an unauthorised source" -- this host is on the LAN and
-    # very likely allow-listed, so admin endpoints will answer here and be
-    # refused elsewhere. Say so plainly rather than let a green result mislead.
-    inf "Running the external harness from THIS VM against ${PERIMETER}."
-    inf "Caveat: this host is on the LAN and probably allow-listed, so admin"
-    inf "endpoints may answer here that an outside attacker cannot reach. For"
-    inf "the real access-control test, run wasp-pentest.sh from off-LAN too."
-    echo ""
-    # Non-interactive: the harness normally asks for "I OWN THIS"; feed it,
-    # because running your own testreport against your own VM IS the
-    # authorisation, and a report should not block on a prompt.
-    printf 'I OWN THIS\n' | "$_ph" "$PERIMETER" 2>&1 | sed 's/^/  /' || true
-  fi
+  # The external harness moved out of this repository in 10.5 and is now its
+  # own project. It was never installed on the VM anyway -- deliberately, so a
+  # compromised box does not hand an attacker a ready-made scanner -- so this
+  # section has always been a pointer rather than a test.
+  #
+  # The pointer is kept because the thing it points at is the only check that
+  # can answer the question this report cannot: not "is the control
+  # configured" but "does it have an effect, seen from where an attacker
+  # stands". Every defect found on a live WASP install to date was visible
+  # from outside and invisible to on-box configuration checks.
+  inf "The external harness is not part of this repository as of 10.5."
+  inf "It is a separate project, and it is not installed on this VM by design:"
+  inf "a compromised box should not come with a scanner already on it."
+  echo ""
+  inf "This report checks that controls are CONFIGURED. It cannot check that"
+  inf "they have an EFFECT, because this host is on the LAN and very likely"
+  inf "on the admin allow list -- so admin endpoints answer here that an"
+  inf "outside client cannot reach. A green report is not a tested perimeter."
+  echo ""
+  inf "Run the external harness against ${PERIMETER} from a machine that is"
+  inf "NOT on your admin allow list. The difference between that run and one"
+  inf "from an allow-listed address IS the access control, demonstrated."
   echo ""
 fi
 

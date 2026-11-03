@@ -106,7 +106,7 @@ WORDFENCE_FEED="${WORDFENCE_FEED:-scanner}"
 [ -r "$VULN_CONF" ] && . "$VULN_CONF"
 
 # Compare two dotted version strings. Returns 0 if $1 <= $2.
-# WordPress plugin versions are not strict semver (1.2, 1.2.3, 1.2.3.4 all
+# WordPress plugin versions are not strict semver (1.2, 1.2.3, 203.0.113.4 all
 # occur), so this pads to four fields and compares numerically field by field
 # rather than relying on sort -V, which BusyBox does not implement
 # consistently.

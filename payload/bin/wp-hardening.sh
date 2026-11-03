@@ -746,7 +746,7 @@ SNIPPET
     printf '# itself, assets, the REST API -- goes through NPM default config,\n'
     printf '# which does not forward the client address. Apache then sees the\n'
     printf '# PROXY as the client for those, and the symptom is a log where\n'
-    printf '# /boob shows the real IP while / shows 192.168.x.x.\n'
+    printf '# %s shows the real IP while / shows 192.168.x.x.\n' "$_loginpath"
     printf '#\n'
     printf '# When that happens, three controls degrade together and none of\n'
     printf '# them says so: rate limiting becomes collective (one person\n'
@@ -765,6 +765,24 @@ SNIPPET
     printf '# states the truth and removes the class of bug entirely.\n'
     printf 'proxy_set_header X-Forwarded-For   \$remote_addr;\n'
     printf 'proxy_set_header X-Forwarded-Proto \$scheme;\n\n'
+    printf '# ── admin-ajax.php MUST stay open ──────────────────────────────\n'
+    printf '# The PUBLIC front end calls this: Elementor, contact forms, and\n'
+    printf '# most plugins with any interactive element. The admin location\n'
+    printf '# below matches /wp-admin/ and therefore matches this path too,\n'
+    printf '# so without this block an IP restriction on the admin area also\n'
+    printf '# breaks the site for ordinary visitors -- while every admin page\n'
+    printf '# keeps working, so the cause is not where anyone looks.\n'
+    printf '#\n'
+    printf '# An EXACT-match location (=) outranks a regex location whatever\n'
+    printf '# the order in the file, which is what keeps this one path open\n'
+    printf '# without widening the restriction by a single byte.\n'
+    printf 'location = /wp-admin/admin-ajax.php {\n'
+    printf '    proxy_pass http://%s:80;\n' "${_vmip:-VM_IP}"
+    printf '    proxy_set_header Host              \$host;\n'
+    printf '    proxy_set_header X-Real-IP         \$remote_addr;\n'
+    printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
+    printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
+    printf '}\n\n'
     printf 'location ~* ^/(wp-admin/|wp-login\\.php'
     [ -n "$_slug" ] && printf '|%s' "$_slug"
     printf ') {\n'
@@ -796,6 +814,23 @@ SNIPPET
     printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
     printf '}\n\n'
     printf 'location = /xmlrpc.php { deny all; }\n\n'
+    printf '# ── Never serve these, whatever WordPress or a plugin thinks ───\n'
+    printf '# readme.html and license.txt publish the exact core version, which\n'
+    printf '# is the first thing a scanner reads to pick an exploit. wp-config\n'
+    printf '# should never be served, but a PHP outage serves it as plain text.\n'
+    printf 'location ~* ^/(wp-config\\.php|readme\\.html|license\\.txt)$ { deny all; }\n\n'
+    printf '# .well-known FIRST. The dotfile rule below would otherwise block\n'
+    printf '# ACME challenges and security.txt, since the path begins with a\n'
+    printf '# dot -- and a blocked ACME challenge means certificate renewal\n'
+    printf '# fails silently, weeks later, with no connection to this change.\n'
+    printf '# ^~ makes it a prefix match, which beats the regex either way.\n'
+    printf 'location ^~ /.well-known/ { proxy_pass http://%s:80; }\n' "${_vmip:-VM_IP}"
+    printf 'location ~* /\\.(git|env|svn|ht) { deny all; }\n\n'
+    printf '# Uploads must never execute. This is the control that would have\n'
+    printf '# contained the web shell found in a client import -- it sat in\n'
+    printf '# wp-content/uploads for two years behind a plugin directory name.\n'
+    printf '# Apache enforces this too; two layers that fail differently.\n'
+    printf 'location ~* ^/wp-content/uploads/.*\\.(php|phtml|phar|php[0-9])$ { deny all; }\n\n'
     printf '# ── Security headers, set at the EDGE ──────────────────────────\n'
     printf '# The VM already sets these in Apache. An external scan of a live\n'
     printf '# deployment found NONE of them reaching the internet — only HSTS,\n'
@@ -1586,16 +1621,37 @@ SNIPPET2
     # beyond the configured proxy AND discards a LAN client's real address as
     # "an internal hop". Checked here because it is invisible in the generated
     # config -- it lives in a file WASP does not write.
-    if podman exec wordpress test -L /etc/apache2/conf-enabled/remoteip.conf 2>/dev/null; then
+    # -s, not -L: once masked the path is an empty regular file, so the
+    # question is whether Apache is reading DIRECTIVES from it, not how the
+    # image happens to ship it.
+    if podman exec wordpress test -s /etc/apache2/conf-enabled/remoteip.conf 2>/dev/null; then
       echo ""
       echo "  ⚠  The image's default remoteip.conf is ENABLED."
       echo "     It declares 10/8, 172.16/12 and 192.168/16 as internal proxies,"
       echo "     so Apache accepts X-Forwarded-For from ANY private address --"
       echo "     not only ${PROXY_IP:-the configured proxy} -- and discards the"
       echo "     real address of any client sharing a private range with it."
-      echo "     Remove it; wp-security.conf already sets RemoteIPHeader:"
+      echo ""
+      echo "     Removing it inside the container DOES NOT HOLD: the file is in"
+      echo "     the image layer, so it returns on the next container rebuild."
+      echo "     That is how it came back on a provisioned VM. Mask it instead,"
+      echo "     which survives every rebuild:"
+      echo ""
+      echo "       doas sh -c ': > /home/wpuser/wp/apache-conf/remoteip-masked.conf'"
+      echo "       doas chmod 0644 /home/wpuser/wp/apache-conf/remoteip-masked.conf"
+      echo ""
+      echo "     then add this to WP_EXTRA_VOLS in /etc/wp-install/wp-run-extra.env,"
+      echo "     which is the one list the GeoIP rebuild, the OpenRC service and"
+      echo "     update.sh all read, and recreate the container:"
+      echo ""
+      echo "       -v /home/wpuser/wp/apache-conf/remoteip-masked.conf:/etc/apache2/conf-enabled/remoteip.conf:ro"
+      echo ""
+      echo "     A VM provisioned from 10.6 does this automatically. Mounted"
+      echo "     anywhere else it lasts until the next rebuild, which is how a"
+      echo "     10.5 install lost it. For an immediate stop-gap until then:"
       echo "       doas podman exec wordpress rm /etc/apache2/conf-enabled/remoteip.conf"
       echo "       doas podman exec wordpress apache2ctl -k graceful"
+      echo "     -- effective now, gone at the next rebuild."
     fi
 
     _al=/home/wpuser/wp/logs/access.log

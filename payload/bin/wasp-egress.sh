@@ -422,7 +422,34 @@ allow|deny)
     _ok "Allowed: ${_dom}"
     _warn "Every entry is a route out for a compromised site. Review periodically."
   else
-    grep -vxF "$_dom" "$RUNTIME" > "${RUNTIME}.tmp" && mv -f "${RUNTIME}.tmp" "$RUNTIME"
+    # BUG FIX (found on a live VM, 2026-10-20): this was
+    #   grep -v … > tmp && mv -f tmp "$RUNTIME"
+    # and `mv` REPLACES THE INODE. allowlist-runtime.txt is bind-mounted into
+    # the Squid container as a SINGLE FILE, so the container goes on reading
+    # the old inode and never sees the removal.
+    #
+    # The failure is the dangerous shape: this printed "Removed: <domain>"
+    # and "Squid reloaded", Squid dutifully reloaded from the stale inode,
+    # and the domain stayed permitted. A revocation that reports success and
+    # does nothing is worse than one that fails loudly -- the operator has
+    # no reason to check, and an egress route they believe is closed is open.
+    #
+    # `allow` never hit this because it APPENDS, which keeps the inode. That
+    # is why adding a domain took effect instantly and removing one never
+    # did.
+    #
+    # cat > truncates and rewrites in place, preserving the inode.
+    grep -vxF "$_dom" "$RUNTIME" > "${RUNTIME}.tmp" \
+      && cat "${RUNTIME}.tmp" > "$RUNTIME" \
+      && rm -f "${RUNTIME}.tmp"
+    # Verify from INSIDE the container, which is the only view that decides
+    # policy. Checking the host file would re-create the same blind spot.
+    if podman exec squid grep -qxF "$_dom" /etc/squid/allowlist-runtime.txt 2>/dev/null; then
+      _bad "${_dom} is STILL present in Squid's view of the allowlist."
+      _note "  The host file was written but the container did not see it."
+      _note "  Restart Squid to re-establish the mount:  podman restart squid"
+      exit 1
+    fi
     _ok "Removed: ${_dom}"
   fi
   podman exec squid squid -k parse 2>/dev/null && podman exec squid squid -k reconfigure 2>/dev/null \

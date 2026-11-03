@@ -277,6 +277,22 @@ cat > /home/wpuser/wp/apache-conf/geoip.conf << GEOIPCONF
             # the connection address with the real client IP from
             # X-Forwarded-For before authorization runs, so a remote visitor
             # is still matched on their own address, not the proxy's.
+            #
+            # DO NOT narrow these to the deployment's specific VLANs. It
+            # looks like over-granting and is not, for two reasons:
+            #
+            #   - This is the COUNTRY test, not the admin allowlist. Since
+            #     AuthMerging And above, reaching wp-admin still requires
+            #     passing the allowlist in wp-security.conf as well. A wide
+            #     range here grants a LAN client the public site, which they
+            #     were always going to have.
+            #   - Podman's own container network lives in 10.89.0.0/16, and
+            #     the in-container health check calls 127.0.0.1. Narrowing to
+            #     the site VLANs 403s both, and the install can then never
+            #     see WordPress as healthy.
+            #
+            # Narrowing admin access is done where admin access is decided:
+            # ADMIN_CIDR in wp-security.conf, and the allow list at the proxy.
             Require ip 127.0.0.1
             Require ip ::1
             Require ip 10.0.0.0/8

@@ -154,9 +154,53 @@ fetch)
     url)
       case "$_src" in https://*|http://*) : ;; *) _bad "Give a http(s) URL"; exit 1 ;; esac
       _name=$(basename "${_src%%\?*}")
+      # BUG FIX: a share link ends in an ACCESS TOKEN, not a filename:
+      #   .../share/331434/backup/melroseg.zip/5eDFlx9VLGw
+      # basename gave "5eDFlx9VLGw", so a 653 MB archive landed with no
+      # extension and a name that matches nothing the operator asked for.
+      # `inspect melroseg.zip` then reported "Not found", which reads as the
+      # download having failed when it had in fact succeeded.
+      #
+      # Prefer a path segment that looks like an archive, which is where
+      # these services put the real name.
+      case "$_name" in
+        *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.gz|*.sql|*.wpress) : ;;
+        *)
+          _cand=$(printf '%s' "${_src%%\?*}" | tr '/' '\n' \
+                  | grep -iE '\.(zip|tar|tar\.gz|tgz|tar\.bz2|tar\.xz|wpress|sql)$' \
+                  | tail -1)
+          if [ -n "$_cand" ]; then
+            _note "URL ends in a token; using '${_cand}' from the path instead."
+            _name="$_cand"
+          fi ;;
+      esac
       case "$_name" in ''|*/*) _name="import-$(date -u +%Y%m%d-%H%M%S).bin" ;; esac
+      # BUG FIX: this called curl with no proxy. On every VM running the
+      # egress filtering that is the whole point of this product, the request
+      # is dropped at the firewall and the download simply fails -- so a
+      # documented path could not work on a correctly configured install.
+      #
+      # Squid is the only reachable destination for outbound HTTP here, and
+      # the fetch must also be allowlisted: an import source is an arbitrary
+      # host, so `wasp-egress.sh allow <host>` is part of this workflow, not
+      # an obstacle to route around.
+      _imp_proxy=""
+      if [ "${EGRESS_PROXY:-0}" = "1" ] || podman container exists squid 2>/dev/null; then
+        _imp_proxy="${WASP_PROXY_URL:-http://10.89.10.2:3128}"
+        _note "Fetching through the egress proxy (${_imp_proxy})."
+        _note "  If this is refused, allow the host first:"
+        _note "    doas wasp-egress.sh allow $(printf '%s' "$_src" | sed 's|^[a-z]*://||; s|/.*||')"
+      fi
       _note "Downloading to ${INBOX}/${_name} …"
-      curl -fL --progress-bar -o "${INBOX}/${_name}" "$_src" || { _bad "Download failed."; exit 1; }
+      if [ -n "$_imp_proxy" ]; then
+        curl -fL --progress-bar -x "$_imp_proxy" -o "${INBOX}/${_name}" "$_src" \
+          || { _bad "Download failed."
+               _note "A 403 from the proxy means the host is not allowlisted."
+               _note "Check:  podman exec squid tail -5 /var/log/squid/access.log"
+               exit 1; }
+      else
+        curl -fL --progress-bar -o "${INBOX}/${_name}" "$_src" || { _bad "Download failed."; exit 1; }
+      fi
       # A share page returns HTML that is the right shape and the wrong thing.
       # Catching it here saves a confusing failure three steps later.
       if head -c 512 "${INBOX}/${_name}" | grep -qi '<!doctype html\|<html'; then
@@ -387,8 +431,34 @@ extract)
   fi
 
   # Collect any SQL dumps into db/ so the scan knows where to look.
-  find "${_st}/files" -maxdepth 3 \( -name '*.sql' -o -name '*.sql.gz' -o -name '*-db.gz' \) \
+  #
+  # BUG FIX: maxdepth 3 missed the common case. UpdraftPlus writes its
+  # backups to wp-content/updraft/, which inside a cPanel account archive is
+  # <account>/public_html/wp-content/updraft/ -- depth 5. The dump was
+  # present and reported as absent, so the operator extracted it by hand.
+  #
+  # Depth is not the only issue: an archive routinely holds SEVERAL dumps
+  # from different dates (UpdraftPlus keeps a retention set). Silently
+  # taking the first one found is how a site gets restored from a backup
+  # eighteen months older than the operator believed. Collect them all and,
+  # when there is more than one, refuse to guess.
+  find "${_st}/files" -maxdepth 8 \
+    \( -name '*.sql' -o -name '*.sql.gz' -o -name '*-db.gz' -o -name '*.sql.bz2' \) \
     -exec mv {} "${_st}/db/" \; 2>/dev/null || true
+
+  _ndumps=$(ls -1 "${_st}/db" 2>/dev/null | grep -c .) || _ndumps=0
+  if [ "${_ndumps:-0}" -gt 1 ]; then
+    echo ""
+    _warn "${_ndumps} database dumps found. This archive holds more than one."
+    _note "  Dates matter: restoring the wrong one silently reverts the site"
+    _note "  to whenever that backup was taken."
+    ls -1t "${_st}/db" 2>/dev/null | while IFS= read -r _d; do
+      printf '    %-58s %s\n' "$_d" \
+        "$(date -u -r "${_st}/db/${_d}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+    done
+    _note "  Keep the one you want and remove the rest before importing:"
+    _note "    rm ${_st}/db/<unwanted>"
+  fi
 
   _nf=$(find "${_st}/files" -type f 2>/dev/null | grep -c .) || _nf=0
   _nd=$(ls -1 "${_st}/db" 2>/dev/null | grep -c .) || _nd=0
@@ -574,17 +644,70 @@ apply)
   _note "this VM's own are kept, because those are exactly where a compromised"
   _note "source hides things that survive a content clean."
   printf "  Type IMPORT to proceed: "
-  read -r _cf
+  # BUG FIX: a bare `read` cannot tell "the operator declined" from "there is
+  # nobody to ask". Run under `qm guest exec`, cron or any pipe, read returns
+  # immediately on EOF and this printed "Cancelled — nothing changed", which
+  # is exactly what it prints when the operator types anything else.
+  #
+  # An operator ran this over the guest agent, read "Cancelled", and
+  # reasonably took it as their own answer -- then ran the follow-up steps
+  # against a database that had never been imported. Say which it was.
+  if ! read -r _cf; then
+    echo ""
+    echo "  ✗  No input available — this confirmation cannot be answered here." >&2
+    echo "     Nothing was cancelled by choice; there was no one to ask." >&2
+    echo "" >&2
+    echo "     An import replaces the site's database. That confirmation stays" >&2
+    echo "     interactive by design. Run it from a terminal:" >&2
+    echo "       qm terminal <vmid>      (stay attached — detaching kills it)" >&2
+    echo "       or the hypervisor's console" >&2
+    exit 1
+  fi
   [ "$_cf" = "IMPORT" ] || { echo "  Cancelled — nothing changed."; exit 0; }
 
   # ── Normalise ────────────────────────────────────────────────────────────
   _hdr "Normalising"
   _q="${_st}/quarantined"; mkdir -p "$_q"
   _src="${_st}/files"
-  # Some archives nest the site one level down.
-  [ -d "${_src}/wp-content" ] || {
-    _cand=$(find "$_src" -maxdepth 2 -type d -name wp-content 2>/dev/null | head -1)
-    [ -n "$_cand" ] && _src=$(dirname "$_cand") && _note "Site root: ${_src#${_st}/}"; }
+  # Some archives nest the site. A cPanel/WHM full-account backup puts it at
+  # <account>/public_html/, which is depth 2 -- and this searched to
+  # maxdepth 2 for wp-content itself, i.e. depth 3. It therefore found
+  # nothing, and the operator worked around the pipeline by extracting and
+  # copying by hand. That detour bypassed the scan gate, and the tree they
+  # copied in contained a webshell.
+  #
+  # So the depth limit was not a cosmetic bug: it is what pushed a
+  # compromised upload tree past the control designed to catch it.
+  #
+  # Search deeper, but choose carefully. A real backup contains DECOYS --
+  # wp-content/updraft/plugins-old/, upgrade-temp-backup/, nested archives
+  # of previous sites -- each with their own wp-content. Two rules:
+  #
+  #   1. A site root has wp-content AND (wp-includes OR wp-config.php).
+  #      A backup folder inside wp-content has neither.
+  #   2. Prefer the SHALLOWEST match. The real site is always closer to the
+  #      archive root than a backup buried inside it.
+  if [ ! -d "${_src}/wp-content" ]; then
+    _cand=$(find "$_src" -maxdepth 6 -type d -name wp-content 2>/dev/null \
+            | while IFS= read -r _c; do
+                _p=$(dirname "$_c")
+                if [ -d "${_p}/wp-includes" ] || [ -f "${_p}/wp-config.php" ]; then
+                  printf '%s\t%s\n' "$(printf '%s' "$_c" | tr -cd / | wc -c)" "$_c"
+                fi
+              done | sort -n | head -1 | cut -f2)
+    if [ -n "$_cand" ]; then
+      _src=$(dirname "$_cand")
+      _note "Site root: ${_src#${_st}/}"
+    else
+      # Say so rather than silently importing nothing. An import that
+      # quietly finds no files looks identical to one with nothing to do.
+      _warn "No WordPress site root found in the archive."
+      _note "  Looked for a directory holding wp-content alongside"
+      _note "  wp-includes or wp-config.php, up to 6 levels deep."
+      _note "  Contents:"
+      find "$_src" -maxdepth 2 -type d 2>/dev/null | sed "s|^${_src}|    .|" | head -12
+    fi
+  fi
 
   for _drop in wp-config.php wp-config-sample.php .htaccess .user.ini; do
     [ -e "${_src}/${_drop}" ] && { mv "${_src}/${_drop}" "$_q/" 2>/dev/null
@@ -623,7 +746,30 @@ apply)
 
   # ── Database ─────────────────────────────────────────────────────────────
   _hdr "Importing database"
-  _dump=$(ls -1 "${_st}/db"/* 2>/dev/null | head -1)
+  # BUG FIX: this was `ls -1 ... | head -1`, which takes the first
+  # ALPHABETICALLY. An UpdraftPlus retention set holds several dated dumps,
+  # and backup_2025-08-21... sorts before backup_2026-04-14..., so the
+  # oldest was chosen silently. Restoring a site to eighteen months earlier
+  # than the operator believes is not a failure they would notice quickly:
+  # the site comes up, looks plausible, and is simply missing a year of
+  # content.
+  #
+  # Refuse to guess. Which backup to restore is a decision, not a default.
+  _dumps=$(ls -1 "${_st}/db"/* 2>/dev/null | grep -v '/normalised\.sql$' || true)
+  _ndump=$(printf '%s\n' "$_dumps" | grep -c . 2>/dev/null) || _ndump=0
+  if [ "${_ndump:-0}" -gt 1 ]; then
+    _bad "${_ndump} database dumps are staged. Refusing to choose between them."
+    printf '%s\n' "$_dumps" | while IFS= read -r _d; do
+      [ -n "$_d" ] || continue
+      printf '    %-58s %s\n' "$(basename "$_d")" \
+        "$(date -u -r "$_d" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" >&2
+    done
+    _note "  Dates matter: the oldest sorts first, so a silent pick would"
+    _note "  have restored the stalest one. Keep one and re-run:"
+    _note "    rm ${_st}/db/<unwanted>  &&  wp-import.sh apply ${_id}"
+    exit 1
+  fi
+  _dump=$(printf '%s\n' "$_dumps" | head -1)
   if [ -z "$_dump" ]; then
     _warn "No dump — files imported, database unchanged."
   else
@@ -661,6 +807,44 @@ apply)
          'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "${WORDPRESS_DB_NAME:-wordpress}"' \
          < "$_sql" 2>/dev/null; then
       _ok "Database imported"
+
+      # ── Prefix keys, settled in SQL rather than in text ──────────────────
+      #
+      # BUG FIX (found on a live VM, 2026-10-20): the sed above rewrote the
+      # TABLE names correctly and left the capability KEYS behind, so the
+      # import "succeeded" and the site had no roles at all:
+      #
+      #   wp-cli:  Error: Role doesn't exist: administrator
+      #   admins:  (empty)
+      #
+      # The regex is right and works under both GNU and busybox sed, so the
+      # cause is dump-format specific -- quoting, line wrapping, extended
+      # inserts, whatever that particular backup plugin emits. Which is the
+      # point: rewriting VALUES by pattern-matching SQL text is guessing at
+      # someone else's serialiser. Table names must be rewritten in text
+      # because they are structural, but the keys do not have to be.
+      #
+      # So assert the outcome in SQL, where it is exact and format-blind.
+      # This runs whether or not the text pass appeared to work, because
+      # "appeared to work" is precisely what went wrong.
+      if [ "$_theirpfx" != "$_ourpfx" ]; then
+        _oldhex=$(printf '%s%%' "$_theirpfx" | od -An -tx1 | tr -d ' \n')
+        _newhex=$(printf '%s' "$_ourpfx"     | od -An -tx1 | tr -d ' \n')
+        _cut=$(( ${#_theirpfx} + 1 ))
+        _fixsql="UPDATE ${_ourpfx}options  SET option_name = CONCAT(0x${_newhex}, SUBSTRING(option_name, ${_cut})) WHERE option_name LIKE 0x${_oldhex};
+UPDATE ${_ourpfx}usermeta SET meta_key   = CONCAT(0x${_newhex}, SUBSTRING(meta_key,   ${_cut})) WHERE meta_key   LIKE 0x${_oldhex};
+SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHERE option_name LIKE 0x${_oldhex}) + (SELECT COUNT(*) FROM ${_ourpfx}usermeta WHERE meta_key LIKE 0x${_oldhex}));"
+        _fixout=$(printf '%s\n' "$_fixsql" | podman exec -i mariadb sh -c \
+                    'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -N -B "${WORDPRESS_DB_NAME:-wordpress}"' \
+                    2>/dev/null | grep '^stranded-remaining:' | cut -d: -f2)
+        case "${_fixout:-}" in
+          0) _ok "  Prefix keys verified in SQL — none stranded" ;;
+          '') _warn "  Could not verify prefix keys. Check before trusting logins:" >&2
+              _note "    wp-forensics.sh admins" ;;
+          *)  _bad "  ${_fixout} key(s) still carry the source prefix."
+              _note "    Users will have no roles. wp-forensics.sh admins" ;;
+        esac
+      fi
     else
       _bad "Database import FAILED. Files were copied; the database is unchanged"
       _bad "or partially loaded. The pre-import backup is the newest file in"

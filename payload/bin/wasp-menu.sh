@@ -118,6 +118,1404 @@ _banner() {
 }
 
 # =============================================================================
+#  GUIDANCE LAYER — help cards, and a guided path for a first-time operator
+# =============================================================================
+# WHY THIS IS NOT A TUI
+#
+# The obvious way to make a menu friendly is whiptail, the way the Proxmox
+# community scripts do it. That would mean the `newt` package and its ncurses
+# dependencies on every hardened VM, to draw boxes. This project spends its
+# surface budget on things that defend the site, so the guidance is built out
+# of the same POSIX sh and ANSI the rest of the menu already uses.
+#
+# What a first-time operator actually lacks is not arrow keys. It is knowing
+# which option to pick, what it will ask, and what a correct answer looks
+# like. That is text, and text is free.
+#
+#   ?N   on any menu  -> a card for option N: what it does, when to use it,
+#                        what it will ask, and a worked example
+#   ?    on any menu  -> what the whole menu is for and where to start
+#
+# Every card answers the same four questions in the same order, so an
+# operator learns the shape once.
+# =============================================================================
+
+_rule() { printf '%s──────────────────────────────────────────────────────────────%s\n' "$DIM" "$R"; }
+
+_card() {   # $1 = title; body on stdin
+  clear 2>/dev/null || true
+  printf '%s┌──────────────────────────────────────────────────────────────┐%s\n' "$CYN" "$R"
+  # No right border on the title line. printf's %-58s pads by BYTES, and the
+  # em-dash in these titles is three bytes for one column, so a padded box
+  # closes two characters short on exactly the titles that use one. _banner
+  # has always left this edge open for the same reason; match it.
+  printf '%s│%s  %s%s%s\n' "$CYN" "$R" "$B" "$1" "$R"
+  printf '%s└──────────────────────────────────────────────────────────────┘%s\n' "$CYN" "$R"
+  echo ""
+  cat
+  echo ""
+  _pause
+}
+
+# Read a selection, intercepting help requests. Sets `c`, the variable every
+# submenu already dispatches on. After a card is shown, `c` is cleared so the
+# caller's loop falls through its case and redraws the menu -- which means no
+# submenu needed its dispatch touched to gain help.
+_sel() {    # $1 = help key prefix for this menu
+    _pfx="$1"
+    while :; do
+        printf '\n  select  %s(?N = help on option N,  ? = about this menu)%s : ' "$DIM" "$R"
+        read -r c || { c=q; return 0; }
+        case "$c" in
+            '?'|h|H|help) _help "${_pfx}.menu"; c=''; return 0 ;;
+            '?'*)         _help "${_pfx}.${c#\?}"; c=''; return 0 ;;
+            *)            return 0 ;;
+        esac
+    done
+}
+
+_help() {
+  case "$1" in
+
+  # ── Health ────────────────────────────────────────────────────────────────
+  health.menu) _card "Health & status — start here" <<'EOF'
+  Everything in this menu is READ-ONLY. Nothing changes the site, so you can
+  run any of it on a live production VM without a maintenance window.
+
+  Where to start:
+    New VM you just built ........ 2 (full validation)
+    Something feels wrong ........ 1 (quick check), then 2
+    Handing the VM to a client ... 3 (a report you can send)
+    Site is slow or erroring ..... 4, then 5
+EOF
+    ;;
+  health.1) _card "1 — Quick health check" <<'EOF'
+  WHAT IT DOES
+    Runs about a dozen fast probes: containers running, WordPress answering,
+    database reachable, certificate valid. Takes a few seconds.
+
+  WHEN TO USE IT
+    As a first look when something seems wrong, or in a script -- it sets an
+    exit code, so `validate-wordpress.sh --check && echo ok` works.
+
+  WHAT IT ASKS YOU
+    Nothing. It runs immediately.
+
+  EXAMPLE
+    Just press 1. You want a line reading OK. WARN means degraded but
+    serving; CRIT means the site is down or a control has failed open.
+EOF
+    ;;
+  health.2) _card "2 — Full validation (~45 checks)" <<'EOF'
+  WHAT IT DOES
+    The complete suite: every hardening control, the firewall, egress, MFA,
+    backups, mail, TLS, file permissions. One to two minutes.
+
+  WHEN TO USE IT
+    After building a VM, after any update, and before handing a site to a
+    client. This is the check that decides whether the VM is fit to hand over.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 2 and read the FAIL lines. Each one names the control and tells you
+    the command that fixes it. It does not stop at the first failure -- you
+    get the whole picture in one pass.
+EOF
+    ;;
+  health.3) _card "3 — Full test report (send-able)" <<'EOF'
+  WHAT IT DOES
+    Runs the validation suite and writes a single file you can send to a
+    client or keep as commissioning evidence.
+
+  WHEN TO USE IT
+    At handover, or when a client asks "is it secure?" and wants something
+    on paper.
+
+  WHAT IT ASKS YOU
+    Nothing. It prints the path of the report when it finishes.
+
+  EXAMPLE
+    Press 3, then copy the report off the VM with scp. Note the -O flag:
+      scp -O admin@10.20.101.10:/var/log/wasp-testreport-*.txt .
+EOF
+    ;;
+  health.4) _card "4 — Container / WordPress health" <<'EOF'
+  WHAT IT DOES
+    Checks the WordPress container specifically: HTTP responding, PHP
+    executing, the database name resolving, database auth working, and a real
+    query returning. Five separate things that all present as "site down".
+
+  WHEN TO USE IT
+    The site is erroring and you need to know WHICH layer broke.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 4. If PHP executes but the query fails, the problem is the database
+    or its credentials, not WordPress.
+EOF
+    ;;
+  health.5) _card "5 — Database health" <<'EOF'
+  WHAT IT DOES
+    Checks MariaDB: running, accepting connections, the WordPress database
+    present, and table integrity.
+
+  WHEN TO USE IT
+    After option 4 points at the database, or after an unclean shutdown.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 5. A healthcheck stuck at "starting" forever is a known quirk of
+    running containers without systemd -- if queries work, the database is
+    fine regardless of what the status column says.
+EOF
+    ;;
+
+  # ── Backup ────────────────────────────────────────────────────────────────
+  backup.menu) _card "Backup & restore — the one to get right" <<'EOF'
+  A backup you have never restored is a hope, not a backup. This menu is
+  ordered so you can prove recovery rather than assume it.
+
+  First time on a new VM, in order:
+    2 ... is off-site configured at all?
+    7 ... if not, this tells you exactly what is missing
+    1 ... take a backup now
+    4 ... prove you can actually get it back  <- the one people skip
+
+  [!] marks actions that change or replace data. They ask you to type 'yes'.
+EOF
+    ;;
+  backup.1) _card "1 — Run a backup now" <<'EOF'
+  WHAT IT DOES
+    Dumps the database, compresses it, and writes it locally -- then pushes a
+    copy off-VM if off-site backup is configured.
+
+  WHEN TO USE IT
+    Before any change you might regret: an update, an import, a plugin
+    install, editing wp-config.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 1. If it says the local backup succeeded but the OFF-VM copy
+    failed, you are not protected against losing the VM. Use option 7.
+EOF
+    ;;
+  backup.2) _card "2 — Off-site backup status" <<'EOF'
+  WHAT IT DOES
+    Reports whether backups are leaving this VM, where they go, and when the
+    last one succeeded.
+
+  WHEN TO USE IT
+    First thing on any VM you have inherited or just built.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 2. "Off-VM backup is not configured" means every backup you have is
+    on the same disk as the site. That is the single most common gap on a
+    freshly built VM, and it is the one that matters when a host dies.
+EOF
+    ;;
+  backup.3) _card "3 — List off-site backups" <<'EOF'
+  WHAT IT DOES
+    Lists what is actually in the remote bucket, with dates and sizes.
+
+  WHEN TO USE IT
+    To confirm backups are arriving, and to pick one before a restore.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 3. Check the newest date against today. A list that stops three
+    weeks ago means backups have been failing silently for three weeks.
+EOF
+    ;;
+  backup.4) _card "4 — [!] Prove offsite recovery (restore drill)" <<'EOF'
+  WHAT IT DOES
+    Pulls a real encrypted backup from remote storage, decrypts it with your
+    recovery key, and verifies it restores. This is the only step that proves
+    recovery works end to end.
+
+  WHEN TO USE IT
+    Once per VM at commissioning, and periodically after. Until you have run
+    it, off-site recovery is an assumption.
+
+  WHAT IT ASKS YOU
+    Your recovery key, and confirmation ('yes'). It restores into a scratch
+    area, NOT over the live site.
+
+  EXAMPLE
+    Have the recovery key to hand before you start -- it is not stored on
+    this VM on purpose. If you cannot find it, that IS the finding.
+EOF
+    ;;
+  backup.5) _card "5 — [!] Restore from backup" <<'EOF'
+  WHAT IT DOES
+    Replaces the live database with a backup. This is destructive and real.
+
+  WHEN TO USE IT
+    After a bad update, a failed import, or a compromise -- when you want the
+    site back as it was.
+
+  WHAT IT ASKS YOU
+    Which backup, your recovery key if the backup is encrypted, and
+    confirmation ('yes').
+
+  EXAMPLE
+    Run option 1 FIRST. Restoring replaces the current state, and if the
+    restore turns out to be the wrong backup you will want the one you just
+    overwrote.
+EOF
+    ;;
+  backup.6) _card "6 — Self-test (local restore)" <<'EOF'
+  WHAT IT DOES
+    Takes a backup and restores it into a scratch database to prove the
+    backup/restore machinery works. Does not touch the live site.
+
+  WHEN TO USE IT
+    A safe rehearsal when you are not ready to run the full off-site drill
+    (option 4), or to check the local half after changing backup settings.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 6. It proves the mechanism, not your off-site copy. Option 4 is the
+    one that proves you could survive losing this VM.
+EOF
+    ;;
+  backup.7) _card "7 — Why is nothing off-VM?" <<'EOF'
+  WHAT IT DOES
+    Diagnoses off-site backup: credentials present, destination reachable,
+    bucket writable, encryption key set. Names the specific missing piece.
+
+  WHEN TO USE IT
+    Whenever option 2 says off-site is not configured or not working.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 7. It will tell you which of credentials / destination / key is
+    missing, and options 8 and 9 set those.
+EOF
+    ;;
+  backup.8) _card "8 — Replace storage credentials" <<'EOF'
+  WHAT IT DOES
+    Sets the access key and secret for your object storage (S3, Backblaze B2,
+    Wasabi, MinIO -- anything S3-compatible).
+
+  WHEN TO USE IT
+    First-time setup, or after rotating keys at the provider.
+
+  WHAT IT ASKS YOU
+    Access key ID, then secret access key. The secret is not echoed.
+
+  EXAMPLE
+    Access key ID      : AKIA2XYZEXAMPLE7PQ4R
+    Secret access key  : (typed, not shown)
+    Use a key scoped to ONE bucket with write-but-not-delete if your
+    provider supports it. A backup key that can delete is a ransomware target.
+EOF
+    ;;
+  backup.9) _card "9 — Change backup destination" <<'EOF'
+  WHAT IT DOES
+    Sets where backups are written: provider endpoint, bucket, and path.
+
+  WHEN TO USE IT
+    First-time setup, or moving a client to different storage.
+
+  WHAT IT ASKS YOU
+    An endpoint URL, a bucket name, and a path prefix.
+
+  EXAMPLE
+    Endpoint : https://s3.us-west-002.backblazeb2.com
+    Bucket   : ironveil-client-backups
+    Prefix   : client-a/
+    Give every client their own prefix, so one client's restore can never
+    reach another's data.
+EOF
+    ;;
+
+  # ── Security ──────────────────────────────────────────────────────────────
+  security.menu) _card "Security & hardening" <<'EOF'
+  Options 1-8 are read-only: they report, scan and test. Safe any time.
+
+  Options 10-14 CHANGE hardening. Each says plainly whether it raises or
+  lowers protection. The pairs exist because real work sometimes needs a
+  control relaxed briefly -- relax it, do the work, put it back.
+
+  Where to start:
+    Just built the VM ............ 1, then 3
+    Site behaving oddly .......... 5, then 6
+    Suspect a compromise ......... 7, then menu 6 (Diagnostics)
+    Plugin cannot reach vendor ... 2
+EOF
+    ;;
+  security.1) _card "1 — Hardening status" <<'EOF'
+  WHAT IT DOES
+    Lists every hardening control and whether it is on: file editing, theme
+    and plugin installs, PHP shell functions, XML-RPC, user enumeration, MFA.
+
+  WHEN TO USE IT
+    First thing on any VM, and after anyone has been "fixing" something.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 1. Anything showing ALLOWED that you did not deliberately allow is
+    worth asking about -- options 11 and 13 put them back.
+EOF
+    ;;
+  security.2) _card "2 — Egress (proxy) status" <<'EOF'
+  WHAT IT DOES
+    Shows the destination allowlist -- every domain this site is permitted to
+    reach. WordPress cannot make outbound connections to anything else.
+
+  WHEN TO USE IT
+    When a plugin or theme cannot reach its licence or update server.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 2. To add a vendor, from a shell:
+      doas wasp-egress.sh allow .elementor.com
+    Every entry is also a route OUT for a compromised site, so add the
+    specific host the log names, not a wildcard you guessed.
+EOF
+    ;;
+  security.3) _card "3 — Test egress is enforced" <<'EOF'
+  WHAT IT DOES
+    Proves the firewall actually blocks non-allowlisted destinations, by
+    removing WordPress's proxy setting and confirming the connection still
+    fails. Tests the enforcement, not the configuration.
+
+  WHEN TO USE IT
+    At commissioning. A proxy that is merely CONFIGURED can be bypassed by a
+    plugin that ignores it; this proves the firewall stops that.
+
+  WHAT IT ASKS YOU
+    Nothing. It restores the setting afterwards.
+
+  EXAMPLE
+    Press 3. You want it to report that the direct connection was BLOCKED.
+EOF
+    ;;
+  security.4) _card "4 — CrowdSec whitelist" <<'EOF'
+  WHAT IT DOES
+    Lists the addresses CrowdSec will never ban.
+
+  WHEN TO USE IT
+    After locking yourself out, or before testing from a new location.
+
+  WHAT IT ASKS YOU
+    Nothing in list mode.
+
+  EXAMPLE
+    Press 4. Your office IP and your management overlay belong here. An
+    uptime monitor that hits the login page also belongs here, or it will
+    eventually ban itself.
+EOF
+    ;;
+  security.5) _card "5 — Plugin vulnerability scan" <<'EOF'
+  WHAT IT DOES
+    Checks every installed plugin and theme against known vulnerability
+    feeds, matched locally -- the plugin list is not sent anywhere.
+
+  WHEN TO USE IT
+    Weekly, and always after importing a site you did not build.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 5. An outdated plugin with a known exploit is the single most
+    common way a WordPress site is taken over.
+EOF
+    ;;
+  security.6) _card "6 — Malware scan (quick)" <<'EOF'
+  WHAT IT DOES
+    The high-signal checks: PHP files where PHP never belongs (uploads),
+    core files that differ from the pinned image, world-writable files.
+
+  WHEN TO USE IT
+    Routinely, and immediately after any import.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 6. A .php file under wp-content/uploads is essentially never
+    legitimate -- that finding alone is worth acting on.
+EOF
+    ;;
+  security.7) _card "7 — Malware scan (full)" <<'EOF'
+  WHAT IT DOES
+    Everything in the quick scan plus signature rules and database analysis:
+    injected options, hidden admin users, suspicious scheduled tasks.
+
+  WHEN TO USE IT
+    When you suspect a compromise, or after inheriting a site.
+
+  WHAT IT ASKS YOU
+    Nothing. Takes a few minutes.
+
+  EXAMPLE
+    Press 7. Read the summary counts, but read the findings above them too --
+    and remember no scanner detects a backdoor written for this site alone.
+EOF
+    ;;
+  security.8) _card "8 — Verify tooling integrity" <<'EOF'
+  WHAT IT DOES
+    Checks every WASP tool on this VM against the signed manifest, so you
+    know the tools reporting on the site have not themselves been edited.
+
+  WHEN TO USE IT
+    Before trusting any other result during an incident.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 8. If this fails, stop and treat every other tool's output as
+    unreliable until you know why.
+EOF
+    ;;
+  security.9) _card "9 — [!] Rotate a secret" <<'EOF'
+  WHAT IT DOES
+    Opens a submenu to rotate WordPress salts, database passwords, or SMTP
+    credentials. Verifies the new value works before committing, and rolls
+    back if it does not.
+
+  WHEN TO USE IT
+    After any suspected exposure, after staff turnover, and after any
+    compromise -- rotation is part of recovery, not optional.
+
+  WHAT IT ASKS YOU
+    Which secret, and confirmation ('yes').
+
+  EXAMPLE
+    Rotating salts logs every user out immediately, including an intruder
+    holding a stolen session cookie. That is usually what you want.
+EOF
+    ;;
+  security.10) _card "10 — Theme/plugin uploads: ALLOW (lowers hardening)" <<'EOF'
+  WHAT IT DOES
+    Turns OFF DISALLOW_FILE_MODS, re-enabling plugin and theme installs from
+    inside wp-admin.
+
+  WHEN TO USE IT
+    Rarely. The console path (option 12) installs from a file without
+    lowering anything, and it is logged.
+
+  WHAT IT ASKS YOU
+    Confirmation ('yes'), because this reduces protection.
+
+  EXAMPLE
+    If you do use it, put it back with option 11 the moment you are done.
+    An admin session an attacker has taken over can install a plugin, and a
+    plugin is arbitrary code.
+EOF
+    ;;
+  security.11) _card "11 — Theme/plugin uploads: BLOCK (restores hardening)" <<'EOF'
+  WHAT IT DOES
+    Turns DISALLOW_FILE_MODS back on: no plugin or theme installs, updates or
+    deletions from wp-admin.
+
+  WHEN TO USE IT
+    Immediately after finishing whatever needed option 10.
+
+  WHAT IT ASKS YOU
+    Nothing -- it raises protection, so it runs on a keystroke.
+
+  EXAMPLE
+    Press 11. Afterwards wp-admin shows NO update section at all, even for
+    plugins with valid licences. That is the control working, and it is very
+    commonly mistaken for an egress fault.
+EOF
+    ;;
+  security.12) _card "12 — Install a theme/plugin ZIP" <<'EOF'
+  WHAT IT DOES
+    Installs a plugin or theme from a local .zip, recording its SHA-256.
+    Works WITHOUT lowering hardening, and it is logged.
+
+  WHEN TO USE IT
+    Any commercial theme or plugin: Elementor Pro, BeTheme, Divi -- anything
+    not on WordPress.org.
+
+  WHAT IT ASKS YOU
+    The path to the zip.
+
+  EXAMPLE
+    Get the file onto the VM first:
+      scp -O betheme.zip admin@10.20.101.10:/var/lib/wasp-import/incoming/
+    then answer:
+      /var/lib/wasp-import/incoming/betheme.zip
+    Commercial plugins have no published checksums, so "does not verify" is
+    the expected and correct answer, not a failure.
+EOF
+    ;;
+  security.13) _card "13 — PHP shell functions: BLOCK (restores hardening)" <<'EOF'
+  WHAT IT DOES
+    Disables exec, shell_exec, system, passthru and friends in PHP.
+
+  WHEN TO USE IT
+    Always, unless a specific plugin genuinely needs them.
+
+  WHAT IT ASKS YOU
+    Nothing -- it raises protection.
+
+  EXAMPLE
+    Press 13. Most webshells need one of these functions. Turning them off
+    makes a whole class of attack inert even if a file is planted.
+EOF
+    ;;
+  security.14) _card "14 — PHP shell functions: ALLOW (lowers hardening)" <<'EOF'
+  WHAT IT DOES
+    Re-enables PHP's shell execution functions.
+
+  WHEN TO USE IT
+    Only when a plugin you trust genuinely requires it, and only for as long
+    as that is true.
+
+  WHAT IT ASKS YOU
+    Confirmation ('yes').
+
+  EXAMPLE
+    If a plugin demands this, consider whether you want that plugin on a
+    public site at all. Put it back with option 13 as soon as you can.
+EOF
+    ;;
+  security.17) _card "17 — Is CrowdSec actually blocking?" <<'EOF'
+  WHAT IT DOES
+    Tests the whole chain live: CrowdSec sees an event, makes a decision, and
+    the firewall enforces it. Proves bans actually block rather than just
+    being recorded.
+
+  WHEN TO USE IT
+    At commissioning, and whenever you doubt the bans are real.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 17. CrowdSec logging a decision that nothing enforces is a very
+    quiet failure -- the dashboard looks busy and nobody is being stopped.
+EOF
+    ;;
+  security.18) _card "18 — Report bans to a central LAPI" <<'EOF'
+  WHAT IT DOES
+    Points this VM's CrowdSec agent at a shared Local API on another host, so
+    several sites feed one decision set and a ban learned on one protects all.
+
+  WHEN TO USE IT
+    When you run more than one WASP VM behind a common reverse proxy.
+
+  WHAT IT ASKS YOU
+    The LAPI URL, a machine login, and a machine password.
+
+  EXAMPLE
+    LAPI URL : http://10.20.10.10:8080/
+    Login    : wp01-clientname
+    Password : (typed, not shown)
+    Register the machine on the LAPI host FIRST:
+      cscli machines add wp01-clientname --password '<pw>'
+    Passwords cap at 72 characters there -- longer ones are rejected.
+EOF
+    ;;
+
+  # ── Updates ───────────────────────────────────────────────────────────────
+  updates.menu) _card "Updates" <<'EOF'
+  Two different questions, often confused:
+
+    Has my pinned version been REBUILT with security fixes?   -> 1
+    Is there a NEWER RELEASE than the one I pinned?           -> 22
+
+  Updates run a CVE scan first and refuse to proceed on an incomplete scan
+  under the production profile -- "the scanner did not run" is not the same
+  as "the scanner found nothing".
+
+  Take a backup (menu 2, option 1) before applying anything.
+EOF
+    ;;
+  updates.1) _card "1 — Check what's available" <<'EOF'
+  WHAT IT DOES
+    Compares each pinned image against the registry by digest. Finds security
+    rebuilds of the version you are already on. Changes nothing.
+
+  WHEN TO USE IT
+    Weekly.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 1. "digest up to date" everywhere means you are current on the
+    versions you pinned -- which is a different question from option 22.
+EOF
+    ;;
+  updates.2) _card "2 — Current versions / status" <<'EOF'
+  WHAT IT DOES
+    Shows what is actually running: image versions, digests, container state,
+    firewall and bouncer status.
+
+  WHEN TO USE IT
+    Before and after any update, and when reporting a problem.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 2. A bouncer line reading "agent-only, reporting to a remote LAPI"
+    is normal when the LAPI lives on another host.
+EOF
+    ;;
+  updates.22) _card "22 — Newer versions upstream?" <<'EOF'
+  WHAT IT DOES
+    Asks the registry whether newer RELEASES exist than the versions you
+    pinned. Changes nothing.
+
+  WHEN TO USE IT
+    Monthly, and when a CVE is announced for something you run.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 22, then apply one component at a time from a console:
+      update.sh crowdsec v1.8.1
+    Updates are interactive by design and cannot run over `qm guest exec`,
+    which gives the prompt no input and silently skips.
+EOF
+    ;;
+
+  # ── Import ────────────────────────────────────────────────────────────────
+  import.menu) _card "Import a site" <<'EOF'
+  Importing a site you did not build means running someone else's files and
+  database. The order here exists so nothing is executed or served before it
+  has been examined.
+
+    1 ... how to get the archive onto this VM
+    2 ... look inside it WITHOUT extracting anything
+    3 ... extract to staging, outside the web root, non-executable
+    4 ... scan the staged files AND the database dump
+    then apply, which asks you to type IMPORT
+
+  Take a backup first (menu 2, option 1). Import replaces the database.
+EOF
+    ;;
+  import.1) _card "1 — How to get a backup here" <<'EOF'
+  WHAT IT DOES
+    Prints the ways to deliver an archive to this VM, with the exact
+    commands.
+
+  WHEN TO USE IT
+    Before your first import.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    The usual route, from your own machine:
+      scp -O backup.zip admin@10.20.101.10:/var/lib/wasp-import/incoming/
+    The -O flag is required: there is no SFTP subsystem on this VM.
+EOF
+    ;;
+  import.2) _card "2 — Inspect an archive" <<'EOF'
+  WHAT IT DOES
+    Reads the archive index and reports what is inside. Extracts NOTHING.
+
+  WHEN TO USE IT
+    Always, before extracting. It costs seconds and tells you what you have.
+
+  WHAT IT ASKS YOU
+    The archive path.
+
+  EXAMPLE
+    /var/lib/wasp-import/incoming/backup.zip
+    A cPanel account backup nests the site under <account>/public_html/ and
+    carries mail, logs and the panel's own files. A plugin export is a
+    different shape. Knowing which you have decides everything after.
+EOF
+    ;;
+  import.3) _card "3 — Extract (bounded staging)" <<'EOF'
+  WHAT IT DOES
+    Unpacks into a staging area outside the web root, strips the execute bit
+    from everything, removes known takeover installers, and collects any
+    database dumps it finds.
+
+  WHEN TO USE IT
+    After inspecting.
+
+  WHAT IT ASKS YOU
+    The archive path.
+
+  EXAMPLE
+    /var/lib/wasp-import/incoming/backup.zip
+    Nothing here is web-reachable and nothing is executable. If the archive
+    holds several dated dumps, it will list them and ask you to keep one --
+    picking silently would restore whichever sorted first, not the newest.
+EOF
+    ;;
+  import.4) _card "4 — Scan staged content" <<'EOF'
+  WHAT IT DOES
+    Runs the malware scanner over the staged files AND inspects the database
+    dump for injected admin users, code in option rows, and suspicious
+    scheduled tasks -- BEFORE any of it reaches the live site.
+
+  WHEN TO USE IT
+    Always, and the import refuses to proceed without it.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 4. Findings do not necessarily stop you: people import compromised
+    sites deliberately, to clean them. They stop you importing one by
+    ACCIDENT.
+EOF
+    ;;
+
+  # ── Diagnostics ───────────────────────────────────────────────────────────
+  diag.menu) _card "Diagnostics & forensics" <<'EOF'
+  Two different jobs:
+
+    Something is broken and you want help ....... 1 or 2 (capture)
+    Something is wrong and you suspect intent ... 3 and 4 (forensics)
+
+  If you think the site was compromised, capture BEFORE you clean. Deleting
+  the evidence is how an incident becomes unexplainable -- and an attacker
+  who got in once gets in again by the same door if you never find it.
+EOF
+    ;;
+  diag.1) _card "1 — Capture a session for review" <<'EOF'
+  WHAT IT DOES
+    Records your terminal session plus diagnostics into one local bundle,
+    redacting secrets by value. Uploads nowhere.
+
+  WHEN TO USE IT
+    When you want someone else to see what you are seeing.
+
+  WHAT IT ASKS YOU
+    Nothing to start. Type exit to stop recording.
+
+  EXAMPLE
+    Press 1, reproduce the problem, type exit. It prints the bundle path.
+    Read it before sending it anywhere.
+EOF
+    ;;
+  diag.2) _card "2 — Capture current state only" <<'EOF'
+  WHAT IT DOES
+    Collects diagnostics without recording a session: versions, container
+    state, recent logs, configuration, health results.
+
+  WHEN TO USE IT
+    For a bug report, or a snapshot before making a change.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 2. Secrets are redacted by value, not by guessing at names.
+EOF
+    ;;
+  diag.3) _card "3 — Forensics: unexpected admins" <<'EOF'
+  WHAT IT DOES
+    Lists every WordPress administrator with its registration date and
+    capabilities.
+
+  WHEN TO USE IT
+    Immediately on any suspected compromise, and after inheriting a site.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 3. An administrator you cannot account for is persistence: it
+    survives cleaning whatever created it. Check registration dates against
+    option 4 -- an account appearing minutes after a suspicious file is one
+    event, not two.
+EOF
+    ;;
+  diag.4) _card "4 — Forensics: change timeline" <<'EOF'
+  WHAT IT DOES
+    Builds a timeline from file timestamps, database changes, backups and
+    CrowdSec decisions, so you can see what happened around an event.
+
+  WHEN TO USE IT
+    After finding something suspicious, to see what accompanied it.
+
+  WHAT IT ASKS YOU
+    Nothing, though it accepts a file or time to centre on.
+
+  EXAMPLE
+    Press 4. Be aware of the window: HTTP logs rotate hourly, so anything
+    older has file and database timestamps but no request context. A file
+    dated two years ago will not have logs explaining how it arrived.
+EOF
+    ;;
+  diag.5) _card "5 — Mail: status" <<'EOF'
+  WHAT IT DOES
+    Reports SMTP configuration and whether WordPress can send mail.
+
+  WHEN TO USE IT
+    When password resets or notifications are not arriving.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 5. Mail being unconfigured is common and mostly harmless -- until
+    someone needs a password reset and cannot get one.
+EOF
+    ;;
+  diag.6) _card "6 — Mail: send a test" <<'EOF'
+  WHAT IT DOES
+    Sends a real test message through the configured path and reports what
+    happened.
+
+  WHEN TO USE IT
+    After configuring SMTP, to prove it works.
+
+  WHAT IT ASKS YOU
+    The destination address.
+
+  EXAMPLE
+    you@yourcompany.com
+    Use an address you can actually check. Then look in spam -- delivered but
+    filtered is a different problem from not sent, and needs SPF and DKIM
+    rather than more debugging here.
+EOF
+    ;;
+  diag.7) _card "7 — Self-test (full)" <<'EOF'
+  WHAT IT DOES
+    Exercises the machinery itself: backup and restore, candidate isolation,
+    egress enforcement.
+
+  WHEN TO USE IT
+    At commissioning, or when you doubt a control.
+
+  WHAT IT ASKS YOU
+    Nothing. Takes several minutes.
+
+  EXAMPLE
+    Press 7. This tests that the safety nets work, which is a different
+    question from whether the site is currently healthy.
+EOF
+    ;;
+
+  # ── Testing ───────────────────────────────────────────────────────────────
+  testing.menu) _card "Testing & validation" <<'EOF'
+  Everything here is read-only except 18 (installs the MFA plugin).
+
+  A sensible commissioning order:
+    2  ... quick health
+    3  ... full validation
+    7  ... egress really enforced
+    8  ... tooling integrity
+    14 ... MFA state
+    4  ... full self-test
+    21 ... anything still blocking production?
+EOF
+    ;;
+  updates.3) _card "3 — [!] Update everything" <<'EOF'
+  WHAT IT DOES
+    Updates every component in one pass: WordPress, database, CrowdSec,
+    Squid. Each gets its own CVE scan, health check and rollback.
+
+  WHEN TO USE IT
+    On a VM you are comfortable with. On one that has been misbehaving,
+    update components one at a time (4-8) so you know what moved.
+
+  WHAT IT ASKS YOU
+    Confirmation before each component, and a written justification if a
+    component has HIGH or CRITICAL vulnerabilities.
+
+  EXAMPLE
+    Back up first (menu 2, option 1). Updates are interactive by design --
+    run them from a console, not over `qm guest exec`, which gives the
+    prompts no input and silently skips every one.
+EOF
+    ;;
+  updates.4) _card "4 — [!] Update WordPress" <<'EOF'
+  WHAT IT DOES
+    Starts a CANDIDATE container on a private port with a read-only database
+    account, proves it is healthy, and only then swaps it into place. The old
+    container is kept as the rollback until the new one proves itself.
+
+  WHEN TO USE IT
+    When option 1 or 22 shows a newer WordPress.
+
+  WHAT IT ASKS YOU
+    Confirmation, plus a justification if the image has open CVEs.
+
+  EXAMPLE
+    Afterwards run:  wp-plugins.sh core-update-db
+    A new core against an old database schema fails in ways that do not
+    announce themselves.
+EOF
+    ;;
+  updates.5) _card "5 — [!] Update database" <<'EOF'
+  WHAT IT DOES
+    Updates MariaDB, taking a backup and a data-directory snapshot first.
+
+  WHEN TO USE IT
+    Least often of all of these, and never casually -- a major version
+    upgrades the data directory in place and cannot be undone by swapping
+    the image back.
+
+  WHAT IT ASKS YOU
+    Confirmation, and the version if you are moving between LTS lines.
+
+  EXAMPLE
+    Do this one alone, after everything else is verified, and only with an
+    OFF-VM backup you have actually restored (menu 2, option 4). A higher
+    version number is not always better supported: stay on LTS lines.
+EOF
+    ;;
+  updates.6) _card "6 — [!] Update CrowdSec" <<'EOF'
+  WHAT IT DOES
+    Replaces the CrowdSec container, carrying forward the deployment's own
+    topology -- an agent-only install stays agent-only and keeps reporting
+    to its remote LAPI.
+
+  WHEN TO USE IT
+    When your central LAPI is on a newer version than this agent.
+
+  WHAT IT ASKS YOU
+    Confirmation, plus justification if CVEs are open.
+
+  EXAMPLE
+    A version change migrates config on first start and can take a couple of
+    minutes before the API answers. Afterwards, confirm on the LAPI host that
+    this machine still has a live heartbeat:  cscli machines list
+EOF
+    ;;
+  updates.7) _card "7 — [!] Update Squid (egress proxy)" <<'EOF'
+  WHAT IT DOES
+    Replaces the egress proxy container, then re-validates WordPress.
+
+  WHEN TO USE IT
+    When a digest check shows a rebuild. Canonical ships security fixes in
+    place, so newness here appears as a digest change rather than a new tag.
+
+  WHAT IT ASKS YOU
+    Confirmation.
+
+  EXAMPLE
+    Afterwards check the allowlist survived (menu 3, option 2) and that
+    enforcement still holds (menu 3, option 3).
+EOF
+    ;;
+  updates.8) _card "8 — [!] Update Alpine OS packages" <<'EOF'
+  WHAT IT DOES
+    Runs apk update and upgrade on the VM itself -- the host side, not the
+    containers.
+
+  WHEN TO USE IT
+    Monthly, and whenever an Alpine security advisory affects something
+    installed here.
+
+  WHAT IT ASKS YOU
+    Confirmation.
+
+  EXAMPLE
+    This reaches .alpinelinux.org through the egress proxy, so it works
+    without opening anything new. Reboot afterwards if the kernel moved.
+EOF
+    ;;
+  import.5) _card "5 — [!] Apply the import" <<'EOF'
+  WHAT IT DOES
+    Backs up the CURRENT site, then replaces its content, plugins, themes and
+    database with the staged import. Normalises URLs and the table prefix,
+    regenerates salts, clears scheduled tasks. Core, wp-config.php, .htaccess
+    and the mu-plugins are NOT imported -- this VM's own are kept, because
+    those are exactly where a compromised source hides things that survive a
+    content clean.
+
+  WHEN TO USE IT
+    After inspect, extract and scan, and not before.
+
+  WHAT IT ASKS YOU
+    You must type IMPORT in full. It refuses if the staging set has not been
+    scanned, and refuses on CRITICAL findings without --force.
+
+  EXAMPLE
+    Run it from a CONSOLE. Over `qm guest exec` the confirmation gets no
+    input and it cancels.
+    Afterwards: the imported site's USERS replace yours. If none of their
+    administrators is an account you hold the password for, make yourself one
+    with wp-cli before you close the terminal.
+EOF
+    ;;
+  testing.1) _card "1 — Commission check (guided)" <<'EOF'
+  WHAT IT DOES
+    Runs the whole read-only validation sequence end to end, in the order
+    that makes sense: does it work, is it hardened, can it recover. It does
+    NOT stop at the first failure.
+
+  WHEN TO USE IT
+    Before handing a VM to a client. This is the single best answer to "is
+    this ready?"
+
+  WHAT IT ASKS YOU
+    Confirmation to begin. Nothing it runs changes the site.
+
+  EXAMPLE
+    Press 1. The one thing it cannot prove for you is OFF-SITE recovery --
+    that needs your recovery key and stays a deliberate separate step
+    (menu 2, option 4). Until you run that, off-site recovery is an
+    assumption rather than evidence.
+EOF
+    ;;
+  testing.12) _card "12 — wp-cli can reach the site" <<'EOF'
+  WHAT IT DOES
+    Proves wp-cli can actually see WordPress and its database.
+
+  WHEN TO USE IT
+    When a plugin or MFA command reports something odd -- this separates
+    "wp-cli cannot reach WordPress" from "WordPress says no".
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 12. Those two failures look identical from a command's output, and
+    chasing the wrong one wastes an afternoon.
+EOF
+    ;;
+  testing.2) _card "2 — Quick health (exit code)" <<'EOF'
+  WHAT IT DOES
+    The same quick check as Health menu option 1, but chosen here when you
+    care about the EXIT CODE -- for a script or a monitoring probe.
+
+  WHEN TO USE IT
+    From cron or a monitor, rather than by hand.
+
+  EXAMPLE
+    validate-wordpress.sh --check && echo healthy || echo degraded
+EOF
+    ;;
+  testing.3) _card "3 — Full validation" <<'EOF'
+  WHAT IT DOES
+    The complete ~45-check suite. Identical to Health menu option 2.
+
+  WHEN TO USE IT
+    Commissioning, after updates, before handover.
+
+  EXAMPLE
+    Press 3 and read the FAIL lines; each names its own fix.
+EOF
+    ;;
+  testing.4) _card "4 — Self-test: everything" <<'EOF'
+  WHAT IT DOES
+    Exercises the SAFETY MACHINERY rather than the site: backup and restore,
+    candidate isolation during updates, egress enforcement.
+
+  WHEN TO USE IT
+    At commissioning. "The site is healthy" and "the safety nets work" are
+    different questions, and this answers the second.
+
+  EXAMPLE
+    Press 4. Several minutes. Nothing here touches the live site.
+EOF
+    ;;
+  testing.5) _card "5 — Self-test: local restore" <<'EOF'
+  WHAT IT DOES
+    Backs up and restores into a scratch database to prove the mechanism.
+
+  WHEN TO USE IT
+    After changing backup settings, or as a safe rehearsal before the real
+    off-site drill.
+
+  EXAMPLE
+    Press 5. This proves the machinery. Backup menu option 4 proves you could
+    survive losing this VM, which is the harder and more useful claim.
+EOF
+    ;;
+  testing.6) _card "6 — Self-test: candidate isolated" <<'EOF'
+  WHAT IT DOES
+    Proves that during an update the candidate container cannot write to the
+    live database -- it runs against a temporary read-only account.
+
+  WHEN TO USE IT
+    At commissioning, or if you doubt an update could corrupt live data.
+
+  EXAMPLE
+    Press 6. This is why a failed update rolls back cleanly instead of
+    leaving half-migrated data behind.
+EOF
+    ;;
+  testing.7) _card "7 — Egress is really enforced" <<'EOF'
+  WHAT IT DOES
+    Removes WordPress's proxy setting and confirms outbound connections STILL
+    fail -- proving the firewall enforces the boundary, not just the config.
+
+  WHEN TO USE IT
+    At commissioning. A plugin that ignores the proxy would otherwise walk
+    straight past a perfectly configured allowlist.
+
+  EXAMPLE
+    Press 7. You want BLOCKED. The setting is restored afterwards.
+EOF
+    ;;
+  testing.8) _card "8 — Tooling integrity vs manifest" <<'EOF'
+  WHAT IT DOES
+    Verifies every WASP tool against the signed manifest.
+
+  WHEN TO USE IT
+    Before trusting any other result during an incident.
+
+  EXAMPLE
+    Press 8. If the tools have been edited, everything else they tell you is
+    unreliable -- check this first, not last.
+EOF
+    ;;
+  testing.9) _card "9 — Updates available (no change)" <<'EOF'
+  WHAT IT DOES
+    Read-only check for newer image digests. Same as Updates menu option 1.
+
+  WHEN TO USE IT
+    Weekly, or as part of a commissioning sweep.
+
+  EXAMPLE
+    Press 9. Nothing is pulled or changed.
+EOF
+    ;;
+  testing.10) _card "10 — Image CVE scan (no change)" <<'EOF'
+  WHAT IT DOES
+    Scans the images actually running for HIGH and CRITICAL vulnerabilities.
+
+  WHEN TO USE IT
+    Monthly, and before handover.
+
+  EXAMPLE
+    Press 10. The first run downloads a vulnerability database of several
+    hundred MB. If it fails complaining about the database, check disk --
+    that error names the DB and means the disk.
+EOF
+    ;;
+  testing.11) _card "11 — Mail path works" <<'EOF'
+  WHAT IT DOES
+    Diagnoses the whole mail path end to end rather than just reporting
+    configuration.
+
+  WHEN TO USE IT
+    Before handover -- password resets depend on it.
+
+  EXAMPLE
+    Press 11. Mail unconfigured is survivable until someone needs a reset
+    and cannot get one.
+EOF
+    ;;
+  testing.15) _card "15 — WordPress core version" <<'EOF'
+  WHAT IT DOES
+    Reports the version actually SERVED, read from the files on disk rather
+    than from the image tag.
+
+  WHEN TO USE IT
+    After a core update, and whenever a version claim matters.
+
+  EXAMPLE
+    Press 15. The tag and the served version disagree whenever core files
+    have not been synced -- a real and silent failure mode. Never trust the
+    tag for this question.
+EOF
+    ;;
+  testing.16) _card "16 — WordPress file integrity" <<'EOF'
+  WHAT IT DOES
+    Compares installed plugins and core against published checksums.
+
+  WHEN TO USE IT
+    On any suspected compromise, and after importing a site.
+
+  EXAMPLE
+    Press 16. Commercial plugins have no published checksums, so "no
+    checksums available" for Elementor Pro or BeTheme is expected, not a
+    finding. A MISMATCH on a WordPress.org plugin is a real finding.
+EOF
+    ;;
+  testing.13) _card "13 — [!] Prove OFFSITE recovery" <<'EOF'
+  WHAT IT DOES
+    The same restore drill as Backup menu option 4: pulls a real encrypted
+    backup from remote storage, decrypts it with your recovery key, and
+    verifies it restores. It restores into a scratch area, not over the site.
+
+  WHEN TO USE IT
+    Once per VM at commissioning, and periodically after. The commission
+    check deliberately does NOT run this for you -- it needs your recovery
+    key, so it stays a separate, conscious step.
+
+  WHAT IT ASKS YOU
+    Your recovery key, and confirmation ('yes').
+
+  EXAMPLE
+    Have the key to hand before starting; it is not stored on this VM on
+    purpose. If you cannot find it, that IS the finding, and it is better
+    found now than during an outage.
+EOF
+    ;;
+  testing.20) _card "20 — Known-defect triage" <<'EOF'
+  WHAT IT DOES
+    Checks this VM against the known defects of the build it was installed
+    from, and tells you which apply, which are already fixed, and what the
+    workaround is for the rest.
+
+  WHEN TO USE IT
+    When something behaves oddly and you want to know whether it is a known
+    issue before investigating it as a new one.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 20. A VM built from an older release can carry defects fixed
+    upstream since -- this tells you which, rather than leaving you to
+    rediscover them.
+EOF
+    ;;
+  testing.14) _card "14 — MFA / Two Factor status" <<'EOF'
+  WHAT IT DOES
+    Reports whether the enforcement mu-plugin is installed, whether
+    enforcement is on, and whether the Two Factor plugin is active -- three
+    separate things that are often confused.
+
+  WHEN TO USE IT
+    Any time you need to know whether MFA is actually protecting admins.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 14. The dangerous combination is enforcement ON with the plugin
+    NOT active: admins past their grace window cannot enrol and cannot log
+    in. It flags that explicitly.
+EOF
+    ;;
+  testing.18) _card "18 — Install Two Factor NOW" <<'EOF'
+  WHAT IT DOES
+    Installs and activates the Two Factor plugin immediately, rather than
+    waiting for the deferred installer to do it after setup completes.
+
+  WHEN TO USE IT
+    When you have finished the WordPress setup wizard and do not want to wait
+    for the scheduled run.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 18, then check with option 14. If it reports the site is not
+    installed yet, finish the setup wizard in a browser first.
+EOF
+    ;;
+  testing.19) _card "19 — Why hasn't MFA installed?" <<'EOF'
+  WHAT IT DOES
+    Explains the deferred installer's state: whether it has run, what it
+    found, and what it is waiting for.
+
+  WHEN TO USE IT
+    When MFA was requested at build time but is not active yet.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 19. The usual answer is that the WordPress setup wizard has not
+    been completed -- the plugin cannot install before WordPress exists.
+EOF
+    ;;
+  testing.21) _card "21 — Re-test production blockers" <<'EOF'
+  WHAT IT DOES
+    Re-checks every condition that is currently refusing to certify this VM
+    for production, and clears the ones you have fixed.
+
+  WHEN TO USE IT
+    After fixing whatever the build flagged, to confirm it is actually clear.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Press 21. A blocker is recorded when a control could not be verified at
+    build time. It stays until re-tested, because an unverified control is
+    not the same as a working one.
+EOF
+    ;;
+
+  # ── Main ──────────────────────────────────────────────────────────────────
+  main.menu) _card "WASP operator menu" <<'EOF'
+  Every action prints the exact command before it runs, so you can learn the
+  command by watching -- and skip the menu once you know it.
+
+  Destructive actions are marked [!] and ask you to type 'yes'.
+
+  If this VM is new, press g for a guided walkthrough of what to do first.
+
+  Type ?N on any menu for help on option N -- what it does, when to use it,
+  what it will ask, and an example of a correct answer.
+EOF
+    ;;
+
+  *) _card "No help for that" <<'EOF'
+  There is no help card for that option.
+
+  Type ? on its own for an overview of this menu, or pick an option number
+  that appears in the list.
+EOF
+    ;;
+  esac
+}
+
+# ── Guided first run ────────────────────────────────────────────────────────
+# Not a wizard. A new operator's real problem is not that the commands are
+# hard to type, it is not knowing WHICH ones matter or in what order. This
+# states the order and the reason for it, then hands over.
+guided_start() {
+  _card "First time on this VM — what to do, in order" <<'EOF'
+  1. KNOW WHAT YOU HAVE
+       Menu 1 -> option 2 (full validation)
+       Read the FAIL lines. Each names the control and the fix.
+
+  2. MAKE RECOVERY REAL
+       Menu 2 -> option 2 (is off-site configured?)
+       If not: option 7 tells you what is missing, 8 and 9 set it.
+       Then option 4 -- prove a restore actually works.
+       A backup you have never restored is a hope, not a backup.
+
+  3. CLOSE THE ADMIN DOOR
+       Menu 7 -> option 14 (MFA state)
+       Enforcement on without the plugin active locks admins out; the
+       check says so explicitly.
+
+  4. PROVE THE PERIMETER
+       Menu 3 -> option 3 (egress really enforced)
+       Menu 3 -> option 17 (CrowdSec really blocking)
+       Both test enforcement rather than configuration. A control that is
+       configured but not enforced looks identical from the outside.
+
+  5. IF YOU IMPORTED A SITE YOU DID NOT BUILD
+       Menu 3 -> option 7 (full malware scan)
+       Menu 6 -> option 3 (unexpected admins)
+
+  6. WHEN IT ALL PASSES
+       Main menu -> c (commission check) for the whole picture in one pass,
+       then Menu 1 -> option 3 for a report you can send a client.
+EOF
+}
+
+# =============================================================================
 #  SUBMENUS — grouped by the task an operator actually has in mind
 # =============================================================================
 
@@ -134,7 +1532,7 @@ menu_health() {
     5) Database health               ${DIM}mariadb-health-check.sh${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel health
     case "$c" in
       1) _have validate-wordpress.sh && run "Quick health check" 0 validate-wordpress.sh --check || _missing validate-wordpress.sh ;;
       2) _have validate-wordpress.sh && run "Full validation" 0 validate-wordpress.sh || _missing validate-wordpress.sh ;;
@@ -163,7 +1561,7 @@ menu_backup() {
     6) Self-test (local restore)     ${DIM}wasp-selftest.sh restore-test${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel backup
     case "$c" in
       1) _have wp-db-backup.sh && run "Run a backup" 0 wp-db-backup.sh || _missing wp-db-backup.sh ;;
       2) _have wasp-offsite-backup.sh && run "Off-site status" 0 wasp-offsite-backup.sh status || _missing wasp-offsite-backup.sh ;;
@@ -203,7 +1601,7 @@ menu_security() {
     9) ${RED}[!]${R} Rotate a secret              ${DIM}wp-rotate-secrets.sh ...${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel security
     case "$c" in
       1) _have wp-hardening.sh && run "Hardening status" 0 wp-hardening.sh status || _missing wp-hardening.sh ;;
       2) _have wasp-egress.sh && run "Egress status" 0 wasp-egress.sh status || _missing wasp-egress.sh ;;
@@ -254,7 +1652,7 @@ menu_rotate() {
     4) ${RED}[!]${R} Everything                    ${DIM}wp-rotate-secrets.sh all${R}
     b) back
 EOF
-  printf '\n  select: '; read -r c
+  _sel security
   _have wp-rotate-secrets.sh || { _missing wp-rotate-secrets.sh; return; }
   case "$c" in
     1) run "Rotate salts" 1 wp-rotate-secrets.sh salts ;;
@@ -282,7 +1680,7 @@ menu_updates() {
     8) ${RED}[!]${R} Update Alpine OS packages    ${DIM}update.sh os${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel updates
     _have update.sh || { _missing update.sh; return; }
     case "$c" in
       1) run "Update check" 0 update.sh check ;;
@@ -312,7 +1710,7 @@ menu_import() {
     5) ${RED}[!]${R} Apply the import             ${DIM}wp-import.sh apply${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel import
     _have wp-import.sh || { _missing wp-import.sh; return; }
     case "$c" in
       1) run "Import: where" 0 wp-import.sh where ;;
@@ -354,7 +1752,7 @@ menu_testing() {
    13) ${RED}[!]${R} Prove OFFSITE recovery      ${DIM}wasp-offsite-backup.sh remote-restore-drill${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel testing
     case "$c" in
       1) commission_check ;;
       20) _have wasp-triage.sh && run "Known-defect triage" 0 wasp-triage.sh || _missing wasp-triage.sh ;;
@@ -487,7 +1885,7 @@ menu_diagnostics() {
     7) Self-test (full)              ${DIM}wasp-selftest.sh all${R}
     b) back
 EOF
-    printf '\n  select: '; read -r c
+    _sel diag
     case "$c" in
       1) _have wasp-capture.sh && run "Start session capture" 0 wasp-capture.sh start || _missing wasp-capture.sh ;;
       2) _have wasp-capture.sh && run "Capture state" 0 wasp-capture.sh report || _missing wasp-capture.sh ;;
@@ -521,9 +1919,15 @@ main() {
     ${DIM}Every action shows the command before it runs. Destructive ones${R}
     ${DIM}are marked ${R}${RED}[!]${R}${DIM} and ask you to type 'yes'.${R}
 
+    ${CYN}g)${R} First time here? ${DIM}guided walkthrough of what to do first${R}
+    ${CYN}c)${R} Commission check ${DIM}is this VM fit to hand over?${R}
+
+    ${DIM}Type ${R}${CYN}?N${R}${DIM} for help on any option — what it does, when to${R}
+    ${DIM}use it, what it asks you, and an example answer.${R}
+
     q) quit
 EOF
-    printf '\n  select: '; read -r c
+    _sel main
     case "$c" in
       1) menu_health ;;
       2) menu_backup ;;
@@ -532,6 +1936,8 @@ EOF
       5) menu_import ;;
       6) menu_diagnostics ;;
       7) menu_testing ;;
+      g|G) guided_start ;;
+      c|C) commission_check ;;
       q|Q) clear 2>/dev/null || true; exit 0 ;;
     esac
   done

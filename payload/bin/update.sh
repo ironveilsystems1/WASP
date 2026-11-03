@@ -83,7 +83,7 @@ set -e
 # a value for a component, THAT value is authoritative, not this constant.
 PINNED_WP_VER="7.1-php8.4-apache"
 PINNED_DB_VER="11.4"
-PINNED_CS_VER="v1.7.8"
+PINNED_CS_VER="v1.8.1"
 WP_REGISTRY="docker.io/wordpress"
 DB_REGISTRY="docker.io/mariadb"
 CS_REGISTRY="docker.io/crowdsecurity/crowdsec"

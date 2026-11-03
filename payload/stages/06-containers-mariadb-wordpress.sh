@@ -98,8 +98,29 @@ podman run -d \
 # the container stays in "starting" state indefinitely even when MariaDB is
 # fully ready. Instead, use a direct exec-based probe (mariadbd ping with
 # credentials) which works regardless of conmon or cgroup configuration.
-# The --health-cmd is still configured for 'podman ps' display purposes, but
-# we never block on its output here.
+#
+# 2026-10-25: "often does not fire" is too soft, and keeping --health-cmd "for
+# podman ps display purposes" did the opposite of what it says. Podman
+# schedules health checks through systemd transient timers. Alpine runs
+# OpenRC. There is no timer, so the check NEVER fires -- on a VM inspected
+# after six days: Status "starting", FailingStreak 0, Log null. Not a check
+# that failed: one that had never run once. `podman healthcheck run mariadb`
+# by hand returned 0 immediately.
+#
+# So the display this was kept for reads "(starting)" forever, which is worse
+# than showing nothing -- an operator sees a database that has been coming up
+# for a week. The cron entry below runs the checks Alpine will not schedule,
+# which makes the status mean what it appears to mean. Nothing here or
+# anywhere else in WASP blocks on it; mariadb-health-check.sh remains the
+# probe that decisions are made on.
+if ! grep -q 'podman healthcheck run' /etc/crontabs/root 2>/dev/null; then
+  # Every container that declares a check, so a container added later is
+  # covered without editing this. One that declares none errors into
+  # /dev/null, which costs nothing and keeps the loop free of special cases.
+  printf '%s\n' \
+    '* * * * * for c in $(podman ps --format "{{.Names}}"); do podman healthcheck run "$c" >/dev/null 2>&1; done' \
+    >> /etc/crontabs/root
+fi
 ts "Waiting for MariaDB to accept connections (up to 3 min)"
 # PRODUCTION SAFETY FIX (v7-6k): this loop used to gate readiness on a bare
 # ping — see the mariadb-health-check.sh rationale above (installed earlier
@@ -458,6 +479,35 @@ if [ -n "${PROXY_IP:-}" ]; then
 fi
 
 WP_EXTRA_VOLS="-v /home/wpuser/wp/secrets:/var/www/private:ro"
+
+# ── Mask the image's own remoteip.conf ───────────────────────────────────────
+# The WordPress image ships /etc/apache2/conf-enabled/remoteip.conf declaring
+# every RFC1918 range as an internal proxy. The reasoning for removing it is
+# at the verification block further down; the mechanism is here because it has
+# to be, and that is the point of this comment.
+#
+# Deleting it inside the running container does not hold: the file is in the
+# IMAGE layer, so it returns on every `podman rm` + `podman run` -- including
+# the GeoIP rebuild later in this same script. A mount cannot be undone that
+# way. It is also declarative: `podman inspect` shows it, so the control is
+# visible without exec'ing into anything.
+#
+# An empty regular file, not /dev/null: Apache reads this path as a config
+# file, and a character device is not one.
+#
+# IT GOES IN WP_EXTRA_VOLS, NOT WP_VOL_ARGS, AND THAT IS THE WHOLE FIX. 10.5
+# added this mount to WP_VOL_ARGS, which only the first `podman run` below
+# reads. The GeoIP rebuild, the OpenRC service and update.sh all build their
+# own mount lists and share only what is in wp-run-extra.env -- so on any GeoIP
+# install the mask lasted from here until the rebuild a few hundred lines
+# later, after the verification had already printed its success line. That is
+# defect 32 again, in the fix for defect 32. test/check-remoteip-mask.py holds
+# this in place.
+install -d -m 0755 /home/wpuser/wp/apache-conf
+: > /home/wpuser/wp/apache-conf/remoteip-masked.conf
+chmod 0644 /home/wpuser/wp/apache-conf/remoteip-masked.conf
+WP_EXTRA_VOLS="${WP_EXTRA_VOLS} -v /home/wpuser/wp/apache-conf/remoteip-masked.conf:/etc/apache2/conf-enabled/remoteip.conf:ro"
+
 WP_VOL_ARGS="${WP_VOL_ARGS} ${WP_EXTRA_VOLS}"
 
 # REGRESSION FIX (found in a real deployment): wp-geoip-setup.sh rebuilds
@@ -570,16 +620,59 @@ ok "Container: $(podman ps --filter name='^wordpress$' --format '{{.Status}}' 2>
 # chain and kept the connection peer. Every LAN visitor looked like the proxy.
 #
 # WASP's own config sets RemoteIPHeader, so removing this loses nothing.
-if podman exec wordpress test -L /etc/apache2/conf-enabled/remoteip.conf 2>/dev/null; then
-  if podman exec wordpress rm -f /etc/apache2/conf-enabled/remoteip.conf 2>/dev/null; then
-    podman exec wordpress apache2ctl -k graceful >/dev/null 2>&1 || true
-    ok "  Disabled the image's default remoteip.conf (it trusted all of RFC1918)"
-    ok "  RemoteIPTrustedProxy in wp-security.conf is now the only allowlist"
-  else
-    warn "  Could not disable the default remoteip.conf — Apache will accept"
-    warn "  X-Forwarded-For from any private address, not just ${PROXY_IP:-the proxy}."
-  fi
-fi
+#
+# ── WHY THIS IS A MOUNT AND NOT AN `rm`, as of 2026-10-25 ───────────────────
+#
+# Found on a live VM: `wp-hardening.sh proxy-check` reported the image's
+# remoteip.conf as ENABLED on a VM that had been provisioned by this script,
+# which had run this block and removed it.
+#
+# The file lives in the IMAGE layer. Removing it inside a running container
+# lasts exactly as long as that container does, and the GeoIP rebuild FURTHER
+# DOWN THIS SAME FILE does `podman rm -f wordpress` and re-runs it. So the
+# removal was undone during provisioning, by this script, a few hundred lines
+# after doing it. Any later recreation -- an update, a reboot, a manual
+# restart -- does the same.
+#
+# Nothing reported it, because the block had already printed its success line.
+# The operator-facing remediation in `proxy-check` suggested the same `rm` and
+# had the same lifetime.
+#
+# A read-only bind mount of an empty file cannot be undone by a rebuild, and
+# is visible in `podman inspect` without exec'ing into anything. It reaches
+# every path that recreates this container through WP_EXTRA_VOLS, above.
+#
+# The test is `-s` (exists and non-empty) rather than `-L` (symlink): masked,
+# the path is empty, so testing for content answers the question that matters
+# -- is Apache reading directives from it -- without depending on how the image
+# happens to ship the file. Output-based rather than exit-code-based because a
+# failed `podman exec` would otherwise read as "masked".
+#
+# A function because it runs TWICE. The first run proves this container; the
+# GeoIP rebuild further down replaces it, and the check that matters is the one
+# against the container the install finishes with. 10.5 ran it once, here,
+# before the rebuild, so it reported a state that no longer existed by the end
+# of the same stage.
+_verify_remoteip_mask() {
+  _rim=$(podman exec wordpress sh -c \
+    'if [ -s /etc/apache2/conf-enabled/remoteip.conf ]; then echo active; else echo masked; fi' \
+    2>/dev/null | tr -d '\r') || _rim=""
+  case "$_rim" in
+    masked)
+      ok "  Image default remoteip.conf masked (it trusted all of RFC1918)${1:+ — $1}"
+      ok "  RemoteIPTrustedProxy in wp-security.conf is now the only allowlist" ;;
+    active)
+      warn "  The image's default remoteip.conf is STILL ACTIVE${1:+ — $1}."
+      warn "  Apache will accept X-Forwarded-For from any private address, not"
+      warn "  just ${PROXY_IP:-the proxy}, and will discard the real address of any"
+      warn "  client sharing a private range with it."
+      warn "  Check that the mask mount was applied: podman inspect wordpress" ;;
+    *)
+      warn "  Could not read remoteip.conf from the wordpress container${1:+ — $1}."
+      warn "  This is NOT a pass. validate-wordpress.sh re-checks it." ;;
+  esac
+}
+_verify_remoteip_mask
 
 # ── Verify wp-config.php actually received WORDPRESS_CONFIG_EXTRA ────────────
 # The official image writes wp-config.php ONLY on first run. Once the file
@@ -613,7 +706,29 @@ if [ -f "$_WPCFG" ] && [ -n "${WP_CONFIG_EXTRA:-}" ]; then
     # Insert before the marker the image itself writes.
     _tmp=$(mktemp) || _tmp=""
     if [ -n "$_tmp" ]; then
-      awk -v extra="$WP_CONFIG_EXTRA" '
+      # BUG FIX: inject GUARDED defines. The official image evaluates
+      # WORDPRESS_CONFIG_EXTRA through eval() earlier in wp-config.php, so a
+      # constant can already exist at runtime even when the textual check
+      # above does not find it in the file. Injecting a bare define() then
+      # produces, on EVERY request:
+      #
+      #   PHP Warning: Constant WP_DEBUG already defined in
+      #     wp-config.php(128) : eval()'d code on line 1
+      #   PHP Warning: Constant WP_DEBUG already defined in
+      #     wp-config.php on line 131
+      #
+      # Fifteen warnings per request. Harmless to the site and corrosive to
+      # diagnosis: on a real VM php-errors.log reached 1.4 MB of this, and an
+      # operator hunting an actual fatal had it buried forty lines deep in
+      # noise. A log nobody can read is a log nobody reads.
+      #
+      # `defined(...) ||` makes the injection idempotent whatever the image
+      # did, which is more robust than trying to predict it. Only define()
+      # calls are rewritten; any other statement in the extra (the
+      # X-Forwarded-Proto block) passes through untouched.
+      _guarded=$(printf '%s' "$WP_CONFIG_EXTRA" \
+                 | sed 's/define("\([A-Za-z_][A-Za-z0-9_]*\)"/defined("\1") || define("\1"/g')
+      awk -v extra="$_guarded" '
         /That.s all, stop editing/ && !done { print extra; done=1 }
         { print }
       ' "$_WPCFG" > "$_tmp" && mv -f "$_tmp" "$_WPCFG"
@@ -859,4 +974,7 @@ if [ "${GEOIP_ENABLED:-0}" = "1" ] && [ -n "${MAXMIND_ACCOUNT_ID}" ] && [ -n "${
 elif [ "${GEOIP_ENABLED:-0}" = "1" ]; then
   warn "GeoIP was enabled but MaxMind credentials are missing — skipping GeoIP setup"
 fi
+
+# The rebuild above replaced the container the first check looked at.
+[ "${GEOIP_ENABLED:-0}" = "1" ] && _verify_remoteip_mask "after the GeoIP rebuild"
 

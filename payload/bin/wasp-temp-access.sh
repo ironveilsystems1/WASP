@@ -94,7 +94,7 @@ grant)
   _label="${2:-}"; _days="${3:-}"; shift 3 2>/dev/null || true
   [ -n "$_label" ] && [ -n "$_days" ] && [ $# -gt 0 ] || {
     echo "Usage: wasp-temp-access.sh grant <label> <days> <ip> [ip...]" >&2
-    echo "   eg: wasp-temp-access.sh grant webdev 2 139.135.49.52 124.29.239.165" >&2
+    echo "   eg: wasp-temp-access.sh grant webdev 2 203.0.113.51 203.0.113.52" >&2
     exit 1; }
   printf '%s' "$_label" | grep -qE '^[A-Za-z0-9_-]+$' || { _bad "label must be letters, digits, dash, underscore"; exit 1; }
   case "$_days" in ''|*[!0-9]*) _bad "days must be a number"; exit 1 ;; esac
