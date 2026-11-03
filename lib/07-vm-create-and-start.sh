@@ -289,7 +289,7 @@ echo   "  ╠══════════════════════�
   echo   "  ║  Containers (all --cap-drop ALL):                           ║"
   printf "  ║    WordPress  %-47s║\n" "${_WP_PORT_DESC}"
   printf "  ║    MariaDB    %-47s║\n" "11.4 → wp-db:10.89.20.0/24 internal (no host port)"
-  printf "  ║    CrowdSec   %-47s║\n" "v1.7.8 → host network, read-only"
+  printf "  ║    CrowdSec   %-47s║\n" "v1.8.1 → host network, read-only"
   echo   "  ╠══════════════════════════════════════════════════════════════╣"
   echo   "  ║  Networking: netavark firewall_driver=nftables (no iptables)║"
   echo   "  ║  nftables forward: wp-front 10.89.10.0/24 + wp-db 10.89.20.0/24,║"

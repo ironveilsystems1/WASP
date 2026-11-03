@@ -413,7 +413,7 @@ if [[ "$NET_MODE_SEL" == "2" ]]; then
   echo "    9) Enter your own"
   echo ""
   # ── The gateway, which was the right answer and was not on the menu ───────
-  # From the melroseparkfire install: the operator typed 10.20.101.1 — their
+  # From the client-a install: the operator typed 10.20.101.1 — their
   # VLAN gateway, and the documented correct answer for a guest on a segmented
   # network — at a prompt that takes a NUMBER. It fell through to the default
   # and the VM was built on Quad9.
@@ -484,7 +484,7 @@ if [[ "$NET_MODE_SEL" == "2" ]]; then
       *)  # Re-prompt rather than silently choosing. A fallback that prints one
           # warning line and continues is not a decision: during a twenty-minute
           # questionnaire that line scrolls away, and the VM is built on a
-          # resolver nobody picked. That is how melroseparkfire ended up on Quad9
+          # resolver nobody picked. That is how client-a ended up on Quad9
           # after its operator had typed their own gateway address.
           #
           # Nothing is lost by asking again — the question is cheap and the
@@ -809,7 +809,7 @@ _v15_valid_cidr() {
 _ask_cidr() {  # $1 prompt text ; echoes validated COMMA-separated list (may be empty)
   # Takes a LIST now, not a single value.
   #
-  # From the melroseparkfire install: the operator typed
+  # From the client-a install: the operator typed
   # "10.20.1.254/24,10.0.0.4/24" — the remote-administration path and the
   # on-site desktops — and it was rejected as invalid. They retyped with only
   # the on-site range, which does not cover them, and would have found out by
@@ -1550,7 +1550,7 @@ unset _CSW _bad _clean _e _oldIFS
 # admin addresses, the SSH source — and one of them was an explicit yes to a
 # separate question two prompts earlier.
 #
-# From the melroseparkfire install: the operator answered y to the CGNAT
+# From the client-a install: the operator answered y to the CGNAT
 # question, saw "Overlay range included — your remote source address is
 # covered", then typed two addresses here and lost 100.64.0.0/10, the SSH
 # source and the public admin IP in one keystroke. The confirmation line stayed

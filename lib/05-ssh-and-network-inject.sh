@@ -230,8 +230,8 @@ IFACEEOF
   # copied into the image by lib/04 so apk can resolve inside the chroot and
   # never replaced afterwards.
   #
-  # From the melroseparkfire install: tispve runs NetBird, which owns
-  # /etc/resolv.conf there and points it at 100.87.54.172. That address leaked
+  # From the client-a install: pve01 runs NetBird, which owns
+  # /etc/resolv.conf there and points it at 100.64.0.10. That address leaked
   # into the VM, which has no route to 100.64.0.0/10 -- and the site's own
   # firewall blocks SITE_NETS -> PRIVATE_NETS, which includes the CGNAT range.
   # Every lookup timed out, apk failed on the first mirror fetch, and the

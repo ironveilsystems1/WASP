@@ -22,7 +22,7 @@ A note on how to read that sentence, and this README generally: "integrity-check
 | **Host** | Proxmox VE (anything with `qm`, `pvesm`, `pvesh`) |
 | **Guest OS** | Alpine Linux — auto-detects the newest available release (3.24 → 3.21), BIOS cloud image |
 | **Container runtime** | Podman, **rootful only** |
-| **Stack** | WordPress `7.1-php8.4-apache` · MariaDB `11.4` · CrowdSec `v1.7.8` |
+| **Stack** | WordPress `7.1-php8.4-apache` · MariaDB `11.4` · CrowdSec `v1.8.1` |
 | **Default sizing** | 2 vCPU · 4096 MB RAM · 20G disk (edit `CORES`/`RAM`/`DISK` in `lib/00-preflight.sh` to change) |
 | **Networking** | Two segmented Podman networks — `wp-front` (egress + published port) and `wp-db` (`--internal`, no egress) |
 | **Deployment profile** | `production` — the only one. Verification failures are fatal; Squid, MFA, egress filtering and a resolvable relay are all required |
@@ -140,7 +140,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.4` — and both exist only because the codebase
+same value — currently `10.6` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -542,6 +542,34 @@ wasp-menu.sh          # or just: wasp-menu
 ```
 
 It groups the tooling by what you actually came to do — Health, Backup, Security, Updates, Import, Diagnostics, and **Testing & validation** — and every action **shows the exact command before it runs**, so it doubles as a cheat-sheet: a new tech learns the commands by watching, and an engineer can confirm nothing surprising happens and skip the menu next time. Destructive actions (rotate, update, restore, purge) are marked `[!]` and require typing `yes`.
+
+**If you have never used it before**, press `g` at the main menu. That is a
+guided walkthrough of what to do first on a new VM and why, in order — know
+what you have, make recovery real, close the admin door, prove the perimeter.
+It does not run anything; it tells you which menu and option to pick, and what
+each one is for.
+
+**For any individual option, type `?N`** — for example `?12` in the Security
+menu. Every option has a card answering the same four questions in the same
+order:
+
+```
+  WHAT IT DOES          what actually happens when you press it
+  WHEN TO USE IT        and, often, when not to
+  WHAT IT ASKS YOU      every prompt you will see, before you see it
+  EXAMPLE               a worked example of a correct answer
+```
+
+So `?12` in Security tells you to `scp -O` the file to
+`/var/lib/wasp-import/incoming/` first, what to type at the path prompt, and
+that "does not verify" against published checksums is the *expected* answer
+for a commercial plugin rather than a failure. Typing `?` on its own explains
+what the whole menu is for and where to start in it.
+
+The cards exist because what a new operator lacks is not arrow keys — it is
+knowing which option to pick, what it will ask, and what a right answer looks
+like. A test asserts every option has one, because a help system that covers
+most options teaches people it is unreliable and they stop opening it.
 
 It is deliberately plain: pure POSIX shell, no extra packages, and it works in the `qm terminal` console (where you cannot paste) exactly as it does over SSH. It is not a web interface — that would mean a listening service and a new attack surface, which is the opposite of what this VM is for. It launches the tools; it does not replace them, so anything the menu does you can still do by typing the command yourself.
 
@@ -1229,24 +1257,19 @@ scp -O admin@your-vm:/var/tmp/wasp-capture-\*.tar.gz .
 
 ## Testing it from the outside
 
-`tools/wasp-pentest.sh` validates the perimeter from a Kali box — or any Linux machine — by confirming WASP's controls actually respond as claimed from where an attacker would stand. The VM's own tooling checks that a control is *configured*; this checks that it has an *effect*.
+Everything in this repository checks that a control is **configured**. Nothing in it can check that the control has an **effect**, and that distinction is where every defect found on a live WASP install has lived.
 
-```sh
-./wasp-pentest.sh https://your-site.example
-./wasp-pentest.sh --ip 192.168.1.100 https://your-site.example   # also tests WEB_CIDR
-```
+The reason is structural, not an oversight. The VM is on the LAN and is almost certainly on its own admin allow list, so admin endpoints answer when it asks — the same endpoints an outside client is refused. An on-box check cannot tell those two situations apart, so a green report is not a tested perimeter.
 
-**Where you run it from is the point.** WASP restricts the admin surface by source address, so from an allow-listed address wp-admin will answer (correct → WARN), and from anywhere else it should be refused (the test that matters → PASS). Run it from both; the difference between the two runs is the access control working.
-
-You can also trigger it from the VM's own report, though the report points you off-box by default:
+The external harness that did this moved out of this repository in 10.5 and is now a separate project. It was never installed on the VM by design: a compromised box should not come with a scanner already on it.
 
 ```sh
 wasp-testreport.sh --perimeter https://your-site.example
 ```
 
-That adds a perimeter section to the full report. Because the VM is on the LAN and likely allow-listed, it explains that the meaningful run is still from a machine that is *not* — and gives you the two commands to do it — rather than pretending an on-box run tests the access control. The harness is deliberately not installed on the VM, so a compromised box doesn't hand an attacker a ready-made scanner.
+still produces a perimeter section, which now tells you what to run and why it has to run from elsewhere.
 
-It is a **validation** tool, not an attack tool — ordinary HTTP requests, no exploit code, no wordlists, no flood, every request tagged in the target's logs. It asks you to type `I OWN THIS` first, because testing a system you don't own is a criminal offence in most jurisdictions. A clean run means the perimeter controls are visible and working; it does not mean the site is invulnerable, which no external test can establish. Full detail in [tools/PENTEST.md](tools/PENTEST.md).
+**Where you run it from is the whole point.** From an allow-listed address wp-admin answers, which is correct and proves nothing. From anywhere else it must be refused. The difference between those two runs *is* the access control, demonstrated rather than asserted — and running only the first is how a site ships with an admin surface open to the internet and a full set of passing checks.
 
 ## Multiple SSH keys
 
@@ -1665,9 +1688,9 @@ The installer asks for a whitelist and pre-fills it with your reverse proxy and 
 
 ```sh
 wp-hardening.sh crowdsec-whitelist list          # whitelist + current bans
-wp-hardening.sh crowdsec-whitelist add 1.2.3.4
-wp-hardening.sh crowdsec-whitelist remove 1.2.3.4
-doas podman exec crowdsec cscli decisions delete --ip 1.2.3.4   # unban without whitelisting
+wp-hardening.sh crowdsec-whitelist add 203.0.113.4
+wp-hardening.sh crowdsec-whitelist remove 203.0.113.4
+doas podman exec crowdsec cscli decisions delete --ip 203.0.113.4   # unban without whitelisting
 ```
 
 Written as a **postoverflow** whitelist, not a parser one. A parser-stage whitelist discards events before they reach a scenario, making whitelisted addresses completely invisible. At the postoverflow stage the alert is still raised and only the ban is suppressed — so if your own workstation is compromised and starts brute-forcing, it appears in `cscli alerts list` rather than having silent free rein. Not locking yourself out and not blinding yourself are both achievable; the parser stage would have traded the second for the first.
@@ -1679,7 +1702,7 @@ Prefer single addresses to ranges. Whitelisting a `/24` trusts every device on i
 ```sh
 doas podman exec crowdsec cscli decisions list        # who is banned
 doas podman exec crowdsec cscli alerts list           # what triggered it
-doas podman exec crowdsec cscli decisions delete --ip 1.2.3.4
+doas podman exec crowdsec cscli decisions delete --ip 203.0.113.4
 ```
 
 **Why a mu-plugin and not a plugin:** a plugin is another update surface, another CVE surface, and can be switched off from an admin panel an intruder would reach immediately. mu-plugins can't be deactivated from wp-admin and survive core updates.
@@ -2969,7 +2992,7 @@ In order, the script asks about:
 |---|---|---|---|---|
 | `wordpress` | `wordpress:7.1-php8.4-apache` (or a locally-built `wordpress-geoip:*` layer if GeoIP is enabled) | `wp-front` (primary) + `wp-db` | `80:80` | `--cap-drop ALL --cap-add NET_BIND_SERVICE,SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER`, 768 MB memory cap, 200 PID limit |
 | `mariadb` | `mariadb:11.4` | `wp-db` only | none | `--cap-drop ALL --cap-add SETUID,SETGID,CHOWN,DAC_OVERRIDE,FOWNER`, 512 MB memory cap, InnoDB buffer pool capped at 256M, explicit `--network-alias mariadb` |
-| `crowdsec` | `crowdsecurity/crowdsec:v1.7.8` | host network | LAPI locked to `127.0.0.1:8080` | `--read-only --cap-drop ALL --cap-add DAC_OVERRIDE,SETUID,SETGID,CHOWN`, 512 MB memory cap |
+| `crowdsec` | `crowdsecurity/crowdsec:v1.8.1` | host network | LAPI locked to `127.0.0.1:8080` | `--read-only --cap-drop ALL --cap-add DAC_OVERRIDE,SETUID,SETGID,CHOWN`, 512 MB memory cap |
 
 **Networks**
 

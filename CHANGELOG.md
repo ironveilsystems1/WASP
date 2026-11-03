@@ -6,9 +6,285 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.6 — the mask that unmasked itself, and one version meaning one version
+
+### Defect 38: the 10.5 `remoteip.conf` mask did not survive the GeoIP rebuild
+
+10.5 fixed defect 32 by masking the image's `remoteip.conf` with a read-only
+bind mount, on the grounds that a mount cannot be undone by `podman rm`. True,
+and it was applied to the wrong list. The mount went into `WP_VOL_ARGS`, which
+only the first `podman run` in stage 06 reads. The GeoIP rebuild, the OpenRC
+service and `update.sh` each build their own mount list and share only what is
+in `wp-run-extra.env`, and the mask was added after that file was written.
+
+So on any GeoIP install the mask lived from stage 06 until the rebuild further
+down the same stage, and the verification ran between the two: it printed
+`Image default remoteip.conf masked`, and the install finished on a container
+without it. A comment beside the mount said it was "re-applied by every podman
+run in this script by construction". It was the same failure as the defect it
+fixed, in the fix.
+
+Found by reading the rebuild paths while preparing a second tenant. 10.5 was
+never installed on real hardware, so no VM has this.
+
+The mount now joins `WP_EXTRA_VOLS` before `wp-run-extra.env` is written, which
+is the one list all four paths read. Stage 06 verifies twice, the second time
+against the container the install ends with. `validate-wordpress.sh` now asserts
+it on the running container, output-based so that a failed `podman exec` cannot
+read as a pass; until now only `proxy-check` looked, and only if someone ran it.
+The `proxy-check` remedy names the env file, because mounting it anywhere else
+repeats this defect.
+
+`test/check-remoteip-mask.py` holds the shape: it fails against the 10.5 source
+on MASK-ENV, MASK-REVERIFY and MASK-LIVE.
+
+### The validator warned on every agent-only VM about a service that is not there
+
+Stage 09 installs `cs-firewall-bouncer` only under `CS_ENFORCEMENT=local`. The
+validator asked the same question of every VM, so every tenant behind the proxy
+reported "bans are never enforced at the firewall" with a restart command for a
+service that does not exist. That is a working system made to look broken, and
+it was carried as an unverified open item on a live VM.
+
+It now reads the declared topology. `upstream` passes, and warns only if a local
+bouncer IS running, since that is the state that looks like enforcement and is
+not. `detect-only` warns. `local` behaves as before.
+
+### One version
+
+10.5 set `WASP_VERSION="10.5"` beside `WASP_RELEASE="10.4"`, under a comment
+saying they are the same value. The signing tool reads `WASP_RELEASE`, so the
+signed trusted comment would have named the wrong build. `WASP_VERSION_NOTE`
+was also still describing 10.4. `check-version-claims.py` now fails when the two
+disagree.
+
+### CrowdSec v1.8.1 for new installs
+
+Not a security bump. The two DoS fixes in v1.8.0 are in the HTTP and Kubernetes
+audit datasources, which this stack does not acquire from. It is parity: a new
+VM on v1.7.8 would be the only one in the fleet on it. **Honest scope:** v1.8.1
+has run in production as an agent reached by `update.sh crowdsec`; a clean first
+install on v1.8.1 has not been run on hardware.
+
+### Not verified
+
+Everything in 10.5 and 10.6 has passed static checks only. Neither has been
+installed on real hardware. The first install is the test, including a reboot.
+
+## 10.5 — php2shell, and the pin that holds a VM on a vulnerable PHP
+
+### CVE-2026-109618 / CVE-2026-109619
+
+Two critical unauthenticated remote code execution flaws in PHP core, patched
+upstream on 21 October 2026. Both are reachable over plain HTTP with no
+credentials and execute as the web worker. Fixed releases: **8.2.35, 8.3.36,
+8.4.27, 8.5.12**.
+
+WASP ships `wordpress:7.1-php8.4-apache`, which serves through Apache with
+mod_php — the configuration upstream names as highest risk, because 109618 is
+reachable **before any application code runs**. No login slug, allow list,
+mu-plugin or geoip rule sits in front of that.
+
+**The pinning problem is the part worth understanding.** WASP resolves image
+tags to a digest at install time. That is the right call for reproducibility
+and supply-chain integrity, and it means a VM installed before 21 October
+keeps running the pre-patch PHP indefinitely however many times the upstream
+tag is rebuilt. The pin that protects an install from a tampered image also
+holds it on a vulnerable one, and nothing in the validator would have noticed.
+
+Three changes:
+
+**`validate-wordpress.sh` now asserts a PHP version floor**, read from the
+running container rather than inferred from the tag — a tag says what was
+asked for, the binary says what is serving. Below the fixed release for its
+branch it FAILs with the CVE named and points at `update.sh digest-check`,
+because the digest must be re-resolved rather than merely re-pulled. An
+unlisted branch WARNs rather than passing: 8.1 and older are end-of-life and
+receive no upstream fix, which is not a reason to report them clean.
+
+**`session.upload_progress.enabled = Off`** in `php-conf/security.ini`. It is
+the documented trigger for 109619 and is on by default; WordPress core does
+not use it. Set in the ini because `ini_set()` and `.user.ini` both run too
+late to matter. The validator reports it separately from the version, because
+it is the one part a site can fix without a new image.
+
+**Two upstream mitigations are deliberately NOT applied**, recorded in the ini
+so the decision is visible rather than forgotten. `memory_limit = -1` trades a
+hard-to-exploit RCE for an easy denial of service against every other guest on
+a shared host. `post_max_size = 8M` silently breaks WordPress media libraries,
+which is a poor trade for a partial mitigation.
+
+None of this is a fix. The fix is a patched image. These narrow the window.
+
+### `tools/wasp-pentest.sh` moved out
+
+The external harness is now its own project. It was never installed on the VM
+— deliberately, so a compromised box does not come with a scanner already on
+it — so what lived here was the source plus a pointer.
+
+This also resolves part of defect 37 by subtraction rather than by fixing it.
+The signed manifest covers `install.sh`, `lib/` and `payload/`; `tools/` sits
+outside it. The pentest harness was the item that mattered in that gap:
+executable code, run against live client sites, whose output decides whether
+an operator believes a perimeter holds. A tampered copy that always reports
+PASS is this project's characteristic defect with a signature-shaped hole in
+it. Moving it elsewhere removes it from *this* trust boundary; wherever it
+lives now needs its own integrity story.
+
+`wasp-testreport.sh --perimeter` still produces its section, and it now says
+plainly what this repository cannot check: that a control is **configured** is
+not that it has an **effect**, and an on-box run cannot tell those apart
+because the VM is almost certainly on its own admin allow list.
+
+---
+
+## Unreleased — WASP was publishing the administrator username
+
+From a live client site, 2026-10-25. A credential attack arrived against a
+randomly generated ten-character administrator login. The first theory was
+that the pair came from the prior compromise of that client's old host. It had
+not. **WASP published the username**, and this release closes that and three
+other defects found while chasing it.
+
+### Two enumeration routes were never closed, and one comment said so wrongly
+
+`06-wasp-username-privacy.php` shut the three routes security guidance names —
+the REST user listing, `?author=N`, and the login error oracle — and asserted
+in a comment that oEmbed "exposes the display name rather than the login
+name."
+
+That was wrong and had never been tested. oEmbed returns `author_url`, which
+is built from `user_nicename`, and `user_nicename` **defaults to
+`user_login`**. The endpoint answers unauthenticated, which makes it the
+standard route around exactly the REST restriction route 1 implements.
+
+The users sitemap was not considered at all. WordPress has generated
+`/wp-sitemap-users-1.xml` by default since 5.5 and submits it to search
+engines on publish. On the affected site it contained one entry: the
+administrator's author archive, under their login name, crawlable and indexed
+for the life of the install.
+
+Both are closed. More importantly, **`user_nicename` is now decoupled from
+`user_login`**, which is the control the others lean on — every public surface
+prints the nicename, so blocking surfaces one at a time loses to the next
+plugin that adds a sixth. New users get an opaque slug at registration, and a
+one-time migration covers users that arrived in an imported database, where
+`user_register` never fires.
+
+### Importing a client database disarmed two-factor authentication
+
+A dump carries its own `active_plugins`, which replaces the deployment's.
+Every plugin WASP installed is deactivated by that one row, **Two Factor
+included**.
+
+The mu-plugins are not listed in that option and survive, so
+`03-wpvm-mfa-enforce` stayed loaded and enforcing while the plugin providing
+the second factor was gone — and that file deliberately no-ops when
+`Two_Factor_Core` is absent, because enforcing an unavailable requirement
+would lock out every administrator.
+
+Both behaviours are correct alone. Together the site ran with MFA enforcement
+loaded, reporting nothing, and no second factor on any account, until a
+validator run happened to catch it. `docs/IMPORT-DESIGN.md` now carries this
+as a named step rather than a bullet in a list.
+
+### The remoteip fix was reverted by the installer, a few hundred lines later
+
+The image ships `conf-enabled/remoteip.conf` declaring every RFC1918 range an
+internal proxy. Stage 06 removed it with `podman exec … rm` and printed a
+success line.
+
+That file lives in the image layer. The GeoIP rebuild **further down the same
+script** does `podman rm -f wordpress` and re-runs it, so the removal was
+undone during provisioning, by the installer, after reporting it done. Any
+later recreation does the same. `proxy-check` suggested the same `rm` to
+operators, with the same lifetime.
+
+It is now masked with a read-only bind mount of an empty file, which no
+rebuild can undo, and the block that used to remove it only verifies the mask.
+`proxy-check` explains the lifetime difference instead of recommending a fix
+that evaporates.
+
+### `nginx-snippet` would have IP-restricted the public front end
+
+The generated admin location was one regex, `^/(wp-admin/|wp-login\.php|slug)`
+— which matches `/wp-admin/admin-ajax.php`, the endpoint the **public** front
+end calls for Elementor, contact forms and most interactive plugins.
+
+Applied as generated, every visitor loses the site's interactive elements
+while every admin page keeps working, so nothing about the symptom points at
+the proxy config. An exact-match `location = /wp-admin/admin-ajax.php` now
+precedes it; `=` outranks a regex regardless of file order.
+
+The same command also emitted `/boob` as its example slug in output handed to
+operators, and omitted the `wp-config.php` / `readme.html` / `license.txt`
+denies, the dotfile rule, `.well-known`, and the uploads no-execute rule that
+`README.md` specifies — so the two sources of truth disagreed about what a
+complete config was. All are now emitted.
+
+### Container health checks never ran, and said "starting" forever
+
+Podman schedules health checks through systemd transient timers. Alpine runs
+OpenRC. On a VM inspected after six days MariaDB reported `Status: starting`,
+`FailingStreak: 0`, `Log: null` — not a check that failed, one that had never
+executed once. Run by hand it returned 0 immediately.
+
+Stage 06 already knew not to block on it and used `mariadb-health-check.sh`
+instead, but kept the declaration "for `podman ps` display purposes" — a
+display that shows a database perpetually coming up. A cron entry now runs the
+checks Alpine will not schedule, for every container that declares one.
+
+### Not changed, and why
+
+`wp-geoip-setup.sh` grants `Require ip 10.0.0.0/8` in its country-test
+`<Location />`. That reads as over-granting and is not: since `AuthMerging
+And`, reaching wp-admin still requires passing the allowlist in
+`wp-security.conf`, Podman's container network lives in `10.89.0.0/16`, and
+the in-container health check calls `127.0.0.1`. Narrowing it to the site
+VLANs would 403 both and the install could never see WordPress as healthy. The
+file now says so, so the next reader does not "fix" it.
+
+### What worked: the CrowdSec chain, proven live
+
+The same incident validated the detection and enforcement path end to end,
+against a real attacker rather than a fixture:
+
+```
+14:39:09 UTC   02-wpvm-login-guard logs the failure, sends the alert
+14:39:25 UTC   the edge bouncer denies 198.51.100.23 with 'ban'
+```
+
+Sixteen seconds, unattended. Every link that was once inert — mu-plugin
+logging, acquisition reading the right filename, parser matching, scenario
+firing, LAPI decision, bouncer pulling — carried the event, and the latency is
+measurable rather than asserted because the alert mail timestamps detection
+and the nginx log timestamps enforcement.
+
+`test-fail-closed.sh` opens by naming this chain as the canonical control that
+was "present, well-formed, and inert." That note now carries the live result
+alongside it. A changelog that only accumulates defects teaches that the
+system is a pile of near-misses; this one is a control with a measured
+response time.
+
+The lockout alert earned its place too. It carries a line telling the operator
+that if the reported address is their reverse proxy rather than a real client,
+forwarding is misconfigured and the lockout is affecting every visitor —
+self-diagnosing output that distinguishes two very different situations before
+anyone starts investigating. Here it correctly did not apply.
+
+### Tests
+
+`test/check-enumeration-routes.py` — 16 assertions covering each of the five
+disclosure routes individually, the nicename control and its import migration,
+and every rule the generated proxy config must carry. Verified against the
+unfixed source: routes 4 and 5 and the admin-ajax location fail without these
+changes.
+
+---
+
 ## Unreleased — the installer now reads the host instead of trusting the answer
 
-From the melroseparkfire install on tispve (2026-10-17). Every prompt answered,
+From the client-a install on pve01 (2026-10-17). Every prompt answered,
 the Alpine image built and verified, the whole payload injected — then dead at
 VM creation on:
 
@@ -167,7 +443,7 @@ symptom `squid.conf`'s own comment warns about, written after a previous
 resolver failure that was *"indistinguishable from a policy denial"*.
 
 **It only appears when the operator picks a resolver other than the default.**
-Choose Quad9 and both sides agree by accident. The melroseparkfire install
+Choose Quad9 and both sides agree by accident. The client-a install
 chose the segment gateway — the better answer, and the one that exposed it.
 
 Nothing in the install reported a fault. The site served, Apache was healthy,
@@ -185,7 +461,7 @@ above is the same lesson from the other direction.
 A regression introduced by this same release, which makes it the most
 instructive one here.
 
-`_ask_cidr` was taught to accept several ranges because the melroseparkfire
+`_ask_cidr` was taught to accept several ranges because the client-a
 operator typed two and was rejected. The prompt was fixed. The nftables
 consumers were converted with `_csv`. **The one consumer that needs the
 opposite convention was not touched:**
@@ -249,8 +525,8 @@ installer printed the operator's choice twice:
 ✔  Static IP: 10.20.101.10/24 ... DNS: 10.20.101.1
 ```
 
-On melroseparkfire the host runs NetBird, which owns that file and points it at
-`100.87.54.172`. The VM has no route to `100.64.0.0/10`, and the site's own
+On client-a the host runs NetBird, which owns that file and points it at
+`100.64.0.10`. The VM has no route to `100.64.0.0/10`, and the site's own
 firewall blocks `SITE_NETS → PRIVATE_NETS` — which that alias includes. Every
 lookup timed out:
 
@@ -272,7 +548,7 @@ leaked copy is replaced rather than left. An unreachable resolver is refused
 before the VM ships:
 
 ```
-⚠ Refusing to ship this VM with an unreachable resolver: 100.87.54.172
+⚠ Refusing to ship this VM with an unreachable resolver: 100.64.0.10
 ⚠   Loopback and CGNAT/overlay addresses belong to the host that
 ⚠   generated them, not to this VM. It would boot, look healthy,
 ⚠   and fail at the first apk fetch with no mention of DNS.
@@ -293,7 +569,7 @@ qm guest exec <vmid> -- cat /etc/resolv.conf
 
 ### An explicit "yes" could be discarded by the next answer, silently
 
-From the melroseparkfire install, and the worst of the three because the
+From the client-a install, and the worst of the three because the
 installer printed a confirmation that then became false.
 
 The operator was asked whether to add the CGNAT overlay range, answered **y**,
@@ -304,7 +580,7 @@ and was told:
 ```
 
 The next prompt offered a default assembled from everything answered so far —
-`10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10` — and they typed two
+`10.20.10.10,203.0.113.10,10.20.1.254/32,100.64.0.0/10` — and they typed two
 on-site addresses. That answer **replaces** the default rather than adding to
 it, so the overlay range, the SSH source and the public admin IP all went in
 one keystroke, with the confirmation line still on screen above it.
@@ -322,7 +598,7 @@ prompt now names what went and offers it back:
   ⚠ Your answer replaced the default rather than adding to it.
   ⚠   These were offered and are now NOT whitelisted:
   ⚠     10.20.10.10
-  ⚠     98.206.9.121
+  ⚠     203.0.113.10
   ⚠     10.20.1.254/32
   ⚠     100.64.0.0/10   ← you answered YES to this one prompt ago
   ⚠   You chose upstream enforcement, so a ban proposed here is applied
@@ -501,7 +777,7 @@ on every VM.
 ### A prompt with no stdin reported itself as a declined answer
 
 ```
-root@tispve:~# qm guest exec 500 -- update.sh crowdsec v1.8.1
+root@pve01:~# qm guest exec 500 -- update.sh crowdsec v1.8.1
   Update CrowdSec to v1.8.1? [y/N]:    Skipped.
 ```
 
@@ -703,7 +979,223 @@ in a variable now, and a test grepping for `seq 1 6` would sail straight past
 someone lowering it back. The first version of that test did exactly that,
 and only the negative test caught it.
 
-149 fail-closed tests.
+### Fifteen PHP warnings per request buried a real fatal
+
+Found while diagnosing an Elementor crash on a client VM:
+
+```
+PHP Warning: Constant WP_DEBUG already defined in
+  wp-config.php(128) : eval()'d code on line 1
+PHP Warning: Constant WP_DEBUG already defined in wp-config.php on line 131
+… thirteen more, on every request …
+```
+
+The official image evaluates `WORDPRESS_CONFIG_EXTRA` through `eval()` at
+line 128. Stage 06's repair block then injects the same defines literally at
+line 131, because its presence check reads the file textually and did not
+match what the image had written. Every constant ends up defined twice.
+
+Harmless to the site, corrosive to diagnosis. `php-errors.log` reached
+1.4 MB of this, and an operator hunting an actual Elementor fatal found it
+forty lines up, nearly off the end of a `tail -40`. A log nobody can read is
+a log nobody reads, which makes this a *reliability* defect rather than a
+cosmetic one — it degrades every future incident on the VM, not this one.
+
+The injection is now idempotent — `defined("X") || define("X", …)` — which
+is more robust than trying to predict what the image did. Only `define()`
+calls are rewritten; other statements in the extra (the X-Forwarded-Proto
+block) pass through untouched, and the result is syntax-checked.
+
+162 fail-closed tests.
+
+### A client migration, and the six defects it found
+
+All from one real import on 2026-10-20: a cPanel account backup of a
+WordPress site that turned out to have been compromised since November 2024.
+They are logged together because they form a chain, and the chain is the
+lesson.
+
+**`wp-import.sh fetch url` had no proxy.** It called `curl` directly, so on
+any VM running the egress filtering that is this product's purpose, the
+request was dropped at the firewall. A documented path that could not work
+on a correctly configured install. It now routes through Squid, prints the
+`wasp-egress.sh allow` line for the host it is about to contact, and on
+failure points at Squid's log instead of saying only "Download failed".
+
+**A share link ends in an access token, not a filename.** `basename` of
+`.../backup/melroseg.zip/5eDFlx9VLGw` gave the token, so a 653 MB archive
+landed with no extension under a name matching nothing the operator had
+asked for — and `inspect melroseg.zip` then said "Not found" about a file
+that had downloaded perfectly. The real name is now recovered from the path.
+
+**`SCAN_PATH` was wiped before it was read.** An unconditional
+`SCAN_PATH=""` erased any inherited value, so
+`SCAN_PATH=/tree wp-malware-scan.sh yara` silently scanned the live site and
+reported *it* clean. 33 MB of imported uploads went into production behind a
+verdict that had never looked at them.
+
+**A flag after the command was silently discarded.** The option loop breaks
+at the first non-flag argument, so `wp-malware-scan.sh yara --path /staged`
+dropped `--path` and scanned the default target. Same failure, second route.
+A misplaced flag now refuses rather than scanning something else: reporting
+"nothing critical found" about the wrong tree is the most expensive thing
+this tool can do.
+
+**The import confirmation could not tell EOF from a refusal.** `apply`
+printed "Cancelled — nothing changed" on EOF — identical to what it prints
+when the operator declines. Run over `qm guest exec` it cancelled silently,
+and the operator continued through the follow-up steps against a database
+that had never been imported.
+
+**And the depth limits, which are the reason the rest mattered.** See the
+entries below: because the pipeline could not read the archive, the work was
+done by hand, and the hand-copy went around the scan gate.
+
+Each of these is individually small. Together they moved a webshell from an
+archive into a live site while four separate checks reported success.
+
+### The import pipeline could not read a cPanel backup, and that was a security bug
+
+A full-account backup nests the site at `<account>/public_html/`, so
+`wp-content` is at depth 3 and the UpdraftPlus `-db.gz` at depth 5.
+Site-root detection searched to `maxdepth 2`; dump collection to
+`maxdepth 3`. Both missed.
+
+The consequence was not "the tool reported nothing". It was that **the
+operator worked around the pipeline**, because that was the only way
+forward — and the hand-copy bypassed the scan gate that stands between a
+staged tree and the docroot. The tree they copied in contained a webshell.
+
+A limit that makes the sanctioned path unusable does not merely fail. It
+routes the work around the control.
+
+Detection now searches deeper and chooses by two rules, because a backup
+archive is full of decoy `wp-content` directories (`updraft/`,
+`plugins-old/`, `upgrade-temp-backup/`, `.trash/oldsite/`): a site root has
+`wp-content` **and** `wp-includes` or `wp-config.php` beside it, and the
+shallowest match wins. Verified against a tree carrying all four decoys.
+
+**Multiple dumps are refused rather than guessed.** `ls | head -1` takes the
+first *alphabetically*, so `backup_2025-08-21` beat `backup_2026-04-14` —
+the oldest. Restoring a site eighteen months earlier than intended is not a
+failure anyone catches quickly: it comes up, looks plausible, and is quietly
+missing a year and a half.
+
+### The prefix rewrite reported success and left the site with no roles
+
+Same import: table names rewritten correctly, capability keys not. Every
+check passed and the site had no roles at all.
+
+```
+wp-cli:  Error: Role doesn't exist: administrator
+admins:  (empty)
+```
+
+`wp_capabilities`, `wp_user_level` and `wp_user_roles` are stored as
+`meta_key` / `option_name` **values** carrying the prefix. The sed covering
+them is correct — verified under GNU sed and busybox 1.36 — so the cause is
+specific to what that backup plugin emits.
+
+Which is the lesson: rewriting *values* by pattern-matching SQL text is
+guessing at someone else's serialiser. Table names must be done in text
+because they are structural; the keys need not be.
+
+The outcome is now asserted in SQL after import, where it is exact and
+format-blind, and it runs whether or not the text pass appeared to work —
+because "appeared to work" is precisely the failure. Stranded keys are
+reported with their consequence named, rather than a successful import of a
+site nobody can log into.
+
+### Two rules for the obfuscation family that got past YARA
+
+The webshell used `goto`-dispatch control flow and assembled
+`file_put_contents` from character indices, so the dangerous name never
+appeared in the file. Nothing in the ruleset matched it. Only the structural
+"PHP in uploads" check caught it, and only after it was already live.
+
+- `wpvm_goto_dispatch_obfuscation` — more than five `goto` jumps alongside
+  `$_POST`/`$_GET`/`$_REQUEST`. PHP's `goto` is vanishingly rare in
+  legitimate code and essentially never appears a dozen times in one file.
+- `wpvm_charindex_function_assembly` — `str_split` of a scrambled string,
+  `explode` of a comma-separated offset list, and `[(int)$…]` indexing.
+
+Both graded **critical**, verified against the real sample and against
+benign controls — including one deliberately combining `str_split`,
+`explode` and `$_POST` — with no false positives.
+
+### You could not remove a domain from the egress allowlist
+
+Found on a live VM, 2026-10-20, when a removed domain was still in the list
+afterwards.
+
+```sh
+allow:  printf '%s\n' "$_dom" >> "$RUNTIME"       # append — keeps the inode
+deny:   grep -v … > tmp && mv -f tmp "$RUNTIME"   # replaces the inode
+```
+
+`allowlist-runtime.txt` is bind-mounted into the Squid container as a
+**single file**. `mv` creates a new inode, so the container went on reading
+the old one. `deny` printed `Removed: <domain>` and `Squid reloaded`, Squid
+reloaded from the stale inode, and the domain stayed permitted.
+
+`allow` never hit this because appending preserves the inode — which is
+exactly why adding a domain took effect instantly, removing one never did,
+and nobody noticed for the entire life of the tool.
+
+A revocation that reports success without performing it is worse than one
+that fails loudly. The operator has no reason to check, and an egress route
+they believe they closed is open.
+
+`deny` now rewrites in place with `cat >`, preserving the inode, and then
+**verifies from inside the container** — the only view that decides policy.
+Checking the host file would reproduce the same blind spot.
+
+This is the third place the bind-mounted-single-file inode trap has bitten
+this project (`squid.conf`, `geoip.conf`, now the allowlist). The pattern to
+remember: `sed -i` and `mv` replace the inode; `cat tmp > file` does not.
+
+### A guidance layer on wasp-menu, for operators who have never seen it
+
+Twenty tools behind seven menus is navigable once you know it and opaque
+before that. The menu already printed every command before running it, which
+teaches the commands — but not which option to pick, what it will ask, or
+what a right answer looks like.
+
+`?N` on any option now opens a card answering four questions in a fixed
+order: what it does, when to use it, what it asks you, and a worked example.
+`?` on its own explains what a menu is for and where to start in it. `g` at
+the main menu gives a first-run walkthrough — know what you have, make
+recovery real, close the admin door, prove the perimeter — which runs
+nothing and just says which option to pick and why.
+
+The examples are the point. `?12` in Security gives the `scp -O` line to get
+a zip onto the VM, the exact path to type, and the fact that "does not
+verify" against published checksums is the EXPECTED answer for a commercial
+plugin rather than a failure. `?18` gives the `cscli machines add` command
+to run on the LAPI host first, and notes the 72-character password cap that
+rejects longer ones. `?5` in Backup says to take a backup before restoring
+one, because restoring replaces the state you may discover you wanted.
+
+**No TUI toolkit.** The obvious way to do this is whiptail, as the Proxmox
+community scripts do, and that means `newt` and ncurses on every hardened VM
+to draw boxes. This project spends its surface budget on things that defend
+the site, so the cards are the same POSIX sh and ANSI the menu already used.
+A test fails if `whiptail`, `dialog` or `newt` ever appears in the menu, so
+that decision cannot be reversed by accident.
+
+Two tests guard the layer itself. `check-menu-help-coverage.py` fails if any
+option lacks a card — a help system covering most options teaches operators
+it is unreliable and they stop opening it. And `_sel` must clear the
+selection after showing a card, or a help request falls through as a menu
+choice: asking for help on a destructive option would run it. The first
+version of that guard grepped for the clearing line anywhere in the file and
+passed with one of two branches broken, which is the defect it exists to
+prevent; it now counts branches.
+
+Writing the coverage check found eleven options with no card, including two
+that a narrower first regex had hidden.
+
+188 fail-closed tests, 71 menu options covered.
 
 ---
 
@@ -4646,7 +5138,7 @@ first lines and notes that a dump carrying CREATE USER/GRANT statements from the
 source system is a plausible cause worth inspecting before blaming the backup.
 
 **A duplicated allow-list display that looked like a config bug.** The validator
-printed "192.168.100.0/24 72.208.112.108 192.168.100.0/24 72.208.112.108"
+printed "192.168.100.0/24 203.0.113.42 192.168.100.0/24 203.0.113.42"
 because the same list legitimately appears in two `<Directory>` blocks and the
 display concatenated all matches. Deduplicated.
 
@@ -8232,7 +8724,7 @@ prompt to investigate, never as a verdict.
 Keys are stored in `/etc/wp-install/vuln-sources.conf` at 0600.
 
 **Verified before shipping:** the version comparator handles the shapes
-WordPress plugins actually use (`1.2`, `1.2.3`, `1.2.3.4`) including
+WordPress plugins actually use (`1.2`, `1.2.3`, `203.0.113.4`) including
 `1.10 > 1.9`, which naive string comparison gets wrong; and the range-matching
 logic was simulated against a realistic feed structure covering inclusive
 upper bound, inclusive lower bound, one patch above, well below, and a slug

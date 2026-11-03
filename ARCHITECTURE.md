@@ -414,6 +414,57 @@ flowchart TD
     style V fill:#1f2937,stroke:#22c55e,color:#fff
 ```
 
+### 7.1 Nested archives, and why the depth limits were a security bug
+
+A cPanel/WHM full-account backup does not look like a site archive. The
+WordPress install sits at `<account>/public_html/`, surrounded by `.trash/`,
+`.conf/`, mail and the panel's own state — and `wp-content` itself contains
+`updraft/`, `plugins-old/` and `upgrade-temp-backup/`, each with their own
+nested `wp-content`.
+
+Site-root detection searched to `maxdepth 2`; the real `wp-content` was at
+depth 3. Dump collection searched to `maxdepth 3`; the UpdraftPlus `-db.gz`
+was at depth 5. Both missed, on an archive shape that is extremely common.
+
+That is not a cosmetic limitation. **An operator who cannot use the pipeline
+works around it** — extracting and copying by hand, which bypasses the scan
+gate that stands between a staged tree and the docroot. On a real import that
+detour carried a webshell into a live site. The depth limits did not fail to
+find a file; they routed a compromised tree around the control designed to
+catch it.
+
+Detection now searches deeper and chooses by two rules, because a backup
+archive is full of decoys:
+
+1. A site root has `wp-content` **and** `wp-includes` or `wp-config.php`
+   beside it. A backup folder inside `wp-content` has neither.
+2. Prefer the **shallowest** match — the real site is always closer to the
+   archive root than a backup buried inside it.
+
+Multiple dumps are refused rather than guessed. A retention set holds several
+dated backups, and `ls | head -1` takes the first *alphabetically*, which for
+`backup_2025-…` against `backup_2026-…` is the **oldest**. Restoring a site a
+year earlier than intended is not a failure anyone notices quickly: it comes
+up, looks plausible, and is quietly missing a year.
+
+### 7.2 Prefix keys are settled in SQL, not in dump text
+
+Table names must be rewritten in the dump text — they are structural. The
+capability **keys** must not be.
+
+`wp_capabilities`, `wp_user_level` and `wp_user_roles` are stored as
+`meta_key` and `option_name` *values* carrying the prefix. A text rewrite of
+those is pattern-matching someone else's serialiser, and it fails per-format:
+on a real import the table names were rewritten correctly and the keys were
+not, so the import reported success and the site had no roles at all —
+`Role doesn't exist: administrator`, and an empty administrator list. The
+regex was correct under both GNU and busybox sed; the dump simply did not
+have the shape it assumed.
+
+So the outcome is asserted in SQL after import, where it is exact and
+format-blind, and it runs whether or not the text pass appeared to work —
+because "appeared to work" is exactly what went wrong.
+
 **Nothing is reachable by the web server, or executed by anything, until it
 has been scanned.** The natural implementation — extract into the document
 root, then scan — leaves a webshell live and serving for as long as the scan

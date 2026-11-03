@@ -225,7 +225,7 @@ nobody is assigned and nobody is reminded of. Allowlists accrete, and every
 stale entry is a route into wp-admin that no longer has an owner.
 
 ```sh
-doas wasp-temp-access.sh grant webdev 2 139.135.49.52 124.29.239.165
+doas wasp-temp-access.sh grant webdev 2 203.0.113.51 203.0.113.52
 doas wasp-temp-access.sh list            # what is open, and when it closes
 doas wasp-temp-access.sh revoke webdev   # close it early
 ```

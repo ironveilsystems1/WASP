@@ -170,10 +170,46 @@ After import:
 - Force a password reset on every administrator, or at minimum report them
 - Re-apply `WP_HOME`/`WP_SITEURL` for this deployment
 - Re-apply the login slug and the wp-admin restriction
+- **Re-assert `active_plugins`** — see below, this one disarms MFA
 - Re-run `wp-plugins.sh vulns`, because you have just installed someone else's
   plugin set
 - Clear the `cron` option and let WordPress rebuild it — the cheapest defence
   against the scheduled-task persistence above
+
+#### `active_plugins` is not a cosmetic one
+
+**Observed live on a client import, 2026-10-25.** The dump carries the old
+site's `active_plugins` option, which replaces this deployment's. Every plugin
+WASP installed is deactivated by that single row — **Two Factor included**.
+
+What makes it dangerous rather than merely annoying is how it interacts with
+the mu-plugins. Those are not listed in `active_plugins` and so survive the
+import untouched. `03-wpvm-mfa-enforce` therefore stays loaded and enforcing
+while the plugin that *provides* the second factor is gone — and that file is
+deliberately written to no-op when `Two_Factor_Core` is absent, because
+enforcing an unavailable requirement would lock out every administrator.
+
+Correct behaviour in both files. Together: the site runs with MFA enforcement
+loaded, reporting nothing, and no second factor on any account. It stayed that
+way until a validator run happened to catch it.
+
+So re-asserting `active_plugins` is not tidying up after the import — it is
+the step that keeps authentication working. Capture the option before the
+load, and after it merge WASP's entries back into whatever the dump brought.
+Do not simply restore the pre-import value: the client's own plugins are the
+reason for the import.
+
+#### `user_nicename` comes across too
+
+The imported users table brings the old site's slugs, which are usually the
+old site's login names. `06-wasp-username-privacy` rewrites slugs for users it
+creates, and nothing it hooks fires for rows that arrived in a dump.
+
+Its one-time migration covers this by design: the `wpvm_nicename_migrated`
+flag lives in the options table, so an imported database arrives without it
+and the migration runs on the next wp-admin request. Worth knowing rather than
+rediscovering — and worth checking after an import rather than assuming, since
+the symptom is a published login name and there is no error either way.
 
 ---
 

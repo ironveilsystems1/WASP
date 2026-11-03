@@ -481,7 +481,7 @@ if [[ -n "$ADMIN_CIDR" || -n "$ALLOWED_ADMIN_IP" ]]; then
   # is invalid."
   #
   # ADMIN_CIDR became a comma list when _ask_cidr was taught to accept several
-  # ranges -- which was itself prompted by the melroseparkfire operator being
+  # ranges -- which was itself prompted by the client-a operator being
   # rejected for entering two. The prompt was fixed, the nftables consumers
   # were converted with _csv, and this one site, which needs the opposite
   # convention, was left alone.
@@ -639,7 +639,7 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
   # keeps its leading "/" (an absolute path from the document root), same as
   # WordPress core's own `RewriteRule . /index.php [L]`.
   # ── Read the shared rewrite template BEFORE building the block ───────────
-  # FORENSIC FIX, from a real install on tispve (melroseparkfire, 2026-10-17).
+  # FORENSIC FIX, from a real install on pve01 (client-a, 2026-10-17).
   #
   # This sed used to run INSIDE the heredoc below, reading
   # "${SCRIPT_DIR}/payload/templates/slug-rewrite.rules". SCRIPT_DIR is
@@ -650,7 +650,7 @@ if [[ -n "$WP_ADMIN_SLUG" ]]; then
   # What that produced, in order:
   #
   #   sed: can't read /payload/templates/slug-rewrite.rules: No such file
-  #   ✔  Apache security config built (… slug: firedept)
+  #   ✔  Apache security config built (… slug: admin-slug)
   #
   # A command substitution that fails yields an empty string, the heredoc
   # completed, and the next line printed success.

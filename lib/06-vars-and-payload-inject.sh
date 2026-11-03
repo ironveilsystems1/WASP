@@ -61,7 +61,7 @@ VM_STATIC_IP=$(_vars_q "$VM_STATIC_IP")
 # or this server's configuration", and nothing anywhere said DNS.
 #
 # It only appears when the operator picks a resolver OTHER than the default —
-# choosing Quad9 makes both sides agree by accident. The melroseparkfire
+# choosing Quad9 makes both sides agree by accident. The client-a
 # install chose the segment gateway, which is the better answer.
 VM_DNS=$(_vars_q "${VM_DNS:-}")
 GEOIP_ENABLED=$(_vars_q "${GEOIP_ENABLED:-0}")

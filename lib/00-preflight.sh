@@ -51,7 +51,7 @@ msg_warn()  { echo -e "  ${YW}⚠${CL}  $*"; }
 msg_error() { echo -e "  ${RD}✗${CL}  $*" >&2; exit 1; }
 
 # ── List normalisation ───────────────────────────────────────────────────────
-# FORENSIC FIX, from the melroseparkfire install (tispve, 2026-10-17).
+# FORENSIC FIX, from the client-a install (pve01, 2026-10-17).
 #
 # Two list conventions coexist here, both correct for their own consumer:
 #
@@ -61,7 +61,7 @@ msg_error() { echo -e "  ${RD}✗${CL}  $*" >&2; exit 1; }
 # They met, and nothing converted between them. `_extra` joined ADMIN_CIDR and
 # ALLOWED_ADMIN_IP with a comma, so a two-address admin list produced:
 #
-#   WEB_CIDR = 10.20.10.10,10.0.0.4/24,98.206.9.121 100.87.54.172
+#   WEB_CIDR = 10.20.10.10,10.0.0.4/24,203.0.113.10 100.64.0.10
 #                                                  ^ a space inside a comma list
 #
 # which lib/03 interpolates into `ip saddr { … }`. A space between two elements
@@ -70,7 +70,7 @@ msg_error() { echo -e "  ${RD}✗${CL}  $*" >&2; exit 1; }
 # check-expansion-order.py was written for, arriving by a different route.
 #
 # The same join also fed the CrowdSec whitelist default, where it concatenated
-# two addresses into "98.206.9.121100.87.54.172" and the operator had to retype
+# two addresses into "203.0.113.10100.64.0.10" and the operator had to retype
 # the list by hand.
 #
 # One helper, used wherever a list crosses between the two conventions.
@@ -85,7 +85,7 @@ _ssv() {    # ...and the reverse, for Apache's Require ip
 
 # ── Proxmox topology facts ───────────────────────────────────────────────────
 # Collected once, here, and used by lib/01 to VALIDATE answers rather than
-# accept them. Motivated by the melroseparkfire install (tispve, 2026-10-17),
+# accept them. Motivated by the client-a install (pve01, 2026-10-17),
 # which ran every prompt, built the disk image, injected the whole payload, and
 # then died at VM creation on:
 #
@@ -163,7 +163,7 @@ _addr_in_use()     { [ -n "$1" ] && _guest_addrs_in_use | grep -qxF "$1"; }
 
 # ── Host interface hints ─────────────────────────────────────────────────────
 # Printed to help the operator pick an address or a CIDR. Two faults in the
-# previous one-liner, both visible in the melroseparkfire install:
+# previous one-liner, both visible in the client-a install:
 #
 #   1. It labelled the ADDRESS as the subnet:
 #          10.0.0.4  (subnet: 10.0.0.4/24)
@@ -174,7 +174,7 @@ _addr_in_use()     { [ -n "$1" ] && _guest_addrs_in_use | grep -qxF "$1"; }
 #      displayed it back as if it were a network.
 #
 #   2. It offered the NetBird overlay address as a candidate:
-#          100.87.54.172  (subnet: 100.87.54.172/16)
+#          100.64.0.10  (subnet: 100.64.0.10/16)
 #      Nothing should ever be assigned on an overlay interface, and a /16 of
 #      CGNAT presented as "your subnet" is an invitation to a wrong answer.
 #
@@ -222,7 +222,7 @@ _host_subnet_hints() {   # $1 = max lines (default 6)
 #   operator the overlay is the whole answer.
 #
 # Printing nothing at the SSH prompt was the worst of the three options. From
-# the melroseparkfire install: the SSH CIDR question — the one prompt in this
+# the client-a install: the SSH CIDR question — the one prompt in this
 # installer whose wrong answer costs you the login path — printed no hints at
 # all, while the wp-admin question thirty lines later printed the full host
 # interface list. The operator, remote over NetBird, had nothing to answer

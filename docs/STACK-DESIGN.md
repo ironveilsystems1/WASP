@@ -367,10 +367,20 @@ be sequencing between three things that do not.
 - **`tools/` is outside the signed manifest.** `MANIFEST.sha256` covers
   `install.sh`, `lib/` and `payload/` — the files that execute during an
   install or land on the VM — and `check-manifest-coverage.py` enforces exactly
-  that set. `wasp-topology.sh` and `wasp-pentest.sh` both run as root on the
+  that set. `wasp-topology.sh` and `wasp-sign-release.sh` run as root on the
   Proxmox host and are not signed. The topology tool reads only and changes
   nothing, which lowers the stakes without removing them: an attacker who can
   edit it can make a plan propose an address they control.
+
+  This gap narrowed in 10.5 for an unrelated reason. The external pentest
+  harness used to live here too, and it was the one that mattered: executable
+  code, run against live client sites, whose output decides whether an
+  operator believes a perimeter holds. A tampered copy that always reports
+  PASS is this project's characteristic defect with a signature-shaped hole in
+  it. Moving it to its own project removes it from this trust boundary rather
+  than resolving the question — wherever it now lives, it needs its own
+  integrity story, and "it used to be in a repo with a signed manifest that
+  did not cover it" was never one.
   Widening the signed set is a change to the release trust boundary — the
   manifest, the check, and `verify_release()` in `install.sh` — so it is noted
   here for a decision rather than made quietly as part of adding a tool.
