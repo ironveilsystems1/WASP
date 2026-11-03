@@ -56,6 +56,102 @@ CONTENT_MARKERS = (
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".github"}
 EXEMPT_FILES = {"CHANGELOG.md", os.path.basename(__file__)}
 
+# ── Routable addresses ───────────────────────────────────────────────────────
+#
+# ADDED 2026-10-25, after this check reported CLEAN on a tree that contained a
+# client's name in twenty places, their public IP as a live allowlist entry in
+# the test data, and their Proxmox node name. All of it was about to be pushed
+# to a public GitHub org.
+#
+# The check was not broken. It is filename-led BY DESIGN and says so, and its
+# content markers only ever ran on .md and .txt — so a .sh file naming a
+# client was never examined. A control that is correct, documented, and blind
+# to the thing it is named for is this project's characteristic defect, and it
+# turned up here in the check written to prevent exactly this.
+#
+# This addition stays inside the original scope rule: it is not a PII scanner.
+# It asks one precisely answerable question — does this repository contain an
+# IPv4 address that routes on the public internet? A platform repo has no
+# legitimate need for one. Every example belongs in a documentation range.
+#
+# Scanned across ALL text files, not just prose, because the leak was in a
+# shell script.
+_ALLOWED_V4 = (
+    (0, 0),            # 0.0.0.0/8      this network
+    (10, 0),           # 10.0.0.0/8     private
+    (127, 0),          # 127.0.0.0/8    loopback
+    (169, 254),        # 169.254/16     link-local
+    (172, 16), (172, 17), (172, 18), (172, 19), (172, 20), (172, 21),
+    (172, 22), (172, 23), (172, 24), (172, 25), (172, 26), (172, 27),
+    (172, 28), (172, 29), (172, 30), (172, 31),          # private
+    (192, 168),        # private
+    (192, 0),          # 192.0.0/24 IETF, 192.0.2/24 TEST-NET-1
+    (198, 18), (198, 19),   # benchmarking
+    (198, 51),         # 198.51.100/24 TEST-NET-2
+    (203, 0),          # 203.0.113/24  TEST-NET-3
+    (255, 255),        # broadcast
+)
+
+# Public infrastructure constants, not client data. The installer offers these
+# as resolver choices and must ship their real addresses — a documentation
+# range would make the feature not work.
+#
+# This list is the difference between a check people act on and one they learn
+# to skip. The first run flagged 46 files, 40 of them public resolvers, and
+# buried three genuine leaks (a web developer's two personal addresses and a
+# past operator's) in the noise. The original author's note on NAME_MARKERS
+# applies exactly: "a check firing on a correct file trains people to ignore
+# it."
+#
+# Add to this only for an address that is genuinely public infrastructure.
+# An address belonging to a client, a contractor or an operator never
+# qualifies, however convenient the example.
+_PUBLIC_INFRA = {
+    "9.9.9.9", "149.112.112.112",                  # Quad9
+    "149.112.121.10", "149.112.122.10",            # CIRA Canadian Shield
+    "1.1.1.1", "1.0.0.1",                          # Cloudflare
+    "8.8.8.8", "8.8.4.4",                          # Google
+    "94.140.14.14", "94.140.15.15",                # AdGuard
+    "76.76.2.0", "76.76.10.0",                     # Control D
+    "185.222.222.222", "45.11.45.11",              # DNS.SB
+    "89.233.43.71", "91.239.100.100",              # UncensoredDNS
+    "5.1.66.255", "185.150.99.255",                # FDN / Freifunk
+    "86.54.11.100", "86.54.11.200",                # DNS4EU
+    "45.148.10.62",                                # CrowdSec CTI demo lookup
+}
+
+_IPV4 = re.compile(r"(?<![\w.])((?:\d{1,3}\.){3}\d{1,3})(?![\w.])")
+
+_TEXT_SUFFIXES = (".sh", ".php", ".py", ".md", ".txt", ".conf", ".cron",
+                  ".yar", ".xml", ".json", ".service", ".yaml", ".yml")
+
+
+def _routable_v4(text):
+    """Public IPv4 literals in this text, deduplicated and in order."""
+    found = []
+    for m in _IPV4.finditer(text):
+        raw = m.group(1)
+        try:
+            octets = [int(o) for o in raw.split(".")]
+        except ValueError:
+            continue
+        if len(octets) != 4 or any(o > 255 for o in octets):
+            continue          # a version string, not an address
+        if raw in _PUBLIC_INFRA:
+            continue
+        a, b = octets[0], octets[1]
+        if a >= 240:
+            continue          # 240.0.0.0/4 reserved
+        if (a, b) in _ALLOWED_V4 or (a, 0) in _ALLOWED_V4:
+            continue
+        if 100 <= a <= 100 and 64 <= b <= 127:
+            continue          # 100.64.0.0/10 CGNAT — NetBird, Tailscale
+        if 224 <= a <= 239:
+            continue          # multicast
+        if raw not in found:
+            found.append(raw)
+    return found
+
 
 def main():
     problems = []
@@ -69,17 +165,23 @@ def main():
             if any(m in low for m in NAME_MARKERS):
                 problems.append(f"{rel}: filename indicates client or sales material")
                 continue
-            if not fn.endswith((".md", ".txt")):
+            if not fn.endswith(_TEXT_SUFFIXES):
                 continue
             try:
                 text = open(os.path.join(root, fn), encoding="utf-8",
                             errors="replace").read()
             except OSError:
                 continue
-            for pat in CONTENT_MARKERS:
-                if pat.search(text):
-                    problems.append(f"{rel}: content reads as notes on a specific engagement")
-                    break
+            if fn.endswith((".md", ".txt")):
+                for pat in CONTENT_MARKERS:
+                    if pat.search(text):
+                        problems.append(
+                            f"{rel}: content reads as notes on a specific engagement")
+                        break
+            for addr in _routable_v4(text):
+                problems.append(
+                    f"{rel}: routable IPv4 address {addr} — use a documentation "
+                    f"range (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)")
 
     if problems:
         print(f"FOUND {len(problems)} file(s) that should not be in this repository:")

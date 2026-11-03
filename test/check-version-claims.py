@@ -53,8 +53,19 @@ def scan(shipped):
     return problems
 
 
+def installer_versions(text):
+    """(WASP_RELEASE, WASP_VERSION) as install.sh assigns them."""
+    rel = re.search(r'^WASP_RELEASE="([^"]*)"', text, re.M)
+    ver = re.search(r'^WASP_VERSION="([^"]*)"', text, re.M)
+    return (rel.group(1) if rel else None, ver.group(1) if ver else None)
+
+
 def self_test():
     assert scan("9.9.9-php9.9-apache"), "self-test: mismatch not detected"
+    r, v = installer_versions('WASP_RELEASE="1.0"\nWASP_VERSION="1.1"\n')
+    assert r != v, "self-test: version split not detected"
+    r, v = installer_versions('WASP_RELEASE="1.1"\nWASP_VERSION="1.1"\n')
+    assert r == v, "self-test: matching versions misread"
     return True
 
 
@@ -64,6 +75,15 @@ def main():
         print("check-version-claims: could not read the shipped tag — skipping")
         return 0
     self_test()
+    # There is one version. 10.5 shipped WASP_VERSION=10.5 beside
+    # WASP_RELEASE=10.4, and the signing tool reads WASP_RELEASE, so the
+    # release's signed trusted comment would have named the wrong build.
+    rel, ver = installer_versions(
+        open(os.path.join(REPO, "install.sh"), encoding="utf-8", errors="replace").read())
+    if not rel or rel != ver:
+        print(f"WASP_RELEASE ({rel}) and WASP_VERSION ({ver}) disagree in install.sh.")
+        print("  The signing tool reads one and the VM records the other.")
+        return 1
     problems = scan(shipped)
     if problems:
         print(f"FOUND {len(problems)} stale version claim(s). Shipped: {shipped}")

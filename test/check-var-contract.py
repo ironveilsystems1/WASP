@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Producer/consumer variable contract across the sourced stages.
 
-PORTED INTO WASP after a real install on tispve (melroseparkfire, 2026-10-17).
+PORTED INTO WASP after a real install on pve01 (client-a, 2026-10-17).
 lib/03 read "${SCRIPT_DIR}/payload/templates/slug-rewrite.rules"; SCRIPT_DIR is
 assigned nowhere in this project (the repo root is REPO_DIR), so sed was handed
 "/payload/templates/..." and failed. The command substitution yielded empty, the

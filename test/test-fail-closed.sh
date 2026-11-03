@@ -23,6 +23,34 @@
 #
 # In each case the positive test passed. The control was there. It did nothing.
 #
+# THE FIRST ONE IN THAT LIST HAS NOW BEEN PROVEN TO WORK
+#
+# 2026-10-25, client-a.example, against a real attacker rather than a
+# fixture. A credential attempt arrived from 198.51.100.23 as POST //xmlrpc.php
+# (the doubled slash is a deliberate attempt to slip past path-based blocks):
+#
+#   14:39:09 UTC  02-wpvm-login-guard logs the failure and sends the alert
+#   14:39:25 UTC  the bouncer at the edge denies that address with 'ban'
+#
+# Sixteen seconds, unattended, on a Sunday. Every link in the chain that was
+# once inert — mu-plugin logging, acquisition reading the right file, parser
+# matching, scenario firing, LAPI decision, bouncer pulling — carried the
+# event, and each link is observable in the record: the alert mail carries the
+# detection timestamp and the nginx log carries the enforcement one, so the
+# gap between them is measurable rather than asserted.
+#
+# That is recorded here, in the file that holds up this chain as the canonical
+# failure, because a document that only accumulates defects teaches the wrong
+# lesson. The chain is no longer a cautionary tale. It is a control with a
+# live result and a measured latency.
+#
+# The alert itself earned its keep too. It carries a line reading "if this
+# address is your reverse proxy rather than a real client, forwarding is
+# misconfigured and this lockout is affecting EVERY visitor" — self-diagnosing
+# output that tells the operator which of two very different situations they
+# are in, before they start investigating. In this case the address was a real
+# client and the note correctly did not apply.
+#
 # The compliance-testing literature names this exactly: positive tests
 # "indicate whether system controls are designed effectively, but are unable to
 # ensure that an implemented control is actually effective at protecting an
@@ -252,7 +280,7 @@ _t6c() { local prof="$1" ep="$2" blocked=0
 # noting. Each fail-closed path is asserted to be present at its call site, so
 echo ""
 echo "── Install-time topology validation"
-# From the melroseparkfire install: every prompt answered, disk image built,
+# From the client-a install: every prompt answered, disk image built,
 # whole payload injected, then dead at VM creation on
 #   storage 'local-vm' does not exist
 # Three faults lined up to make a one-character typo cost a full run: the
@@ -279,7 +307,7 @@ while i < len(src):
 print('\n'.join(out))
 PYX
 if [ -s "$_t0" ]; then
-  # Driven with tispve's real `pvesm status` column layout.
+  # Driven with pve01's real `pvesm status` column layout.
   _stor() { ( . "$_t0"
     pvesm(){ printf 'Name Type Status Total Used Avail %%\nlocal dir active 9 4 8 4%%\nlocal-lvm lvmthin active 1 0 1 0%%\n'; }
     _storage_exists "$1" ); }
@@ -321,7 +349,7 @@ rm -f "$_t0"
 
 echo ""
 echo "── Generated nftables syntax"
-# From the melroseparkfire install (tispve, 2026-10-17). ALLOWED_ADMIN_IP is
+# From the client-a install (pve01, 2026-10-17). ALLOWED_ADMIN_IP is
 # SPACE-separated (Apache's `Require ip` takes that natively); WEB_CIDR and
 # SSH_CIDR become nftables SET ELEMENTS, which are comma-separated. The two
 # were joined with a bare comma, so a two-address admin list produced a space
@@ -337,11 +365,11 @@ if command -v nft >/dev/null 2>&1; then
     if nft -c -f "$f" >/dev/null 2>&1; then rm -f "$f"; return 0; fi
     rm -f "$f"; return 1
   }
-  _nftok '10.20.10.10,10.0.0.4/24,98.206.9.121 100.87.54.172' \
+  _nftok '10.20.10.10,10.0.0.4/24,203.0.113.10 100.64.0.10' \
     && _f "a space inside an nft set was accepted by this test" \
           "the test is wrong, not the code" \
     || _p "a space inside an nft set is rejected by nft (the original defect)"
-  _nftok '10.20.10.10,10.0.0.4/24,98.206.9.121,100.87.54.172' \
+  _nftok '10.20.10.10,10.0.0.4/24,203.0.113.10,100.64.0.10' \
     && _p "the normalised comma list loads" \
     || _f "the normalised list does not load" "_csv is producing something nft rejects"
 else
@@ -352,7 +380,7 @@ fi
 _c0="$(mktemp)"; sed -n '/^_csv()/,/^}/p' "$REPO/lib/00-preflight.sh" > "$_c0"
 if [ -s "$_c0" ]; then
   _csvq() { ( . "$_c0"; _csv "$1" ); }
-  [ "$(_csvq '10.0.0.4/24,98.206.9.121 100.87.54.172')" = "10.0.0.4/24,98.206.9.121,100.87.54.172" ] \
+  [ "$(_csvq '10.0.0.4/24,203.0.113.10 100.64.0.10')" = "10.0.0.4/24,203.0.113.10,100.64.0.10" ] \
     && _p "_csv normalises a mixed comma/space list" \
     || _f "_csv did not normalise the list that broke the ruleset" ""
   [ -z "$(_csvq '')" ] && _p "_csv on empty yields empty" || _f "_csv invented a value from nothing" ""
@@ -417,10 +445,10 @@ if [ -s "$_m0" ]; then
   # The overlay address must be OFFERED here, having been excluded as a VM
   # address candidate: the same data, two opposite correct answers.
   _ovl=$( . "$_m0"
-    ip(){ printf '5: wt0\n    inet 100.87.54.172/16 scope global wt0\n'; }
+    ip(){ printf '5: wt0\n    inet 100.64.0.10/16 scope global wt0\n'; }
     _overlay_addrs )
   case "$_ovl" in
-    *100.87.54.172*) _p "the overlay address is offered at the admin-source prompt" ;;
+    *100.64.0.10*) _p "the overlay address is offered at the admin-source prompt" ;;
     *) _f "the overlay address is not offered" \
           "it is excluded from VM-address hints; here it is the likely answer" ;;
   esac
@@ -432,7 +460,7 @@ rm -f "$_m0"
 unset _src _ovl
 
 # ── The never-ban prompt replaces its default ────────────────────────────────
-# Behavioural, driven with melroseparkfire's exact answers. The operator
+# Behavioural, driven with client-a's exact answers. The operator
 # answered YES to the CGNAT question, was told "your remote source address is
 # covered", then typed two addresses at the next prompt and lost the overlay
 # range, the SSH source and the public admin IP in one keystroke — while that
@@ -447,7 +475,7 @@ _c1="$(mktemp)"; sed -n '/^_csv()/,/^}/p' "$REPO/lib/00-preflight.sh" > "$_c1"
 if [ -s "$_w0" ] && [ -s "$_c1" ]; then
   _wlq() { ( . "$_c1"
     msg_warn(){ :; }; msg_ok(){ :; }; msg_info(){ :; }
-    _CS_DEFAULT="10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10"
+    _CS_DEFAULT="10.20.10.10,203.0.113.10,10.20.1.254/32,100.64.0.0/10"
     _CS_OVERLAY_OPTIN=1; CS_ENFORCEMENT="upstream"; PROXY_IP="10.20.10.10"
     CROWDSEC_WHITELIST="$1"
     # A herestring, NOT `printf | . "$_w0"`: the right-hand side of a pipe runs
@@ -477,8 +505,8 @@ if [ -s "$_w0" ] && [ -s "$_c1" ]; then
     || _f "declining still altered the list (got '${_kept}')" \
           "a deliberate narrow answer must survive the offer"
   # Accepting the default must NOT warn — a prompt that always fires is noise.
-  _same=$(_wlq "10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10" "y")
-  [ "$_same" = "10.20.10.10,98.206.9.121,10.20.1.254/32,100.64.0.0/10" ] \
+  _same=$(_wlq "10.20.10.10,203.0.113.10,10.20.1.254/32,100.64.0.0/10" "y")
+  [ "$_same" = "10.20.10.10,203.0.113.10,10.20.1.254/32,100.64.0.0/10" ] \
     && _p "an unchanged default raises nothing" \
     || _f "the check fired on an unchanged default (got '${_same}')" \
           "a warning that always fires is one the operator learns to skip"
@@ -495,8 +523,8 @@ unset _merged _kept _same
 # /etc/network/interfaces does not fix that: it is a Debian resolvconf
 # extension that Alpine's busybox ifupdown parses and discards.
 #
-# From the melroseparkfire install: tispve runs NetBird, which owns that file
-# and points it at 100.87.54.172. The address leaked into the VM, which has no
+# From the client-a install: pve01 runs NetBird, which owns that file
+# and points it at 100.64.0.10. The address leaked into the VM, which has no
 # route to 100.64.0.0/10 and whose own firewall blocks SITE_NETS ->
 # PRIVATE_NETS. Every lookup timed out and apk died on the first mirror fetch,
 # fifteen minutes into an unattended build, with the installer having printed
@@ -515,7 +543,7 @@ if [ -s "$_n0" ]; then
     ( msg_ok(){ :; }; msg_warn(){ :; }; msg_error(){ exit 9; }
       MNT=$(mktemp -d); trap 'rm -rf "$MNT"' EXIT
       mkdir -p "$MNT/etc/network"
-      printf '# Generated by NetBird\nnameserver 100.87.54.172\n' > "$MNT/etc/resolv.conf"
+      printf '# Generated by NetBird\nnameserver 100.64.0.10\n' > "$MNT/etc/resolv.conf"
       NET_MODE="${2:-static}" VM_STATIC_IP=10.20.101.10 VM_NETMASK=255.255.255.0
       VM_PREFIX=24 VM_GATEWAY=10.20.101.1 VM_DNS="$1"
       . "$_n0" >/dev/null 2>&1
@@ -529,12 +557,12 @@ if [ -s "$_n0" ]; then
           "dns-nameservers alone is discarded by busybox ifupdown" ;;
   esac
   case "$_r" in
-    *100.87.54.172*) _f "the host's leaked resolver survived into the image" \
-                        "this is the melroseparkfire failure exactly" ;;
+    *100.64.0.10*) _f "the host's leaked resolver survived into the image" \
+                        "this is the client-a failure exactly" ;;
     *NetBird*)       _f "the host's resolv.conf was not replaced" "" ;;
     *) _p "the Proxmox host's leaked resolv.conf is replaced" ;;
   esac
-  _refused "100.87.54.172" \
+  _refused "100.64.0.10" \
     && _p "a CGNAT/overlay resolver is refused before the VM ships" \
     || _f "a CGNAT resolver was accepted" \
           "the VM cannot route to 100.64.0.0/10; it fails at the first apk fetch"
@@ -543,7 +571,7 @@ if [ -s "$_n0" ]; then
     || _f "127.0.0.53 was accepted" "that stub belongs to the host, not the VM"
   _rd=$(_dnsq "" "dhcp")
   case "$_rd" in
-    *100.87.54.172*) _f "DHCP mode still ships the host's leaked resolver" \
+    *100.64.0.10*) _f "DHCP mode still ships the host's leaked resolver" \
                         "a failed lease would resolve against the hypervisor" ;;
     *) _p "DHCP mode clears the host copy too" ;;
   esac
@@ -565,7 +593,7 @@ unset _r _rd
 # Both helpers sit next to each other in lib/00, which is exactly what makes
 # forgetting one of them easy.
 #
-# From the melroseparkfire install: _ask_cidr was taught to accept several
+# From the client-a install: _ask_cidr was taught to accept several
 # ranges, the nftables consumers were converted with _csv, and lib/03's
 # Require ip lines were not. wp-security.conf stopped parsing, Apache never
 # started, every request to the VM was refused, and it surfaced two stages
@@ -585,7 +613,7 @@ fi
 rm -f "$_s0"
 
 # ── Variables the VM reads must be variables the VM was given ────────────────
-# From the melroseparkfire install, and the most expensive bug of the set to
+# From the client-a install, and the most expensive bug of the set to
 # diagnose because both halves looked correct in isolation:
 #
 #   lib/03, on the Proxmox host  — opens the firewall from Squid to exactly
@@ -1317,6 +1345,246 @@ if [ -n "$_cs_missing" ]; then
 else
   _p "every CrowdSec topology variable the installer sets is carried across updates"
 fi
+
+# ── wp-config repair must not redefine what the image already defined ───────
+#
+# The official image evaluates WORDPRESS_CONFIG_EXTRA through eval() earlier
+# in wp-config.php, so a constant can exist at runtime even when the textual
+# check does not find it in the file. Injecting bare define() calls then
+# produced fifteen "Constant X already defined" warnings PER REQUEST. On a
+# real VM php-errors.log reached 1.4 MB of it and buried an actual fatal
+# forty lines deep. A log nobody can read is a log nobody reads.
+_guard "the wp-config repair injects guarded defines" \
+  "payload/stages/06-containers-mariadb-wordpress.sh" 'defined("\\1") || define'
+if grep -q 'awk -v extra="\$WP_CONFIG_EXTRA"' \
+     "$REPO/payload/stages/06-containers-mariadb-wordpress.sh" 2>/dev/null; then
+  _f "the wp-config repair injects the raw extra again" \
+     "every already-defined constant warns on every request"
+else
+  _p "the wp-config repair injects the guarded form, not the raw extra"
+fi
+
+# ── An import fetch must go through the egress proxy ────────────────────────
+#
+# `wp-import.sh fetch url` called curl with no proxy. On any VM running the
+# egress filtering that is this product's purpose, the request is dropped at
+# the firewall -- so a documented path could not work on a correctly
+# configured install. Same shape as the MFA verification command and the
+# LAPI port: documented, reachable-looking, inoperable.
+_guard "wp-import fetch routes through the egress proxy" \
+  "payload/bin/wp-import.sh" 'curl -fL --progress-bar -x "\$_imp_proxy"'
+_guard "a refused fetch tells the operator to allowlist the host" \
+  "payload/bin/wp-import.sh" "not allowlisted"
+# A share link ends in an ACCESS TOKEN, not a filename. Taking basename gave
+# a 653 MB archive no extension and a name matching nothing the operator
+# asked for; `inspect melroseg.zip` then said "Not found", which reads as a
+# failed download when the download had succeeded.
+_guard "fetch recovers the real filename from a tokenised share URL" \
+  "payload/bin/wp-import.sh" "URL ends in a token"
+
+# ── SCAN_PATH must not be wiped before it is read ───────────────────────────
+#
+# wp-malware-scan.sh had an unconditional SCAN_PATH="" that erased any
+# inherited value, so `SCAN_PATH=/tree wp-malware-scan.sh yara` silently
+# scanned the LIVE SITE. It then reported "nothing critical found" about a
+# tree the operator had not asked about. On a real VM 33 MB of imported
+# uploads went into the live site behind a clean verdict that had never
+# looked at them.
+if grep -qE '^SCAN_PATH=""$' "$REPO/payload/bin/wp-malware-scan.sh" 2>/dev/null; then
+  _f "wp-malware-scan.sh wipes SCAN_PATH before reading it" \
+     "the env var is silently ignored and the wrong tree is scanned and reported clean"
+else
+  _p "wp-malware-scan.sh honours an inherited SCAN_PATH"
+fi
+_guard "SCAN_PATH defaults without clobbering the environment" \
+  "payload/bin/wp-malware-scan.sh" 'SCAN_PATH="\${SCAN_PATH:-}"'
+
+# ── An import confirmation must distinguish EOF from a refusal ──────────────
+#
+# `apply` printed "Cancelled — nothing changed" on EOF, identical to what it
+# prints when the operator declines. Run over the guest agent it cancelled
+# silently, and the operator continued with follow-up steps against a
+# database that had never been imported.
+_guard "the import confirmation says when there was nobody to ask" \
+  "payload/bin/wp-import.sh" "Nothing was cancelled by choice"
+if grep -qE '^\s*read -r _cf$' "$REPO/payload/bin/wp-import.sh" 2>/dev/null; then
+  _f "the import confirmation cannot tell EOF from a refusal" \
+     "an unanswerable prompt reports as the operator's own cancellation"
+else
+  _p "the import confirmation detects EOF"
+fi
+
+# ── A misplaced scanner flag must refuse, not scan something else ───────────
+#
+# The option loop breaks at the first non-flag argument, so
+# `wp-malware-scan.sh yara --path /staged` discarded --path, scanned the
+# LIVE SITE, and reported "nothing critical found". The operator copied an
+# unexamined tree into production on the strength of that verdict. It
+# contained a webshell.
+_guard "a flag after the command is refused rather than ignored" \
+  "payload/bin/wp-malware-scan.sh" "must come BEFORE the command"
+_guard "the refusal explains the correct ordering" \
+  "payload/bin/wp-malware-scan.sh" "Refusing rather than scanning something you did not ask for"
+
+# ── The import pipeline must handle a nested (cPanel) archive ───────────────
+#
+# THE FAILURE CHAIN THIS CLOSES. A cPanel account backup nests the site at
+# <account>/public_html/, so wp-content sits at depth 3 and the UpdraftPlus
+# dump at depth 5. Site-root detection searched to maxdepth 2 and dump
+# collection to maxdepth 3, so BOTH missed. The operator worked around the
+# pipeline by extracting and copying by hand -- which bypassed the scan gate
+# -- and the tree they copied in contained a webshell.
+#
+# The depth limits were not cosmetic: they are what routed a compromised
+# upload tree around the control designed to catch it.
+_guard "site-root detection reaches a nested public_html" \
+  "payload/bin/wp-import.sh" "maxdepth 6 -type d -name wp-content"
+# A backup archive is full of decoy wp-content dirs (updraft/, plugins-old/).
+# A real site root also has wp-includes or wp-config.php beside it.
+_guard "site-root detection requires wp-includes or wp-config.php alongside" \
+  "payload/bin/wp-import.sh" 'wp-includes" \] || \[ -f "\${_p}/wp-config.php"'
+_guard "dump collection reaches an UpdraftPlus directory" \
+  "payload/bin/wp-import.sh" "maxdepth 8"
+# An archive routinely holds several dated dumps. `ls | head -1` takes the
+# first ALPHABETICALLY, which for backup_2025-* vs backup_2026-* is the
+# OLDEST -- restoring a site to a year earlier than the operator believes,
+# silently, with the site coming up looking plausible.
+if grep -qE '_dump=\$\(ls -1 "\$\{_st\}/db"/\* 2>/dev/null \| head -1\)' \
+     "$REPO/payload/bin/wp-import.sh" 2>/dev/null; then
+  _f "apply picks a dump alphabetically again" \
+     "the oldest backup sorts first and is restored silently"
+else
+  _p "apply refuses to choose between multiple dumps"
+fi
+_guard "multiple staged dumps stop the import" \
+  "payload/bin/wp-import.sh" "Refusing to choose between them"
+
+# ── Prefix keys must be settled in SQL, not guessed from dump text ──────────
+#
+# The text rewrite handled the TABLE names and left the capability KEYS, so
+# the import reported success and the site had no roles at all: wp-cli said
+# "Role doesn'"'"'t exist: administrator" and the admin list was empty. The regex
+# is correct under both GNU and busybox sed, so the cause is dump-format
+# specific -- which is the point. Rewriting VALUES by pattern-matching
+# someone else'"'"'s serialiser is guessing; SQL is exact.
+_guard "the prefix rewrite is verified in SQL after import" \
+  "payload/bin/wp-import.sh" "stranded-remaining:"
+_guard "a stranded prefix key is reported, not passed over" \
+  "payload/bin/wp-import.sh" "Users will have no roles"
+
+# ── The obfuscation family that got past YARA ───────────────────────────────
+#
+# The webshell found on a client import used goto-dispatch control flow and
+# assembled "file_put_contents" from character indices, so the dangerous
+# name never appeared in the file. No rule matched it; only the structural
+# "PHP in uploads" check caught it, and only after placement.
+_guard "the ruleset covers goto-dispatch obfuscation" \
+  "payload/malware/wp-malware.yar" "rule wpvm_goto_dispatch_obfuscation"
+_guard "the ruleset covers character-index function assembly" \
+  "payload/malware/wp-malware.yar" "rule wpvm_charindex_function_assembly"
+# A rule the scanner does not grade as critical is a rule that reports as
+# "review this sometime".
+_guard "both new rules are graded critical by the scanner" \
+  "payload/bin/wp-malware-scan.sh" "wpvm_goto_dispatch_obfuscation|wpvm_charindex_function_assembly"
+
+# ── Removing a domain from the allowlist must actually remove it ────────────
+#
+# `deny` used `grep -v … > tmp && mv -f tmp "$RUNTIME"`, and mv REPLACES THE
+# INODE. allowlist-runtime.txt is bind-mounted into the Squid container as a
+# single file, so the container kept reading the old inode. The tool printed
+# "Removed: <domain>" and "Squid reloaded", Squid reloaded from the stale
+# file, and the domain stayed permitted.
+#
+# `allow` appends, which keeps the inode -- which is why adding worked
+# instantly and removing never did, and why nobody noticed.
+#
+# A revocation that reports success without performing it is worse than one
+# that fails loudly: the operator has no reason to check, and an egress
+# route they believe is closed is open.
+if grep -qE 'mv -f "\$\{RUNTIME\}\.tmp" "\$RUNTIME"' \
+     "$REPO/payload/bin/wasp-egress.sh" 2>/dev/null; then
+  _f "wasp-egress deny replaces the inode again" \
+     "the Squid container keeps reading the old file and the domain stays allowed"
+else
+  _p "wasp-egress deny rewrites in place, preserving the bind-mounted inode"
+fi
+_guard "deny verifies removal from inside the container" \
+  "payload/bin/wasp-egress.sh" "STILL present in Squid.s view"
+
+# ── The menu's guidance layer must be complete and reachable ────────────────
+#
+# A help system that covers most options is worse than none: the first
+# option without a card teaches the operator it is unreliable, and they stop
+# using it. Coverage is asserted by check-menu-help-coverage.py; these guard
+# the plumbing that makes the cards reachable at all.
+_guard "menu input is routed through the help-aware reader" \
+  "payload/bin/wasp-menu.sh" "_sel() {"
+_guard "every submenu prompt offers help" \
+  "payload/bin/wasp-menu.sh" "?N = help on option N"
+# After a card, `c` is cleared so the caller's case falls through and the
+# menu redraws. If that stops happening, a help request would be dispatched
+# as a menu selection -- asking for help on a destructive option would RUN it.
+# EVERY help branch must clear it, not just one. The first version of this
+# guard grepped for the string anywhere in the file and passed happily with
+# one of the two branches broken -- a guard with the same defect as the code
+# it guards against.
+_sel_body=$(sed -n '/^_sel() {/,/^}$/p' "$REPO/payload/bin/wasp-menu.sh" 2>/dev/null)
+_sel_help=$(printf '%s\n' "$_sel_body" | grep -c "_help ")
+_sel_clear=$(printf '%s\n' "$_sel_body" | grep -c "c=''; return 0")
+if [ "${_sel_help:-0}" -eq 0 ]; then
+  _f "_sel no longer offers help" "?N would be dispatched as a menu selection"
+elif [ "${_sel_clear:-0}" -lt "${_sel_help:-0}" ]; then
+  _f "only ${_sel_clear} of ${_sel_help} help branches clear the selection" \
+     "a help request falls through as a selection — asking for help on a destructive option would RUN it"
+else
+  _p "every help branch clears the selection (${_sel_clear}/${_sel_help})"
+fi
+_guard "a first-time operator is offered a guided path" \
+  "payload/bin/wasp-menu.sh" "guided_start"
+# The project deliberately has no TUI toolkit on a hardened VM. If one
+# appears here, that decision was reversed by accident rather than on
+# purpose.
+if grep -qE '\b(whiptail|dialog|newt)\b' "$REPO/payload/bin/wasp-menu.sh" 2>/dev/null \
+   | grep -qv '^#'; then
+  _f "wasp-menu.sh calls a TUI toolkit" \
+     "that adds newt/ncurses to every hardened VM to draw boxes"
+else
+  _p "wasp-menu.sh stays dependency-free (no whiptail/dialog)"
+fi
+
+# ── Live-answer checks in the validator ─────────────────────────────────────
+# Run from the shipped text with podman and rc-service stubbed, so what is
+# tested is the branch logic the operator actually gets. The remoteip block
+# matters most in its third case: a failed `podman exec` must not read as
+# "masked", which is the failure an exit-code test has.
+echo ""
+echo "── Validator: judged on the live answer"
+_vblock() {  # awk range from the validator; $1 start regex, $2 end regex
+  awk -v s="$1" -v e="$2" '$0 ~ s {on=1} on {print} on && $0 ~ e {exit}' \
+    "$REPO/payload/bin/validate-wordpress.sh"
+}
+_vrun() {  # $1 block, $2 podman stub, $3 rc-service stub, $4 CS_ENFORCEMENT
+  CS_ENFORCEMENT="$4" bash -c '
+    pass() { echo PASS; }; fail() { echo FAIL; }; warn() { echo WARN; }
+    podman() { '"$2"'; }
+    rc-service() { '"$3"'; }
+    eval "$0"' "$1" 2>/dev/null
+}
+_vexpect() {  # $1 description, $2 expected, $3 got
+  if [ "$3" = "$2" ]; then _p "$1"
+  else _f "$1" "expected $2, got '${3:-nothing}'"; fi
+}
+_rim_block=$(_vblock '^_rim=\$\(podman exec wordpress' '^esac$')
+_vexpect "remoteip: an empty file passes"         PASS "$(_vrun "$_rim_block" 'echo masked' ':' local)"
+_vexpect "remoteip: active directives FAIL"       FAIL "$(_vrun "$_rim_block" 'echo active' ':' local)"
+_vexpect "remoteip: a failed exec is not a pass"  WARN "$(_vrun "$_rim_block" 'return 125' ':' local)"
+_bnc_block=$(_vblock '^_bouncer_up=0' '^esac$')
+_up='echo " * status: started"'; _down='echo " * status: stopped"'
+_vexpect "bouncer: agent-only with none running passes"  PASS "$(_vrun "$_bnc_block" ':' "$_down" upstream)"
+_vexpect "bouncer: agent-only with one running warns"    WARN "$(_vrun "$_bnc_block" ':' "$_up"   upstream)"
+_vexpect "bouncer: detect-only warns"                    WARN "$(_vrun "$_bnc_block" ':' "$_down" detect-only)"
+_vexpect "bouncer: local with none running warns"        WARN "$(_vrun "$_bnc_block" ':' "$_down" local)"
+_vexpect "bouncer: local with one running passes"        PASS "$(_vrun "$_bnc_block" ':' "$_up"   local)"
 
 # ── Result ───────────────────────────────────────────────────────────────────
 echo ""
