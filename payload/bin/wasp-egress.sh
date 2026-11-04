@@ -9,6 +9,8 @@
 #   wasp-egress maintenance status | disable
 #   wasp-egress allow <domain>      add to the runtime allowlist
 #   wasp-egress deny <domain>       remove from it
+#   wasp-egress import-source add|remove|list [host]
+#                                   hosts wp-import.sh may open for one download
 #
 # THE BOUNDARY
 #
@@ -44,6 +46,7 @@ LOGS="${SQ}/logs"
 RUNTIME="${CONF}/allowlist-runtime.txt"
 MAINT="${CONF}/allowlist-maintenance.txt"
 MAINT_META="${CONF}/.maintenance"
+IMPORT_SOURCES=/etc/wp-install/import-sources.txt
 PROXY_HOST=10.89.10.2
 PROXY_PORT=3128
 
@@ -457,5 +460,52 @@ allow|deny)
     || { _bad "Squid rejected the configuration — restoring the previous list"
          cp "$(ls -1t ${RUNTIME}.bak-* | head -1)" "$RUNTIME"; exit 1; } ;;
 
-*) sed -n '4,12p' "$0" ;;
+# ── Import sources ───────────────────────────────────────────────────────────
+# A file host for backups is needed for a few minutes during an import, and
+# nothing else. The runtime allowlist is the wrong place for it: that list is
+# what a compromised WordPress may reach at any hour, and a file-sharing service
+# is an exfiltration route with an upload button.
+#
+# So this list grants nothing by itself. It names hosts `wp-import.sh fetch url`
+# may open, through the maintenance window, for that download alone. The window
+# is logged and emailed like any other, and expires even if the fetch dies.
+#
+# Exact hostnames only. A leading dot would admit every customer of a shared
+# platform, including one an attacker signed up for.
+import-source)
+  _sub="${2:-list}"; _h=$(printf '%s' "${3:-}" | tr 'A-Z' 'a-z')
+  case "$_sub" in
+    list)
+      _hdr "Import sources"
+      if [ -s "$IMPORT_SOURCES" ]; then sed 's/^/  /' "$IMPORT_SOURCES"
+      else echo "  (none)"; fi
+      echo ""
+      _note "Reachable only while wp-import.sh fetch url is downloading from them." ;;
+    add|remove|has)
+      case "$_h" in
+        ''|.*|*[!a-z0-9.-]*|*..*|-*)
+          [ "$_sub" = has ] && exit 1
+          _bad "Give an exact hostname, with no scheme, path or leading dot."
+          exit 1 ;;
+      esac
+      case "$_h" in *.*) : ;; *) [ "$_sub" = has ] && exit 1; _bad "Give a full hostname."; exit 1 ;; esac
+      case "$_sub" in
+        has) grep -qxF "$_h" "$IMPORT_SOURCES" 2>/dev/null ;;
+        add)
+          mkdir -p "$(dirname "$IMPORT_SOURCES")"
+          grep -qxF "$_h" "$IMPORT_SOURCES" 2>/dev/null || printf '%s\n' "$_h" >> "$IMPORT_SOURCES"
+          logger -t wasp-egress "import source added: ${_h}" 2>/dev/null || true
+          _ok "${_h} may be opened for an import download." ;;
+        remove)
+          if [ -f "$IMPORT_SOURCES" ]; then
+            grep -vxF "$_h" "$IMPORT_SOURCES" > "${IMPORT_SOURCES}.tmp" || true
+            cat "${IMPORT_SOURCES}.tmp" > "$IMPORT_SOURCES"; rm -f "${IMPORT_SOURCES}.tmp"
+          fi
+          _ok "${_h} removed." ;;
+      esac ;;
+    *) echo "Usage: wasp-egress import-source add|remove|list [host]" >&2; exit 1 ;;
+  esac
+  ;;
+
+*) sed -n '4,14p' "$0" ;;
 esac

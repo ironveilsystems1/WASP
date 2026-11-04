@@ -19,6 +19,10 @@ echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] wp-geoip-setup.sh starting ==="
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: must run as root"; exit 1; }
 [ -f /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
+# Only the WORDPRESS_* values. The root password stays out of containers that
+# run site code. A VM built before 10.10 has just the one file.
+WP_ENV_FILE=/etc/wordpress/wp.env
+[ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
 PRUN() {
   podman "$@"
 }
@@ -111,21 +115,20 @@ echo "Base image: ${CURRENT_WP_IMAGE}  ->  Target: ${GEOIP_IMG_TAG}"
 
 mkdir -p /home/wpuser/wp/geoip-build /home/wpuser/wp/geoip-db /home/wpuser/wp/apache-mods
 
-MMDB_ASSET_URL=$(wget -qO- https://api.github.com/repos/maxmind/mod_maxminddb/releases/latest 2>/dev/null \
-  | grep -oE '"browser_download_url":\s*"[^"]*mod_maxminddb-[0-9.]+\.tar\.gz"' \
-  | head -1 | sed -E 's/.*"(https[^"]+)"/\1/')
-if [ -z "$MMDB_ASSET_URL" ]; then
-  MMDB_ASSET_URL="https://github.com/maxmind/mod_maxminddb/releases/download/1.2.0/mod_maxminddb-1.2.0.tar.gz"
-  echo "GitHub API lookup failed — using pinned mod_maxminddb 1.2.0"
-else
-  echo "Latest mod_maxminddb release: $(basename "$MMDB_ASSET_URL")"
-fi
+# A fixed release with the hash of the file itself. This used to take whatever
+# the GitHub API called "latest" and compile it into Apache with no check at
+# all, so the code running in every request was whatever that download was.
+MMDB_VERSION="1.3.0"
+MMDB_SHA256="877d3a36fa4bbcf807468c00b8cfedd7e16fa4039c5d465b5490bbdb243ad5cd"
+MMDB_ASSET_URL="https://github.com/maxmind/mod_maxminddb/releases/download/${MMDB_VERSION}/mod_maxminddb-${MMDB_VERSION}.tar.gz"
+echo "mod_maxminddb ${MMDB_VERSION} (hash-pinned)"
 
 cat > /home/wpuser/wp/geoip-build/Containerfile << CONTAINERFILE
 FROM ${CURRENT_WP_IMAGE} AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
       apache2-dev libmaxminddb-dev build-essential curl ca-certificates \
     && curl -fsSL -o /tmp/mod_maxminddb.tar.gz "${MMDB_ASSET_URL}" \
+    && echo "${MMDB_SHA256}  /tmp/mod_maxminddb.tar.gz" | sha256sum -c - \
     && mkdir -p /tmp/build && tar xzf /tmp/mod_maxminddb.tar.gz -C /tmp/build --strip-components=1 \
     && cd /tmp/build && ./configure --with-apxs=/usr/bin/apxs && make \
     && find /tmp/build -name 'mod_maxminddb.so' -exec cp {} /tmp/mod_maxminddb.so \; \
@@ -400,7 +403,7 @@ podman run -d \
   --security-opt no-new-privileges:true \
   --pids-limit 200 --memory=768m --cpu-shares=512 \
   --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
-  --env-file /etc/wordpress/env \
+  --env-file "$WP_ENV_FILE" \
   -e WORDPRESS_DB_HOST=mariadb:3306 \
   -e WORDPRESS_DEBUG="" \
   -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \

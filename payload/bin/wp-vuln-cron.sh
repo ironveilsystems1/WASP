@@ -15,7 +15,29 @@ set -u
 OUT=$(mktemp) || exit 0
 trap 'rm -f "$OUT"' EXIT INT TERM
 
-/usr/local/bin/wp-plugins.sh vulns >"$OUT" 2>&1 || true
+_rc=0
+/usr/local/bin/wp-plugins.sh vulns >"$OUT" 2>&1 || _rc=$?
+
+# A scan that could not run is the one result that must not be silent. This used
+# to be `|| true`, then a look for findings: with no token, or a feed that stopped
+# downloading, no findings were possible, so a site went unscanned with no alert
+# and the job looked healthy. Alerted only while it lasts, and wp-notify
+# deduplicates on the body, so a standing fault is not a daily email.
+if [ "$_rc" -ne 0 ] || grep -q '^  INCOMPLETE:' "$OUT"; then
+    logger -t wp-vulns "vulnerability scan did not complete (exit ${_rc}) — run: wp-plugins.sh vulns"
+    grep '^  INCOMPLETE:' "$OUT" | while IFS= read -r line; do logger -t wp-vulns "  ${line}"; done
+    if [ -x /usr/local/bin/wp-notify.sh ]; then
+        BODY=$(mktemp)
+        {
+          printf 'The daily vulnerability scan on this site did not complete.\n'
+          printf 'No findings below does NOT mean no vulnerabilities.\n\n'
+          grep '^  INCOMPLETE:' "$OUT" || printf '  exit status %s\n' "$_rc"
+          printf '\nCheck:  wp-plugins.sh vuln-sources\n'
+        } > "$BODY"
+        /usr/local/bin/wp-notify.sh wp-vulns "Vulnerability scan incomplete" "$BODY"
+        rm -f "$BODY"
+    fi
+fi
 
 # A finding line starts with two spaces and a severity in brackets. Colour is
 # already suppressed here because stdout is not a terminal.

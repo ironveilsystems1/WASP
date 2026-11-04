@@ -25,22 +25,17 @@ www.wordfence.com
 # Alpine package updates
 .alpinelinux.org
 
-# ── Container registries, for image updates ──────────────────────────────────
-# Needed by update.sh; not by WordPress itself. Removing these means image
-# updates must be done from the Proxmox host instead, which is a defensible
-# choice for a locked-down deployment.
-# .docker.io covers registry-1.docker.io and auth.docker.io. Listing those
-# separately is not merely redundant -- squid's dstdomain ACL is a splay tree
-# and it treats a subdomain of an already-listed parent as a FATAL config
-# error, not a warning:
-#     ERROR: 'registry-1.docker.io' is a subdomain of '.docker.io'
-#     FATAL: Bungled ... acl runtime_allow dstdomain
-# which is what stopped a real production install. Never list both a leading-dot
-# parent and any of its subdomains in the same dstdomain file.
-production.cloudflare.docker.com
-.docker.io
-ghcr.io
-.githubusercontent.com
+# ── Container registries: not here, deliberately ─────────────────────────────
+# .docker.io, ghcr.io and .githubusercontent.com used to be listed "for
+# update.sh". update.sh never came through this proxy: it runs on the host, and
+# the host's own output chain reaches 80/443 directly. This file is read for
+# wp-front, so the only thing those entries did was let a compromised WordPress
+# fetch tools from GitHub and PUT to a registry. If one site's plugin updater
+# really needs GitHub:  doas wasp-egress.sh allow raw.githubusercontent.com
+#
+# dstdomain is a splay tree and treats a subdomain of an already-listed parent
+# as a FATAL config error. Never list both a leading-dot parent and any of its
+# subdomains in the same file.
 
 # ── NOT included, deliberately ───────────────────────────────────────────────
 # Gravatar, Google Fonts, jsdelivr, unpkg, and the rest of the CDN estate that

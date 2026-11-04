@@ -238,7 +238,7 @@ EOF
 
   EXAMPLE
     Press 3, then copy the report off the VM with scp. Note the -O flag:
-      scp -O admin@10.20.101.10:/var/log/wasp-testreport-*.txt .
+      scp -O admin@10.20.101.10:/tmp/wasp-testreport-* .
 EOF
     ;;
   health.4) _card "4 — Container / WordPress health" <<'EOF'

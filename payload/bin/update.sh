@@ -198,6 +198,20 @@ DIGEST_PIN_LOG="/var/log/wp-digest-pinning.log"
 # current here after every successful update. Deliberately NOT re-derived
 # from the running container's image string on every run (see header note).
 WP_TAG="" WP_DIGEST="" DB_TAG="" DB_DIGEST="" CS_TAG="" CS_DIGEST="" SQUID_TAG="" SQUID_DIGEST=""
+# WordPress gets only the WORDPRESS_* values. A VM built before 10.10 has just
+# the one file, so it is split here, and the next WordPress recreate below drops
+# the database root password out of that container.
+WP_ENV_FILE=/etc/wordpress/wp.env
+if [ ! -s "$WP_ENV_FILE" ] && [ -r /etc/wordpress/env ]; then
+  ( umask 077; grep '^WORDPRESS_' /etc/wordpress/env > "$WP_ENV_FILE" ) || true
+fi
+[ -s "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
+# The boot service builds the same container, so it has to agree, or the first
+# recreate after a reboot would put the root password back.
+if [ "$WP_ENV_FILE" = /etc/wordpress/wp.env ] && [ -f /etc/init.d/wp-container ]; then
+  sed -i 's#--env-file /etc/wordpress/env #--env-file /etc/wordpress/wp.env #' /etc/init.d/wp-container || true
+fi
+
 # shellcheck disable=SC1091
 [ -f /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
 
@@ -1123,7 +1137,7 @@ do_wp_update() {
     --security-opt no-new-privileges:true \
     --pids-limit 200 --memory=768m --cpu-shares=512 \
     --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
-    --env-file /etc/wordpress/env \
+    --env-file "$WP_ENV_FILE" \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     -e WP_ENVIRONMENT_TYPE=staging \
@@ -1239,7 +1253,7 @@ do_wp_update() {
     --security-opt no-new-privileges:true \
     --pids-limit 200 --memory=768m --cpu-shares=512 \
     --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
-    --env-file /etc/wordpress/env \
+    --env-file "$WP_ENV_FILE" \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -e WORDPRESS_DEBUG="" \
     -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \

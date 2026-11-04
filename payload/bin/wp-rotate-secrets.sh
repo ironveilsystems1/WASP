@@ -19,8 +19,8 @@
 #
 # THE HARD PART IS THAT A SECRET LIVES IN MORE THAN ONE PLACE
 #
-# The database password is in /etc/wordpress/env (the container environment),
-# in the MariaDB user's grant, and is read by WordPress from the environment.
+# The database password is in /etc/wordpress/env and wp.env, in the MariaDB
+# user's grant, and is read by WordPress from its container's environment.
 # Rotating it means changing MariaDB and the environment IN THE RIGHT ORDER,
 # or the running WordPress loses its database mid-request. This does that in an
 # order that keeps the site up, verifies the new credential works before
@@ -43,6 +43,9 @@ fi
 [ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 
 ENVF=/etc/wordpress/env
+WPENVF=/etc/wordpress/wp.env
+WP_ENV_FILE=$WPENVF
+[ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=$ENVF
 SECRETS=/home/wpuser/wp/secrets
 BACKUP_DIR=/root/.rotate-backups
 
@@ -59,9 +62,14 @@ _newpass() {
   echo
 }
 
-_mdb() { # run SQL as root inside the container
-  podman exec -i mariadb sh -c \
-    'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "$@"' _ "$@"
+# wp.env is derived from env, so the two cannot disagree.
+_sync_wp_env() {
+  ( umask 077; grep '^WORDPRESS_' "$ENVF" > "${WPENVF}.tmp" ) \
+    && mv -f "${WPENVF}.tmp" "$WPENVF"
+}
+
+_mdb() { # run SQL from stdin as root inside the container
+  podman exec -i mariadb sh -c 'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD"'
 }
 
 # wp-cli runs in its OWN container: the official wordpress:*-apache image does
@@ -77,7 +85,7 @@ _wp() {
   podman run --rm \
     --network "container:wordpress" \
     --user 33:33 \
-    --env-file /etc/wordpress/env \
+    --env-file "$WP_ENV_FILE" \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     -v /home/wpuser/wp/html:/var/www/html \
     "$(_wpcli_image)" wp --path=/var/www/html "$@" 2>/dev/null
@@ -147,7 +155,9 @@ db)
   # the running WordPress still holds a live connection with the OLD password
   # (MySQL does not drop existing connections on password change), so the site
   # keeps serving until the clean restart.
-  if _mdb -e "ALTER USER '${_user}'@'%' IDENTIFIED BY '${_new}'; FLUSH PRIVILEGES;" 2>/dev/null; then
+  # The statement goes over stdin. As an argument the new password would sit in
+  # the host's process list, which is exactly the secret this is replacing.
+  if printf "ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; FLUSH PRIVILEGES;\n" "$_user" "$_new" | _mdb 2>/dev/null; then
     _ok "MariaDB password changed"
   else
     _bad "Could not change the MariaDB password. Nothing else was touched."
@@ -158,30 +168,48 @@ db)
   _tmp=$(mktemp)
   sed "s#^WORDPRESS_DB_PASSWORD=.*#WORDPRESS_DB_PASSWORD=${_new}#; s#^MARIADB_PASSWORD=.*#MARIADB_PASSWORD=${_new}#" \
     "$ENVF" > "$_tmp" && cat "$_tmp" > "$ENVF" && rm -f "$_tmp"
-  _ok "Environment file updated"
+  _sync_wp_env
+  _ok "Environment files updated"
 
   # Verify BEFORE declaring success: can a fresh connection authenticate with
   # the new password? If not, roll everything back.
-  _check=$(podman exec -i mariadb sh -c \
-    "mariadb -u '${_user}' -p'${_new}' -e 'SELECT 1;' '${_name}' 2>/dev/null && echo OK" 2>/dev/null)
+  _check=$(printf '%s\n' "$_new" | podman exec -i mariadb sh -c \
+    'IFS= read -r p; MYSQL_PWD="$p"; export MYSQL_PWD
+     mariadb -u "$1" -e "SELECT 1;" "$2" 2>/dev/null && echo OK' _ "$_user" "$_name" 2>/dev/null)
   if [ "$_check" != "OK" ] && ! printf '%s' "$_check" | grep -q OK; then
     _bad "The new password does not authenticate. Rolling back."
     cp "${BACKUP_DIR}/env.${_ts}" "$ENVF"
+    _sync_wp_env
     _old=$(sed -n 's/^WORDPRESS_DB_PASSWORD=//p' "$ENVF" | head -1)
-    _mdb -e "ALTER USER '${_user}'@'%' IDENTIFIED BY '${_old}'; FLUSH PRIVILEGES;" 2>/dev/null
+    printf "ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; FLUSH PRIVILEGES;\n" "$_user" "$_old" | _mdb 2>/dev/null
     _note "Restored the previous password in both places."
     exit 1
   fi
   _ok "New password authenticates"
 
-  _note "Restarting WordPress to pick up the new credential…"
-  podman restart wordpress >/dev/null 2>&1
-  sleep 5
-  # Confirm the site actually serves after the restart.
-  if _wp option get siteurl >/dev/null 2>&1; then
+  # Recreated, not restarted. wp-config.php reads the password from the
+  # container's environment, and `podman restart` keeps the environment the
+  # container was created with, so a restarted site kept the OLD password and
+  # could not reach its database. The old check missed that: wp-cli reads the
+  # env file, so it had the new password and passed while the site was down.
+  _note "Recreating WordPress so it picks up the new credential…"
+  rc-service wp-container stop >/dev/null 2>&1 || true
+  podman rm -f wordpress >/dev/null 2>&1 || true
+  rc-service wp-container start >/dev/null 2>&1 || true
+  _wpup=0
+  for _try in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if /usr/local/bin/wp-health-check.sh wordpress 80 >/dev/null 2>&1; then
+      _wpup=1; break
+    fi
+    sleep 5
+  done
+  if [ "$_wpup" = 1 ]; then
     _ok "WordPress reconnected with the new password"
   else
-    _warn "WordPress restarted but did not respond in 5s — check: podman logs --tail 30 wordpress"
+    _bad "WordPress did not come back within a minute."
+    _note "Check: podman logs --tail 30 wordpress"
+    _note "Then:  /usr/local/bin/wp-health-check.sh wordpress 80"
+    exit 1
   fi
   echo ""
   _ok "Database password rotated. Old snapshot kept at ${BACKUP_DIR}/env.${_ts}"

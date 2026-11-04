@@ -34,15 +34,20 @@ else
 fi
 
 # 3) The EXACT credentials WordPress itself uses — MARIADB_USER/PASSWORD/
-# DATABASE come from the same /etc/wordpress/env file mounted into both the
-# mariadb and wordpress containers, so this is the identical database,
-# user, and password WORDPRESS_DB_* resolves to on the WordPress side. A
+# DATABASE and WORDPRESS_DB_* come from the same /etc/wordpress/env file, so
+# this is the identical database, user, and password WordPress logs in with. A
 # root-only check can report healthy while WordPress's own grants are
 # broken (e.g. a botched restore, a user dropped by an errant migration) —
 # proving root works is not the same as proving WordPress can log in.
-WP_QUERY=$(podman exec "$CONTAINER" sh -c \
-  'mariadb -u"${MARIADB_USER}" -p"${MARIADB_PASSWORD}" "${MARIADB_DATABASE}" -N -e "SELECT 1;" 2>/dev/null ||
-   mysql   -u"${MARIADB_USER}" -p"${MARIADB_PASSWORD}" "${MARIADB_DATABASE}" -N -e "SELECT 1;" 2>/dev/null')
+#
+# The password comes from the file, not the container's environment. Rotation
+# changes the file and the database but not this container's environment, so
+# reading ${MARIADB_PASSWORD} here failed on every VM after a rotation.
+WP_QUERY=$(sed -n 's/^MARIADB_PASSWORD=//p' /etc/wordpress/env 2>/dev/null | head -1 \
+  | podman exec -i "$CONTAINER" sh -c \
+  'IFS= read -r p; MYSQL_PWD="$p"; export MYSQL_PWD
+   mariadb -u"${MARIADB_USER}" "${MARIADB_DATABASE}" -N -e "SELECT 1;" 2>/dev/null ||
+   mysql   -u"${MARIADB_USER}" "${MARIADB_DATABASE}" -N -e "SELECT 1;" 2>/dev/null')
 if [ "$WP_QUERY" = "1" ]; then
   _pass "wordpress-user SELECT 1 (same credentials WordPress itself uses)"
 else

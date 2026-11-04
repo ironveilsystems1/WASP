@@ -202,18 +202,8 @@ function wpvm_login_log($event, $username, $extra = '') {
     ));
 }
 
-/**
- * Refuse the attempt before any credential checking happens.
- *
- * Hooked at priority 5 -- earlier than wp_authenticate_username_password (20)
- * -- so a locked-out request never reaches the password hash comparison.
- * bcrypt verification is deliberately expensive, so skipping it is most of the
- * CPU saving this layer can offer.
- */
-add_filter('authenticate', function ($user, $username, $password) {
-    if (empty($username) && empty($password)) {
-        return $user;                       // not a login attempt; leave it alone
-    }
+/** Seconds left on any lock that covers this attempt: account or address. */
+function wpvm_login_lock_left($username) {
     $left = wpvm_login_lock_remaining($username);
     if ($left === 0) {
         $sp = get_transient(wpvm_login_ipkey('lock'));
@@ -221,25 +211,71 @@ add_filter('authenticate', function ($user, $username, $password) {
             $left = max(0, (int) $sp - time());
         }
     }
+    return $left;
+}
+
+function wpvm_login_locked_error($left) {
+    return new WP_Error(
+        'wpvm_locked_out',
+        sprintf(
+            /* Deliberately states the limit and the wait. Hiding it does
+             * not slow an attacker down -- they measure it -- and it does
+             * confuse the legitimate user who mistyped a password twice. */
+            __('<strong>Too many failed attempts.</strong> Try again in %d minute(s).'),
+            max(1, (int) ceil($left / 60))
+        )
+    );
+}
+
+/**
+ * Refuse the attempt before any credential checking happens.
+ *
+ * Returning a WP_Error here is not enough on its own. Core's authenticators run
+ * at priority 20 and do not stop for an incoming error when a username and
+ * password are present, so a "locked" account could still log in with the right
+ * password, and guessing carried on through every lock. So this removes them for
+ * the request, which means a locked-out attempt never reaches the password hash
+ * comparison. bcrypt verification is deliberately expensive, so skipping it is
+ * most of the CPU saving this layer can offer.
+ */
+add_filter('authenticate', function ($user, $username, $password) {
+    if (empty($username) && empty($password)) {
+        return $user;                       // not a login attempt; leave it alone
+    }
+    $left = wpvm_login_lock_left($username);
     if ($left > 0) {
         wpvm_login_log('blocked', $username, 'lock_remaining=' . $left);
-        $mins = max(1, (int) ceil($left / 60));
-        return new WP_Error(
-            'wpvm_locked_out',
-            sprintf(
-                /* Deliberately states the limit and the wait. Hiding it does
-                 * not slow an attacker down -- they measure it -- and it does
-                 * confuse the legitimate user who mistyped a password twice. */
-                __('<strong>Too many failed attempts.</strong> Try again in %d minute(s).'),
-                $mins
-            )
-        );
+        remove_filter('authenticate', 'wp_authenticate_username_password', 20);
+        remove_filter('authenticate', 'wp_authenticate_email_password', 20);
+        remove_filter('authenticate', 'wp_authenticate_application_password', 20);
+        return wpvm_login_locked_error($left);
     }
     return $user;
 }, 5, 3);
 
+/*
+ * Last on the filter, so an authentication plugin at a later priority cannot turn
+ * a lock back into a login. It asks again rather than remembering the answer from
+ * priority 5: a value held for the request could refuse a different username.
+ */
+add_filter('authenticate', function ($user, $username, $password) {
+    if (empty($username) && empty($password)) {
+        return $user;
+    }
+    $left = wpvm_login_lock_left($username);
+    return $left > 0 ? wpvm_login_locked_error($left) : $user;
+}, PHP_INT_MAX, 3);
+
 /** Count a failure and lock out once the threshold is crossed. */
-add_action('wp_login_failed', function ($username) {
+add_action('wp_login_failed', function ($username, $error = null) {
+    /* Not guesses, so they are not counted. A request refused by a lock never
+     * had its password checked: counting it would let anyone keep an account
+     * locked, and double the lock, by hammering it. A walled administrator
+     * (03-wpvm-mfa-enforce) supplied the right password. */
+    if ($error instanceof WP_Error
+            && in_array($error->get_error_code(), array('wpvm_locked_out', 'wpvm_mfa_required'), true)) {
+        return;
+    }
     /* Spray tier: failures from this ADDRESS against ANY username. Set much
      * higher than the per-account limit, because on a shared NAT a high count
      * is normal traffic rather than an attack. It exists so username spraying
@@ -315,7 +351,8 @@ add_action('wp_login_failed', function ($username) {
 
             $body  = "A login lockout was triggered on {$site}.\n\n";
             $body .= "  Address     : {$ip}\n";
-            $body .= "  Account     : {$username}\n";
+            // Attacker-supplied. Cleaned the same way as the log line.
+            $body .= "  Account     : " . preg_replace('/[^A-Za-z0-9._@-]/', '', (string) $username) . "\n";
             $body .= "  Locked for  : " . round($secs / 60) . " minutes\n";
             $body .= "  Lockout #   : {$count} for this address\n";
             $body .= "  Time        : {$when}\n\n";
@@ -341,7 +378,7 @@ add_action('wp_login_failed', function ($username) {
     } else {
         wpvm_login_log('failed', $username, 'remaining=' . (WPVM_LOGIN_MAX_ATTEMPTS - $attempts));
     }
-});
+}, 10, 2);
 
 /** A success clears the counter, but not the escalation history. */
 add_action('wp_login', function ($user_login) {

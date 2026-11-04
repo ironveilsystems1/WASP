@@ -13,10 +13,12 @@
  * second factor, which is exactly the account that most needs one. This adds the
  * enforcement WITHOUT modifying the plugin, so the plugin can update freely.
  *
- * THE THING THIS MUST NOT DO IS LOCK ANYONE OUT
+ * THE THING THIS MUST NOT DO IS STRAND ANYONE
  *
  * Enforcement that has no escape hatch is how a lost phone becomes a rebuild.
- * So this is built around recovery, not just around blocking:
+ * So this is built around recovery, not just around blocking. Past the grace
+ * window an unenrolled administrator hits a wall from the network, on purpose
+ * (see "The wall" below), and the escape hatch is the console:
  *
  *   1. A GRACE WINDOW. A newly-created or newly-promoted admin is not blocked
  *      immediately; they are steered to set up 2FA and given a configurable
@@ -157,91 +159,93 @@ function wpvm_mfa_grace_expired( $user_id ) {
 }
 
 /*
- * ── The real gate: every wp-admin request, not just the login moment ─────────
+ * ── The wall ─────────────────────────────────────────────────────────────────
  *
- * Enforcing only at wp_login has two holes that a mocked test cannot show but a
- * real install will:
+ * Past the grace window an unenrolled administrator gets nothing: no session, no
+ * wp-admin, no admin-ajax, no admin-post, no REST. That is a decision, not a side
+ * effect. The grace window is when they enrol, and after it the recovery path is
+ * the console (SUPPORT-RUNBOOK.md, "An admin hit the two-factor wall"), which
+ * clears wpvm_mfa_grace_start and so gives that one account a fresh window.
  *
- *   1. An admin who was ALREADY logged in when enforcement was turned on never
- *      fires wp_login again until their cookie expires (up to 14 days), so they
- *      would go unprotected for that whole window.
- *
- *   2. wp_clear_auth_cookie() at wp_login races the auth cookie that the login
- *      flow already queued earlier in the same response. It usually wins on
- *      header order, but "usually" is not a control — a surviving cookie would
- *      be logged straight into wp-admin on the next request.
- *
- * Gating on admin_init closes both: it runs on EVERY wp-admin request, checks
- * the current user, and redirects an unenrolled in-scope admin (past grace) to
- * the 2FA setup page. A stale session is caught on its very next click; a
- * survived cookie never reaches an admin screen.
- *
- * The critical subtlety is that the gate must NOT block the paths an admin needs
- * to actually enrol, or "enforcement" becomes "lockout". So the profile page,
- * the AJAX/POST endpoints the Two Factor plugin uses to set up and verify TOTP,
- * and logout are all allowed through even while the admin is unenrolled.
+ * There is deliberately no list of pages that stay open. This used to allow
+ * profile.php, user-edit.php, admin-ajax.php, admin-post.php and any request with
+ * action=logout, so that someone past grace could finish enrolling. Reproduced
+ * against real WordPress with only a stolen password: `plugins.php?action=logout`
+ * rendered, user-edit.php promoted another account to administrator, and that
+ * account then had a fresh grace window and the whole of wp-admin. Enrolment
+ * did not even work there, because TOTP setup goes through the REST API, which is
+ * closed below. A list that opened the door without serving its purpose is worse
+ * than no list.
  */
-function wpvm_mfa_request_is_enrollment_path() {
-    global $pagenow;
-
-    // The profile screen is where the Two Factor options live. Both profile.php
-    // (your own) and user-edit.php (an admin editing themselves) qualify.
-    if ( in_array( $pagenow, array( 'profile.php', 'user-edit.php' ), true ) ) {
-        return true;
-    }
-    // TOTP setup and verification, and other providers' setup, go through these.
-    if ( in_array( $pagenow, array( 'admin-ajax.php', 'admin-post.php' ), true ) ) {
-        return true;
-    }
-    // Never trap someone on the way OUT — logout must always be reachable.
-    if ( 'wp-login.php' === $pagenow ) {
-        return true;
-    }
-    if ( isset( $_REQUEST['action'] ) && 'logout' === $_REQUEST['action'] ) {
-        return true;
-    }
-    return false;
-}
-
-add_action( 'admin_init', function () {
+function wpvm_mfa_is_walled( $user ) {
     if ( ! WPVM_MFA_ENFORCE || ! wpvm_mfa_available() ) {
-        return;
-    }
-    // AJAX during enrollment (the TOTP verify step) must pass, or setup breaks.
-    if ( wp_doing_ajax() ) {
-        return;
-    }
-    $user = wp_get_current_user();
-    if ( ! $user || ! $user->ID ) {
-        return;
+        return false;
     }
     if ( ! wpvm_mfa_user_in_scope( $user ) || wpvm_mfa_user_enrolled( $user->ID ) ) {
+        return false;
+    }
+    return wpvm_mfa_grace_expired( $user->ID );
+}
+
+function wpvm_mfa_wall_message() {
+    return '<strong>Two-factor authentication is required.</strong> Administrator accounts '
+        . 'on this site must have it set up, and the time allowed to do that has ended. '
+        . 'Contact your support team: they can reopen the setup window for this account.';
+}
+
+/**
+ * End every session this user has.
+ *
+ * wp_destroy_current_session() is no use here. It reads the token from $_COOKIE,
+ * which is empty during a login, so it destroyed nothing and the cookies issued
+ * moments earlier in the same response stayed valid. destroy_all() works from
+ * the user, not the request.
+ */
+function wpvm_mfa_end_sessions( $user_id ) {
+    WP_Session_Tokens::get_instance( $user_id )->destroy_all();
+    wp_clear_auth_cookie();
+}
+
+/*
+ * Refuse before a session exists, so there are no cookies to clean up.
+ *
+ * Priority 100 is after core's password check (20) and spam check (99). The
+ * tempting hook, wp_authenticate_user, runs BEFORE the password is checked, so it
+ * would tell anyone who typed an administrator's username that the account has
+ * no second factor, and start that account's grace clock for them.
+ */
+add_filter( 'authenticate', function ( $user ) {
+    if ( $user instanceof WP_User && wpvm_mfa_is_walled( $user ) ) {
+        return new WP_Error( 'wpvm_mfa_required', wpvm_mfa_wall_message() );
+    }
+    return $user;
+}, 100 );
+
+/*
+ * Sessions that already exist. An admin logged in when the window closed never
+ * fires authenticate or wp_login again until their cookie expires, up to 14 days
+ * later. Priority 0, so it runs before other plugins' admin_init work, and it
+ * fires for admin-ajax.php and admin-post.php as well as every wp-admin screen.
+ */
+add_action( 'admin_init', function () {
+    $user = wp_get_current_user();
+    if ( ! $user || ! $user->ID || ! wpvm_mfa_is_walled( $user ) ) {
         return;
     }
-    // Within grace: allow through (the admin notice does the nudging). Only a
-    // fully-expired grace turns the redirect on, so nobody is walled before they
-    // have had a chance to enrol.
-    if ( ! wpvm_mfa_grace_expired( $user->ID ) ) {
-        return;
-    }
-    // Past grace and still unenrolled: let them reach the enrollment paths, and
-    // redirect everything else to the profile so they cannot use the admin until
-    // they set up 2FA.
-    if ( wpvm_mfa_request_is_enrollment_path() ) {
-        return;
-    }
-    wp_safe_redirect( admin_url( 'profile.php#two-factor-options' ) );
-    exit;
-} );
+    wpvm_mfa_end_sessions( $user->ID );
+    wp_die(
+        wp_kses_post( wpvm_mfa_wall_message() ),
+        'Two-factor authentication required',
+        array( 'response' => 403 )
+    );
+}, 0 );
 
 /*
  * ── Login-moment enforcement, kept as a second layer ─────────────────────────
  *
- * The admin_init gate above is the primary control. This wp_login handler stays
- * as defence in depth: it nudges within grace, and past grace it refuses to let
- * the login complete into a working session in the first place, so the common
- * case never even reaches the admin_init redirect. Belt and braces on a login is
- * the right amount of paranoia.
+ * The authenticate filter above is the control. This catches anything that logs
+ * a user in without going through it, such as a single sign-on plugin calling
+ * wp_set_auth_cookie() and firing wp_login itself. Within grace it sets the nudge.
  */
 add_action( 'wp_login', function ( $user_login, $user ) {
     if ( ! WPVM_MFA_ENFORCE || ! wpvm_mfa_available() ) {
@@ -251,23 +255,11 @@ add_action( 'wp_login', function ( $user_login, $user ) {
         return;
     }
     if ( wpvm_mfa_grace_expired( $user->ID ) ) {
-        // Destroy the freshly-created session and clear the cookie. Even if the
-        // cookie survives the header race, the admin_init gate will catch the
-        // next request — this just makes the common path clean.
-        wp_destroy_current_session();
-        wp_clear_auth_cookie();
-        $setup = admin_url( 'profile.php#two-factor-options' );
+        wpvm_mfa_end_sessions( $user->ID );
         wp_die(
-            wp_kses_post(
-                '<h1>Two-factor authentication required</h1>' .
-                '<p>Administrator accounts on this site must have two-factor ' .
-                'authentication enabled. Your grace period to set it up has ended.</p>' .
-                '<p>If you have lost access, an administrator can reset your ' .
-                'two-factor from the server console (see the support runbook). ' .
-                'Otherwise, ask another administrator to help you enrol.</p>'
-            ),
+            wp_kses_post( wpvm_mfa_wall_message() ),
             'Two-factor authentication required',
-            array( 'response' => 403, 'link_url' => $setup, 'link_text' => 'Set up two-factor' )
+            array( 'response' => 403 )
         );
     }
     // Within grace: set a transient so an admin notice nudges them.

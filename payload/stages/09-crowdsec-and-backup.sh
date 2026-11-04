@@ -65,6 +65,17 @@ if [ "${EGRESS_PROXY:-0}" = "1" ]; then
     } >> /opt/squid/config/allowlist-runtime.txt
     ok "  Builder domains allowed: ${PAGE_BUILDER_DOMAINS}"
   fi
+  # Not the allowlist. wp-import.sh opens these for one download; see
+  # import-source in wasp-egress.sh.
+  if [ -n "${IMPORT_SOURCE_HOSTS:-}" ]; then
+    for _ish in ${IMPORT_SOURCE_HOSTS}; do
+      case "$_ish" in
+        .*|*[!a-z0-9.-]*|'') warn "  Skipping malformed import source: ${_ish}" ;;
+        *) printf '%s\n' "$_ish" >> /etc/wp-install/import-sources.txt ;;
+      esac
+    done
+    ok "  Import sources: ${IMPORT_SOURCE_HOSTS}"
+  fi
   # SMTP failed closed at config-generation time. Record it as a blocker: the
   # VM is running with no outbound mail at all, which means no password resets,
   # no backup-failure alerts and no heartbeat. That is the correct state given

@@ -47,6 +47,13 @@ else
   chmod 750 /var/lib/wasp-import/incoming
 fi
 ok "Import inbox ready: /var/lib/wasp-import/incoming"
+# wp-import.sh reads archive listings before it extracts anything. BusyBox unzip
+# cannot list members at all, and BusyBox tar follows hard-link targets out of
+# the extraction directory (CVE-2026-26158). wp-import.sh refuses a zip it cannot
+# list, so a failure here costs zip imports rather than safety.
+apk add --no-cache tar unzip >/dev/null 2>&1 \
+  && ok "GNU tar and Info-ZIP installed for archive imports" \
+  || warn "tar/unzip not installed: wp-import.sh will refuse zips. Fix: apk add tar unzip"
 ok "  How to get a backup there: wp-import.sh where"
 # Only install what the chosen method needs. rclone is ~50 MB, so it is not
 # pulled onto a VM that will never use it.
@@ -92,9 +99,17 @@ if [ -n "${WORDFENCE_API_KEY:-}" ]; then
   chmod 600 /etc/wp-install/vuln-sources.conf
   ok "Wordfence token stored (0600) — daily vulnerability scans active"
 else
-  warn "No Wordfence token — plugin vulnerability scanning is unavailable"
+  warn "No Wordfence token — add one for the bulk feed:"
   warn "  Free token: https://www.wordfence.com/products/wordfence-intelligence/"
   warn "  Then:       wp-plugins.sh set-key wordfence <token>"
+fi
+# Written either way, so a refusal at install stays a refusal. Unset means on.
+[ -f /etc/wp-install/vuln-sources.conf ] || install -m 0600 /dev/null /etc/wp-install/vuln-sources.conf
+printf 'WPVULNERABILITY=%s\n' "${WPVULNERABILITY:-1}" >> /etc/wp-install/vuln-sources.conf
+if [ "${WPVULNERABILITY:-1}" = "1" ]; then
+  ok "WPVulnerability on: this VM's plugin and theme names go to that service"
+else
+  warn "WPVulnerability off at install"
 fi
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-mail.sh" /usr/local/bin/wp-mail.sh
 
@@ -138,6 +153,10 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/was
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-import.sh" /usr/local/bin/wp-import.sh
+# Not executable and not on PATH: wp-import.sh mounts it read-only into a
+# throwaway container. It never runs on this VM.
+mkdir -p /usr/local/lib/wasp
+install -m 0644 "${PAYLOAD_DIR}/lib/wasp-wpress-reader.php" /usr/local/lib/wasp/wasp-wpress-reader.php
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-egress.sh" /usr/local/bin/wasp-egress.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-rotate-secrets.sh" /usr/local/bin/wp-rotate-secrets.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-capture.sh" /usr/local/bin/wasp-capture.sh

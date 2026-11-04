@@ -21,6 +21,10 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 [ -r /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
+# Only the WORDPRESS_* values. The root password stays out of containers that
+# run site code. A VM built before 10.10 has just the one file.
+WP_ENV_FILE=/etc/wordpress/wp.env
+[ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
 
 SECRETS_DIR="/home/wpuser/wp/secrets"
 # INI, not PHP. The credentials file is data now, so reading it cannot
@@ -63,7 +67,7 @@ _wp() {
   podman run --rm \
     --network "container:wordpress" \
     --user 33:33 \
-    --env-file /etc/wordpress/env \
+    --env-file "$WP_ENV_FILE" \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     ${WPCLI_ENV:-} \
     -v /home/wpuser/wp/secrets:/var/www/private:ro \

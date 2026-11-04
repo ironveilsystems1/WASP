@@ -139,7 +139,8 @@ if [ -n "${WP_ADMIN_SLUG}" ]; then
     echo "    RewriteCond %{ENV:REDIRECT_WPVM_SLUG} !=1"
     echo "    RewriteCond %{REQUEST_URI} !install\\.php\$"
     echo "    RewriteCond %{REQUEST_URI} !setup-config\\.php\$"
-    echo "    RewriteRule ^wp-login\\.php\$ - [F,L]"
+    # (/.*)? because Apache also serves /wp-login.php/anything as wp-login.php.
+    echo "    RewriteRule ^wp-login\\.php(/.*)?\$ - [F,L]"
     echo "</IfModule>"
   } >> /home/wpuser/wp/htaccess/.htaccess
 fi
@@ -148,7 +149,7 @@ cat >> /home/wpuser/wp/htaccess/.htaccess << '8GEOF2'
 # ── author=N user enumeration blocking (mirrors wp-security.conf) ───────────
 <IfModule mod_rewrite.c>
     RewriteEngine On
-    RewriteCond %{QUERY_STRING} author=
+    RewriteCond %{QUERY_STRING} (^|&)author=
     RewriteRule ^ - [F,L]
 </IfModule>
 

@@ -59,6 +59,10 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 [ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 [ -r /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
+# Only the WORDPRESS_* values. The root password stays out of containers that
+# run site code. A VM built before 10.10 has just the one file.
+WP_ENV_FILE=/etc/wordpress/wp.env
+[ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
 
 WP_HTML_DIR="/home/wpuser/wp/html"
 # Pinned at install time (stage 08) into pinned.env alongside the other three
@@ -103,7 +107,28 @@ WF_BASE="https://www.wordfence.com/api/intelligence/v3/vulnerabilities"
 # the one that carries vulnerabilities still under research, so choosing
 # production alone trades detection breadth for record detail.
 WORDFENCE_FEED="${WORDFENCE_FEED:-scanner}"
-[ -r "$VULN_CONF" ] && . "$VULN_CONF"
+
+# Parsed, never sourced: this runs as root and the file holds operator input. An
+# allowlist of keys, assigned by case, leaves no path from its contents to
+# execution. Same shape as _load_conf in wasp-offsite-backup.sh.
+_load_vuln_conf() {
+  [ -r "$VULN_CONF" ] || return 0
+  while IFS= read -r _vc_l || [ -n "$_vc_l" ]; do
+    _vc_v=${_vc_l#*=}
+    case "$_vc_v" in
+      "'"*"'") _vc_v=${_vc_v#\'}; _vc_v=${_vc_v%\'} ;;
+      '"'*'"') _vc_v=${_vc_v#\"}; _vc_v=${_vc_v%\"} ;;
+    esac
+    case "$_vc_l" in
+      WORDFENCE_API_KEY=*) WORDFENCE_API_KEY=$_vc_v ;;
+      WORDFENCE_FEED=*)    WORDFENCE_FEED=$_vc_v ;;
+      WPVULNERABILITY=*)   WPVULNERABILITY=$_vc_v ;;
+      WPV_SKIP=*)          WPV_SKIP=$_vc_v ;;
+    esac
+  done < "$VULN_CONF"
+  unset _vc_l _vc_v
+}
+_load_vuln_conf
 
 # Compare two dotted version strings. Returns 0 if $1 <= $2.
 # WordPress plugin versions are not strict semver (1.2, 1.2.3, 203.0.113.4 all
@@ -301,7 +326,7 @@ _wp() {
   podman run --rm \
     --network "container:wordpress" \
     --user "${WPCLI_UID}:${WPCLI_UID}" \
-    --env-file /etc/wordpress/env \
+    --env-file "$WP_ENV_FILE" \
     -e WORDPRESS_DB_HOST=mariadb:3306 \
     ${_wpcli_proxy} \
     ${WPCLI_MOUNT:-} \
@@ -358,68 +383,286 @@ check_quiet() {
   fi
 }
 
-vuln_scan() {
-  _use_nvd="${1:-0}"
-  command -v jq >/dev/null 2>&1 || { echo "✗ jq is required: apk add jq" >&2; exit 1; }
-  _wf_refresh || exit 1
-  # Read every cached feed. With WORDFENCE_FEED=both a vulnerability can
-  # appear in both files; duplicate findings are collapsed by sorting unique
-  # on the reported line rather than by trying to reconcile the two records.
-  _feeds=$(ls "$VULN_CACHE"/wordfence-*.json 2>/dev/null)
-  [ -n "$_feeds" ] || { echo "  ✗ No cached feed. Run: wp-plugins.sh vuln-refresh" >&2; exit 1; }
+# ── Scan bookkeeping ─────────────────────────────────────────────────────────
+# Unit Separator, not a tab. Tab is whitespace to `read`, so consecutive tabs
+# collapse: a record with no CVE slid its CVSS score into the CVE field, left the
+# score empty, and printed a 9.8 as LOW. A non-whitespace IFS keeps empty fields.
+_VD=$(printf '\037')
 
-  echo ""
-  echo "Vulnerability scan — installed plugins and themes"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  Sources: Wordfence Intelligence ${WORDFENCE_FEED} feed$([ -n "${PATCHSTACK_API_KEY:-}" ] && printf ', Patchstack')$([ -n "${WPSCAN_API_TOKEN:-}" ] && printf ', WPScan')$([ "$_use_nvd" = 1 ] && printf ', NVD')"
-  echo ""
+# Hours an answer stays usable. The feed refreshes twice a day when it can, so
+# three days old means refreshing has been failing, not that nothing changed.
+VULN_MAX_AGE_H=72
 
-  _inv=$(_wp plugin list --fields=name,version,status --format=csv 2>/dev/null | tail -n +2)
-  _inv="${_inv}
-$(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n +2)"
-  [ -n "$(printf '%s' "$_inv" | tr -d '[:space:]')" ] || { echo "  Could not list plugins/themes."; exit 1; }
+_incomplete() { printf '%s\n' "$1" >> "$VULN_CACHE/.incomplete.$$"; }
 
-  _hits=0
-  printf '%s\n' "$_inv" | while IFS=, read -r _slug _ver _status; do
-    [ -n "$_slug" ] || continue
-    # Every affected range recorded for this slug, as "from|from_incl|to|to_incl|title|cve|score"
-    _ranges=$(cat $_feeds | jq -s 'add' 2>/dev/null | jq -r --arg s "$_slug" '
-      to_entries[] | .value as $v
-      | ($v.software // [])[] | select(.slug == $s)
-      | (.affected_versions // {}) | to_entries[] | .value as $r
-      | [ ($r.from_version // "*"), ($r.from_inclusive|tostring),
-          ($r.to_version // "*"),   ($r.to_inclusive|tostring),
-          ($v.title // "untitled"), ($v.cve // ""),
-          (($v.cvss.score // "") | tostring) ] | @tsv
-    ' 2>/dev/null)
-    [ -n "$_ranges" ] || continue
+# Severity unknown is not severity low: LOW is the one band the daily alert drops.
+_sev_label() {  # score letter
+  case "${1%%.*}" in
+    9|10) echo CRITICAL; return 0 ;;
+    7|8)  echo HIGH;     return 0 ;;
+    4|5|6) echo MEDIUM;  return 0 ;;
+    0|1|2|3) echo LOW;   return 0 ;;
+  esac
+  case "$2" in
+    c|C) echo CRITICAL ;;
+    h|H) echo HIGH ;;
+    l|L) echo LOW ;;
+    *)   echo MEDIUM ;;
+  esac
+  return 0
+}
 
-    printf '%s\n' "$_ranges" | while IFS="$(printf '\t')" read -r _fv _fi _tv _ti _title _cve _score; do
-      # Is the installed version inside this affected range?
-      _in=1
-      if [ "$_fv" != "*" ]; then
-        if [ "$_fi" = "true" ]; then _ver_le "$_fv" "$_ver" || _in=0
-        else _ver_le "$_ver" "$_fv" && _in=0; fi
+_finding() {  # slug version title cve score letter unfixed fix
+  if [ -n "$4" ]; then
+    grep -qxF "${1}|${4}" "$VULN_CACHE/.seen.$$" 2>/dev/null && return 0
+    printf '%s|%s\n' "$1" "$4" >> "$VULN_CACHE/.seen.$$"
+  fi
+  _lab=$(_sev_label "$5" "$6")
+  case "$_lab" in
+    CRITICAL|HIGH) _col="$C_RED" ;;
+    MEDIUM)        _col="$C_YEL" ;;
+    *)             _col="" ;;
+  esac
+  printf '  [%s%s%s] %s %s\n' "$_col" "$_lab" "$C_OFF" "$1" "$2"
+  printf '        %s\n' "$3"
+  [ -n "$4" ] && printf '        %s   cvss %s\n' "$4" "${5:-n/a}"
+  if [ "$7" = 1 ]; then
+    printf '        NO FIX PUBLISHED: deactivate and delete it, or record the risk\n'
+  else
+    printf '        fix: %s\n' "$8"
+  fi
+  echo "$1" >> "$VULN_CACHE/.hits.$$"
+  return 0
+}
+
+# ── WPVulnerability (on unless turned off) ─────────────────────────────────────────────────
+# Needs no token, so a VM with no Wordfence account still gets scanned, and it is
+# the only source here for core, PHP and MariaDB. The cost is stated at install
+# and in vuln-sources: one request per component, so the provider sees this VM's
+# address and the name of everything it runs, and for core, PHP and MariaDB the
+# version too. Turning it off writes WPVULNERABILITY=0. WPV_SKIP in
+# vuln-sources.conf holds slugs that must not leave the VM, such as a client's
+# bespoke plugin.
+#
+# Runs on the VM, not through WordPress, like the Wordfence download, so it adds
+# nothing to the Squid allowlist and a compromised site gains no new destination.
+#
+# THREE OUTCOMES, KEPT APART. Answered is data. Unknown (a 404 or an API error
+# flag) is an honest "no record", normal for a commercial plugin and not a
+# failure. Failed is no answer at all, and makes the scan INCOMPLETE. The vendor
+# client folds all three into "no vulnerabilities"; that is the failure this
+# file exists to avoid.
+WPV_BASE="https://www.wpvulnerability.net"
+WPV_CACHE_HOURS=12
+
+_wpv_get() {  # kind key -> 0 answered, 2 unknown, 1 failed
+  _wc="$VULN_CACHE/wpv/${1}-${2}.json"
+  mkdir -p "$VULN_CACHE/wpv"
+  if [ -f "$_wc" ]; then
+    _wa=$(( ( $(date +%s) - $(stat -c %Y "$_wc" 2>/dev/null || echo 0) ) / 3600 ))
+    [ "$_wa" -lt "$WPV_CACHE_HOURS" ] && return 0
+  fi
+  # Refused once this run: stop asking. The rest are failed, and said to be.
+  [ -f "$VULN_CACHE/.wpv-stop.$$" ] && return 1
+  _code=$(curl -sS --max-time 20 -w '%{http_code}' -o "${_wc}.tmp" \
+            "${WPV_BASE}/${1}/${2}/" 2>/dev/null) || _code=000
+  case "$_code" in
+    200)
+      if jq -e 'type == "object"' "${_wc}.tmp" >/dev/null 2>&1; then
+        mv "${_wc}.tmp" "$_wc"
+        return 0
       fi
-      if [ "$_tv" != "*" ] && [ "$_in" = 1 ]; then
-        if [ "$_ti" = "true" ]; then _ver_le "$_ver" "$_tv" || _in=0
-        else _ver_le "$_tv" "$_ver" && _in=0; fi
-      fi
-      [ "$_in" = 1 ] || continue
+      rm -f "${_wc}.tmp"; return 1 ;;
+    404) rm -f "${_wc}.tmp"; return 2 ;;
+    429) rm -f "${_wc}.tmp"; : > "$VULN_CACHE/.wpv-stop.$$"; return 1 ;;
+    *)   rm -f "${_wc}.tmp"; return 1 ;;
+  esac
+}
 
-      case "${_score%%.*}" in
-        9|10) _sev="${C_RED}CRITICAL${C_OFF}" ;;
-        7|8)  _sev="${C_RED}HIGH${C_OFF}" ;;
-        4|5|6) _sev="${C_YEL}MEDIUM${C_OFF}" ;;
-        *)    _sev="LOW" ;;
-      esac
-      printf '  [%b] %s %s\n' "$_sev" "$_slug" "$_ver"
-      printf '        %s\n' "$_title"
-      [ -n "$_cve" ] && printf '        %s   cvss %s\n' "$_cve" "${_score:-n/a}"
-      printf '        fix: wp-plugins.sh update-plugins %s\n' "$_slug"
-      echo "$_slug" >> "$VULN_CACHE/.hits.$$"
-    done
+_op_true() {  # have op want. An operator this does not know reports, not hides.
+  case "$2" in
+    ge|'>=')     _ver_le "$3" "$1" ;;
+    gt|'>')      ! _ver_le "$1" "$3" ;;
+    le|'<=')     _ver_le "$1" "$3" ;;
+    lt|'<')      ! _ver_le "$3" "$1" ;;
+    eq|'='|'==') _ver_le "$1" "$3" && _ver_le "$3" "$1" ;;
+    ne|'!=')     ! { _ver_le "$1" "$3" && _ver_le "$3" "$1"; } ;;
+    *)           return 0 ;;
+  esac
+}
+
+_wpv_in_range() {  # version min_op min_ver max_op max_ver
+  if [ -n "$2" ] && [ -n "$3" ]; then _op_true "$1" "$2" "$3" || return 1; fi
+  if [ -n "$4" ] && [ -n "$5" ]; then _op_true "$1" "$4" "$5" || return 1; fi
+  return 0
+}
+
+_wpv_check() {  # kind key label version fix
+  _wr=0
+  _wpv_get "$1" "$2" || _wr=$?
+  case "$_wr" in
+    0) : ;;
+    2) echo "$3" >> "$VULN_CACHE/.wpv-unknown.$$"; return 0 ;;
+    *) echo "$3" >> "$VULN_CACHE/.wpv-failed.$$";  return 0 ;;
+  esac
+  _wj="$VULN_CACHE/wpv/${1}-${2}.json"
+  if [ "$(jq -r '.error // 0' "$_wj" 2>/dev/null)" != 0 ]; then
+    echo "$3" >> "$VULN_CACHE/.wpv-unknown.$$"; return 0
+  fi
+  if [ "$(jq -r '.data == null' "$_wj" 2>/dev/null)" = true ]; then
+    echo "$3" >> "$VULN_CACHE/.wpv-unknown.$$"; return 0
+  fi
+  if [ "$(jq -r '.data.closed // 0' "$_wj" 2>/dev/null)" = 1 ]; then
+    printf '  [NOTICE] %s: closed on WordPress.org, so no further fixes will come\n' "$3"
+  fi
+  # Captured, not piped. A response in an unexpected shape makes jq fail, and in a
+  # pipeline that failure is an empty list, which reads as no vulnerabilities.
+  _wrows=$(jq -r '
+    (.data.vulnerability // [])[]
+    | [ (.operator.min_operator // ""), (.operator.min_version // ""),
+        (.operator.max_operator // ""), (.operator.max_version // ""),
+        (.operator.unfixed // 0),
+        (.name // "untitled"),
+        ([(.source // [])[] | (.id // "" | tostring) | select(startswith("CVE-"))][0] // ""),
+        (.impact.cvss.score // ""), (.impact.cvss.severity // "") ]
+    | map(tostring | gsub("[[:cntrl:]]"; " ")) | join("\u001f")
+  ' "$_wj" 2>/dev/null) || { echo "$3" >> "$VULN_CACHE/.wpv-failed.$$"; return 0; }
+  [ -n "$_wrows" ] || return 0
+  printf '%s\n' "$_wrows" | while IFS="$_VD" read -r _mo _mv _xo _xv _un _title _cve _score _lt; do
+    _wpv_in_range "$4" "$_mo" "$_mv" "$_xo" "$_xv" || continue
+    _finding "$3" "$4" "$_title" "$_cve" "$_score" "$_lt" "${_un:-0}" "$5"
   done
+  return 0
+}
+
+_wf_match() {  # kind slug version
+  _ranges=$(cat $_feeds | jq -s 'add' 2>/dev/null | jq -r --arg s "$2" '
+    to_entries[] | .value as $v
+    | ($v.software // [])[] | select(.slug == $s)
+    | (.affected_versions // {}) | to_entries[] | .value as $r
+    | [ ($r.from_version // "*"), ($r.from_inclusive|tostring),
+        ($r.to_version // "*"),   ($r.to_inclusive|tostring),
+        ($v.title // "untitled"), ($v.cve // ""),
+        (($v.cvss.score // "") | tostring) ]
+    | map(tostring | gsub("[[:cntrl:]]"; " ")) | join("\u001f")
+  ' 2>/dev/null)
+  [ -n "$_ranges" ] || return 0
+
+  printf '%s\n' "$_ranges" | while IFS="$_VD" read -r _fv _fi _tv _ti _title _cve _score; do  # subshell-ok: _ver_le only counts its own loop
+    # Is the installed version inside this affected range?
+    _in=1
+    if [ "$_fv" != "*" ]; then
+      if [ "$_fi" = "true" ]; then _ver_le "$_fv" "$3" || _in=0
+      else _ver_le "$3" "$_fv" && _in=0; fi
+    fi
+    if [ "$_tv" != "*" ] && [ "$_in" = 1 ]; then
+      if [ "$_ti" = "true" ]; then _ver_le "$3" "$_tv" || _in=0
+      else _ver_le "$_tv" "$3" && _in=0; fi
+    fi
+    [ "$_in" = 1 ] || continue
+    _finding "$2" "$3" "$_title" "$_cve" "$_score" "" 0 "wp-plugins.sh update-plugins $2"
+  done
+  return 0
+}
+
+# Exit 0 means every source answered, with or without findings. Exit 3 means the
+# scan could not say, and the output carries one `INCOMPLETE:` line per reason,
+# which is what wp-vuln-cron.sh alerts on. "The scanner did not run" must never
+# read as "the scanner found nothing".
+#
+# $1: an inventory file of kind,slug,version lines, for scanning something other
+# than the live site (wp-import.sh, before a staged site is installed).
+vuln_scan() {
+  _inv_file="${1:-}"
+  command -v jq >/dev/null 2>&1 || { echo "✗ jq is required: apk add jq" >&2; exit 1; }
+  mkdir -p "$VULN_CACHE"
+  rm -f "$VULN_CACHE/.incomplete.$$" "$VULN_CACHE/.seen.$$" "$VULN_CACHE/.hits.$$" \
+        "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$"
+
+  _wf_ok=1
+  _wf_refresh || _wf_ok=0
+  # Read every cached feed. With WORDFENCE_FEED=both a vulnerability can appear
+  # in both files; _finding drops the repeat.
+  _feeds=$(ls "$VULN_CACHE"/wordfence-*.json 2>/dev/null || true)
+  _src_list=""
+  if [ -n "$_feeds" ]; then
+    _new=$(ls -t $_feeds | head -1)
+    _fa=$(( ( $(date +%s) - $(stat -c %Y "$_new" 2>/dev/null || echo 0) ) / 3600 ))
+    _src_list="Wordfence Intelligence ${WORDFENCE_FEED} feed (${_fa}h old)"
+    [ "$_wf_ok" = 1 ] || _incomplete "the Wordfence feed could not be refreshed; using a ${_fa}h old copy"
+    [ "$_fa" -le "$VULN_MAX_AGE_H" ] || _incomplete "the Wordfence feed is ${_fa}h old"
+    # The matcher reads these with errors hidden, so a damaged file would match
+    # nothing and look clean.
+    jq -e 'type == "object"' "$_new" >/dev/null 2>&1 \
+      || _incomplete "the Wordfence feed is unreadable; run wp-plugins.sh vuln-refresh"
+  elif [ -n "${WORDFENCE_API_KEY:-}" ]; then
+    _incomplete "the Wordfence feed could not be downloaded"
+  elif [ "${WPVULNERABILITY:-1}" != 1 ]; then
+    _incomplete "no vulnerability source: wp-plugins.sh set-key wordfence <token>"
+  fi
+  if [ "${WPVULNERABILITY:-1}" = 1 ]; then
+    _src_list="${_src_list:+${_src_list}, }WPVulnerability (per-component lookups)"
+  fi
+
+  echo ""
+  echo "Vulnerability scan — ${_inv_file:+staged }plugins and themes"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Sources: ${_src_list:-none}"
+  echo ""
+
+  if [ -n "$_inv_file" ]; then
+    _inv=$(cat "$_inv_file")
+  else
+    _inv=$(_wp plugin list --fields=name,version,status --format=csv 2>/dev/null \
+           | tail -n +2 | awk -F, 'NF{print "plugin," $1 "," $2}') || _inv=""
+    _inv="${_inv}
+$(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
+  | tail -n +2 | awk -F, 'NF{print "theme," $1 "," $2}')" || true
+    [ -n "$(printf '%s' "$_inv" | tr -d '[:space:]')" ] \
+      || _incomplete "could not list the installed plugins and themes"
+  fi
+
+  if [ -n "$_src_list" ]; then
+    printf '%s\n' "$_inv" | while IFS=, read -r _kind _slug _ver; do
+      [ -n "$_slug" ] || continue
+      # An inventory can come from an untrusted archive, and these reach a URL.
+      case "$_slug" in *[!A-Za-z0-9._-]*) continue ;; esac
+      case "$_ver"  in *[!A-Za-z0-9.+_-]*) continue ;; esac
+      case "$_kind" in plugin|theme) : ;; *) continue ;; esac
+      [ -z "$_feeds" ] || _wf_match "$_kind" "$_slug" "$_ver"
+      if [ "${WPVULNERABILITY:-1}" = 1 ]; then
+        case " ${WPV_SKIP:-} " in *" ${_slug} "*) continue ;; esac
+        _wpv_check "$_kind" "$_slug" "$_slug" "$_ver" "wp-plugins.sh update-plugins $_slug"
+      fi
+    done
+  fi
+
+  # Core and the runtime. Only this source can answer, and only for the live site.
+  if [ "${WPVULNERABILITY:-1}" = 1 ] && [ -z "$_inv_file" ]; then
+    _cv=$(_wp core version 2>/dev/null | tr -d '\r' | head -1) || _cv=""
+    _pv=$(podman exec wordpress php -r 'echo PHP_VERSION;' 2>/dev/null | tr -d '\r') || _pv=""
+    _mv=$(podman exec mariadb mariadb --version 2>/dev/null \
+          | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || _mv=""
+    for _sw in "core|WordPress core|${_cv}|update.sh status" \
+               "php|PHP|${_pv}|update.sh status" \
+               "mariadb|MariaDB|${_mv}|update.sh status"; do
+      _k=${_sw%%|*}; _r=${_sw#*|}; _l=${_r%%|*}; _r=${_r#*|}; _v=${_r%%|*}; _x=${_r#*|}
+      case "$_v" in
+        ''|*[!0-9.]*) _incomplete "could not read the ${_l} version" ;;
+        *) _wpv_check "$_k" "$_v" "$_l" "$_v" "$_x" ;;
+      esac
+    done
+  fi
+
+  if [ -f "$VULN_CACHE/.wpv-failed.$$" ]; then
+    _nf=$(grep -c . "$VULN_CACHE/.wpv-failed.$$") || _nf=0
+    _incomplete "WPVulnerability did not answer for ${_nf} component(s)"
+  fi
+  if [ -f "$VULN_CACHE/.wpv-unknown.$$" ]; then
+    _nu=$(grep -c . "$VULN_CACHE/.wpv-unknown.$$") || _nu=0
+    echo "  ${_nu} component(s) have no WPVulnerability record, which is normal for"
+    echo "  commercial and bespoke plugins. They were not checked by that source."
+  fi
 
   # `grep -c` prints its count AND exits 1 when that count is zero, so
   # `$(grep -c ...) || echo 0` yields "0\n0" and the arithmetic test below
@@ -429,47 +672,50 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null | tail -n
   else
     _hits=0
   fi
-  rm -f "$VULN_CACHE/.hits.$$"
 
-  # Opt-in sources. Queried per-slug, which is why they are opt-in and not the
-  # default: unlike the Wordfence bulk feed, a per-slug lookup discloses this
-  # site's exact plugin inventory to the provider.
-  if [ -n "${PATCHSTACK_API_KEY:-}" ]; then
-    echo ""
-    echo "  Patchstack: enabled (per-slug queries — your plugin list is sent to Patchstack)"
-  fi
-  if [ -n "${WPSCAN_API_TOKEN:-}" ]; then
-    echo ""
-    echo "  WPScan: enabled. Free tier is limited to 25 API calls per day, so a"
-    echo "  site with more plugins than that will not be fully covered in one run."
-  fi
-  if [ "$_use_nvd" = 1 ]; then
-    echo ""
-    echo "  NVD: keyword matching only. NVD rate-limits to 5 requests per 30s"
-    echo "  without an API key, and WordPress plugin entries there are sparse and"
-    echo "  noisy — plugin names are ordinary words, so keyword search returns"
-    echo "  unrelated CVEs. Treat NVD output as a prompt to investigate, never"
-    echo "  as a verdict."
-  fi
-
+  _end=0
   echo ""
   if [ "${_hits:-0}" -gt 0 ]; then
     echo "  ${_hits} component(s) match a known vulnerability."
     echo "  Update first, then re-run. If no fix exists yet, consider deactivating"
     echo "  and deleting the plugin — deactivated code is still on disk and still"
     echo "  reachable by direct request."
-  else
+  elif [ ! -f "$VULN_CACHE/.incomplete.$$" ]; then
     echo "  No installed component matched a known vulnerability."
-    echo "  That is a statement about DISCLOSED issues in this feed, not proof the"
-    echo "  site is safe: ~46% of plugin vulnerabilities have no patch at the time"
-    echo "  they are disclosed, and a plugin nobody has audited has no CVEs by"
+    echo "  That is a statement about DISCLOSED issues in these sources, not proof"
+    echo "  the site is safe: ~46% of plugin vulnerabilities have no patch at the"
+    echo "  time they are disclosed, and a plugin nobody has audited has no CVEs by"
     echo "  definition."
   fi
+  _reason=""
+  if [ -f "$VULN_CACHE/.incomplete.$$" ]; then
+    _end=3
+    echo ""
+    while IFS= read -r _why; do
+      printf '  INCOMPLETE: %s\n' "$_why"
+      _reason="${_reason}${_reason:+; }${_why}"
+    done < "$VULN_CACHE/.incomplete.$$"
+    echo "  This scan is NOT a clean result. It could not check everything."
+  fi
+  if [ -z "$_inv_file" ]; then
+    {
+      printf 'at=%s\n' "$(date +%s)"
+      [ "$_end" = 0 ] && printf 'result=complete\n' || printf 'result=incomplete\n'
+      printf 'reason=%s\n' "$_reason"
+    } > "$VULN_CACHE/.last-scan"
+  fi
+  rm -f "$VULN_CACHE/.incomplete.$$" "$VULN_CACHE/.seen.$$" "$VULN_CACHE/.hits.$$" \
+        "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$"
+
   # Licensing obligation of the Wordfence feed, not decoration: MITRE
   # copyright claims must be displayed for MITRE records shown to end users.
   echo ""
-  echo "  Vulnerability data: Wordfence Intelligence (free API). Records"
-  echo "  sourced from MITRE remain (c) MITRE Corporation."
+  if [ -n "$_feeds" ]; then
+    echo "  Vulnerability data: Wordfence Intelligence (free API). Records"
+    echo "  sourced from MITRE remain (c) MITRE Corporation."
+  fi
+  [ "${WPVULNERABILITY:-1}" = 1 ] && echo "  Vulnerability data from WPVulnerability."
+  return "$_end"
 }
 
 # ── Verify core and plugin files against WordPress.org checksums ─────────────
@@ -1101,46 +1347,69 @@ case "${1:-status}" in
          exit 1 ;;
     esac ;;
   vulns|vuln|cve)
-    case "${2:-}" in --nvd) vuln_scan 1 ;; *) vuln_scan 0 ;; esac ;;
+    case "${2:-}" in
+      --inventory)
+        [ -r "${3:-}" ] || { echo "Usage: wp-plugins.sh vulns --inventory <file>" >&2; exit 1; }
+        vuln_scan "$3" ;;
+      --nvd)
+        echo "  --nvd was removed: it never queried NVD. It only printed a note." >&2
+        vuln_scan "" ;;
+      *) vuln_scan "" ;;
+    esac ;;
   vuln-sources)
     echo ""
     echo "Vulnerability data sources"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     printf '  Wordfence Intelligence : %s\n' "$([ -n "${WORDFENCE_API_KEY:-}" ] && echo 'ENABLED (free token, bulk feed v3)' || echo 'NO TOKEN — vulnerability scanning unavailable')"
-    printf '  Patchstack             : %s\n' "$([ -n "${PATCHSTACK_API_KEY:-}" ] && echo ENABLED || echo 'not configured')"
-    printf '  WPScan                 : %s\n' "$([ -n "${WPSCAN_API_TOKEN:-}" ] && echo ENABLED || echo 'not configured')"
-    echo "  NVD                    : on demand — wp-plugins.sh vulns --nvd"
+    printf '  WPVulnerability        : %s\n' "$([ "${WPVULNERABILITY:-1}" = 1 ] && echo 'ENABLED (per-component lookups)' || echo 'off')"
     echo ""
     echo "  Wordfence is the primary source: free for personal and commercial"
     echo "  use, and fetched as ONE bulk feed queried locally — so your plugin"
-    echo "  inventory never leaves this VM. The v3 feed does require a free"
+    echo "  inventory is not sent to Wordfence. The v3 feed does require a free"
     echo "  account token (v2 was open and has been retired)."
     echo ""
-    echo "  The opt-in sources query per plugin slug, which does disclose what"
-    echo "  you run to that provider. That is a reasonable trade for better"
-    echo "  coverage, but it should be a choice, so they are off by default."
-    echo ""
-    echo "  Enable:  wp-plugins.sh set-key patchstack <key>"
-    echo "           wp-plugins.sh set-key wpscan <token>"
-    echo "    Patchstack: https://patchstack.com/  ·  WPScan: https://wpscan.com/api" ;;
+    echo "  WPVulnerability needs no token and adds core, PHP and MariaDB. It is"
+    echo "  queried per component, so the provider sees this VM's address and"
+    echo "  everything it runs, which is a client's inventory. On by default:"
+    echo "    wp-plugins.sh vuln-source wpvulnerability on|off"
+    echo "  Keep a slug on the VM:  WPV_SKIP=\"slug-one slug-two\" in ${VULN_CONF}" ;;
+  vuln-source)
+    [ "${2:-}" = wpvulnerability ] || { echo "Usage: wp-plugins.sh vuln-source wpvulnerability on|off" >&2; exit 1; }
+    mkdir -p "$(dirname "$VULN_CONF")"
+    touch "$VULN_CONF"; chmod 600 "$VULN_CONF"
+    case "${3:-}" in
+      on)  sed -i '/^WPVULNERABILITY=/d' "$VULN_CONF"
+           printf 'WPVULNERABILITY=1\n' >> "$VULN_CONF"
+           echo "✔ WPVulnerability on. The provider now sees this VM's address and"
+           echo "  the name of every plugin and theme it runs."
+           echo "  Keep a slug on the VM:  WPV_SKIP=\"slug-one slug-two\" in ${VULN_CONF}" ;;
+      off) sed -i '/^WPVULNERABILITY=/d' "$VULN_CONF"
+           printf 'WPVULNERABILITY=0\n' >> "$VULN_CONF"
+           echo "✔ WPVulnerability off. Nothing about this VM is sent to it now." ;;
+      *)   echo "Usage: wp-plugins.sh vuln-source wpvulnerability on|off" >&2; exit 1 ;;
+    esac ;;
   set-key)
     _src="${2:-}"; _key="${3:-}"
-    [ -n "$_src" ] && [ -n "$_key" ] || { echo "Usage: wp-plugins.sh set-key [wordfence|patchstack|wpscan] <key>" >&2; exit 1; }
+    [ -n "$_src" ] && [ -n "$_key" ] || { echo "Usage: wp-plugins.sh set-key wordfence <token>" >&2; exit 1; }
     mkdir -p "$(dirname "$VULN_CONF")"
     touch "$VULN_CONF"; chmod 600 "$VULN_CONF"
     case "$_src" in
-      wordfence)  sed -i '/^WORDFENCE_API_KEY=/d' "$VULN_CONF"
+      wordfence)  case "$_key" in
+                    *[!A-Za-z0-9._-]*)
+                      echo "That does not look like a token: it has spaces or punctuation." >&2
+                      exit 1 ;;
+                  esac
+                  sed -i '/^WORDFENCE_API_KEY=/d' "$VULN_CONF"
                   printf 'WORDFENCE_API_KEY=%s\n' "$_key" >> "$VULN_CONF"
                   echo "  Note: the feed is fetched whole and matched locally, so your"
                   echo "  plugin list is not sent to Wordfence." ;;
-      patchstack) sed -i '/^PATCHSTACK_API_KEY=/d' "$VULN_CONF"
-                  printf 'PATCHSTACK_API_KEY=%s\n' "$_key" >> "$VULN_CONF" ;;
-      wpscan)     sed -i '/^WPSCAN_API_TOKEN=/d' "$VULN_CONF"
-                  printf 'WPSCAN_API_TOKEN=%s\n' "$_key" >> "$VULN_CONF" ;;
-      *) echo "Unknown source '${_src}'. Use wordfence, patchstack or wpscan." >&2; exit 1 ;;
+      patchstack|wpscan)
+        echo "  ${_src} was listed here but never queried: no code ever used the key." >&2
+        echo "  WPVulnerability draws on both: wp-plugins.sh vuln-source wpvulnerability on" >&2
+        exit 1 ;;
+      *) echo "Unknown source '${_src}'. Use wordfence." >&2; exit 1 ;;
     esac
-    echo "✔ ${_src} key stored in ${VULN_CONF} (0600, root-only)"
-    echo "  Note: per-slug lookups disclose your plugin list to ${_src}." ;;
+    echo "✔ ${_src} key stored in ${VULN_CONF} (0600, root-only)" ;;
   vuln-refresh) _wf_refresh force && echo "✔ Feed refreshed" ;;
   check)  check_quiet ;;
   update-plugins)
@@ -1194,11 +1463,10 @@ case "${1:-status}" in
     echo ""
     echo "  Vulnerability scanning:"
     echo "       wp-plugins.sh vulns                 scan against known-vulnerable versions"
-    echo "       wp-plugins.sh vulns --nvd           also query NVD (slow, noisy)"
     echo "       wp-plugins.sh vuln-sources          which data sources are enabled"
     echo "       wp-plugins.sh vuln-refresh          force a feed re-download"
     echo "       wp-plugins.sh set-key wordfence <token>"
-    echo "       wp-plugins.sh set-key patchstack|wpscan <key>"
+    echo "       wp-plugins.sh vuln-source wpvulnerability on|off"
     echo ""
     echo "Why this exists: ~91% of WordPress vulnerabilities are in plugins and"
     echo "themes, which live in the mounted volume — not in the container image"

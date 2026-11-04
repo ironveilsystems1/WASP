@@ -38,6 +38,18 @@ UPLOADS_PHP_MARKER="/etc/wp-install/uploads-php-opened-at"
 EGRESS_EXTRA_FILE="/etc/wp-install/egress-extra.nft"
 UPLOADS_PHP_MAX_OPEN_SECS=3600
 
+# Parsed, never sourced: this runs as root, and cti-key writes operator input.
+_load_cti_conf() {
+  [ -r "$1" ] || return 0
+  while IFS= read -r _cc_l || [ -n "$_cc_l" ]; do
+    case "$_cc_l" in
+      CTI_API_KEY=*)        CTI_API_KEY=${_cc_l#*=} ;;
+      CTI_MONTHLY_BUDGET=*) CTI_MONTHLY_BUDGET=${_cc_l#*=} ;;
+    esac
+  done < "$1"
+  unset _cc_l
+}
+
 restart_wp() { PRUN restart wordpress >/dev/null 2>&1 && echo "  ✔  WordPress restarted" || true; }
 
 feature_state() {
@@ -157,6 +169,7 @@ disable_feature() {
         || cat >> "$APACHE_CONF" << 'B'
 
 <DirectoryMatch "^/var/www/html/wp-content/uploads">
+    php_admin_flag engine off
     <FilesMatch "\.ph(p[0-9]?|tml)$">
         Require all denied
     </FilesMatch>
@@ -766,6 +779,9 @@ SNIPPET
     printf 'proxy_set_header X-Forwarded-For   \$remote_addr;\n'
     printf 'proxy_set_header X-Forwarded-Proto \$scheme;\n\n'
     printf '# ── admin-ajax.php MUST stay open ──────────────────────────────\n'
+    printf '# admin-post.php serves logged-out visitors too: it is where WASP'"'"'s\n'
+    printf '# own contact form posts. Apache keeps both open for the same reason.\n'
+    printf '#\n'
     printf '# The PUBLIC front end calls this: Elementor, contact forms, and\n'
     printf '# most plugins with any interactive element. The admin location\n'
     printf '# below matches /wp-admin/ and therefore matches this path too,\n'
@@ -776,13 +792,18 @@ SNIPPET
     printf '# An EXACT-match location (=) outranks a regex location whatever\n'
     printf '# the order in the file, which is what keeps this one path open\n'
     printf '# without widening the restriction by a single byte.\n'
+    _public_location() {
+      printf '    proxy_pass http://%s:80;\n' "${_vmip:-VM_IP}"
+      printf '    proxy_set_header Host              \$host;\n'
+      printf '    proxy_set_header X-Real-IP         \$remote_addr;\n'
+      printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
+      printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
+      printf '}\n\n'
+    }
     printf 'location = /wp-admin/admin-ajax.php {\n'
-    printf '    proxy_pass http://%s:80;\n' "${_vmip:-VM_IP}"
-    printf '    proxy_set_header Host              \$host;\n'
-    printf '    proxy_set_header X-Real-IP         \$remote_addr;\n'
-    printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
-    printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
-    printf '}\n\n'
+    _public_location
+    printf 'location = /wp-admin/admin-post.php {\n'
+    _public_location
     printf 'location ~* ^/(wp-admin/|wp-login\\.php'
     [ -n "$_slug" ] && printf '|%s' "$_slug"
     printf ') {\n'
@@ -1188,7 +1209,7 @@ SNIPPET2
     _ip="${2:-}"
     CTI_CONF=/etc/wp-install/cti.conf
     CTI_CACHE=/var/cache/wp-cti
-    [ -r "$CTI_CONF" ] && . "$CTI_CONF"
+    _load_cti_conf "$CTI_CONF"
     CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-120}"
     [ -n "${CTI_API_KEY:-}" ] || exit 2
     command -v jq >/dev/null 2>&1 || exit 2
@@ -1234,7 +1255,7 @@ SNIPPET2
     # site. An http-probing ban is background noise hitting everyone.
     CTI_CONF=/etc/wp-install/cti.conf
     CTI_CACHE=/var/cache/wp-cti
-    [ -r "$CTI_CONF" ] && . "$CTI_CONF"
+    _load_cti_conf "$CTI_CONF"
     [ "${CTI_ENRICH_BANS:-0}" = "1" ] || exit 0
     [ -n "${CTI_API_KEY:-}" ] || exit 0
     mkdir -p "$CTI_CACHE"; _seen="${CTI_CACHE}/.notified"
@@ -1299,7 +1320,7 @@ SNIPPET2
     _ip="${2:-}"
     CTI_CONF=/etc/wp-install/cti.conf
     CTI_CACHE=/var/cache/wp-cti
-    [ -r "$CTI_CONF" ] && . "$CTI_CONF"
+    _load_cti_conf "$CTI_CONF"
     CTI_MONTHLY_BUDGET="${CTI_MONTHLY_BUDGET:-120}"
     mkdir -p "$CTI_CACHE" 2>/dev/null || true
     chmod 700 "$CTI_CACHE" 2>/dev/null || true
@@ -1955,12 +1976,6 @@ SNIPPET2
       trivy image --cache-dir "${TRIVY_CACHE_DIR}" --severity HIGH,CRITICAL --quiet "${img}" 2>/dev/null \
         && echo "  ✔  Clean" || echo "  ⚠  Vulnerabilities found — run: update.sh"
     done ;;
-  lynis)
-    echo "Running Lynis audit (2-5 min)..."
-    lynis audit system --quiet \
-      --logfile /var/log/lynis.log \
-      --report-file /var/log/lynis-report.dat 2>&1 | logger -t lynis-manual
-    echo "✔  Done. Score: $(grep hardening_index /var/log/lynis-report.dat | cut -d= -f2)" ;;
   *)
     echo "Usage: wp-hardening.sh [status|enable <f>|disable <f>|restart-wp|trivy-scan|lynis]"
     ;;

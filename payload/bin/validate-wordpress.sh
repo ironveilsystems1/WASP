@@ -99,6 +99,10 @@ done
 # while update.sh (which sources pinned.env) correctly showed 3/3. Both files
 # are 0600 root-only, so this depends on the auto-doas elevation at the top.
 [ -r /etc/wp-install/pinned.env ] && . /etc/wp-install/pinned.env
+# Only the WORDPRESS_* values. The root password stays out of containers that
+# run site code. A VM built before 10.10 has just the one file.
+WP_ENV_FILE=/etc/wordpress/wp.env
+[ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
 
 # --- Machine-readable health for external monitoring (Nagios/Zabbix/cron) ---
 # --check exits 0 (healthy), 1 (degraded), or 2 (critical) after one line, so a
@@ -560,6 +564,32 @@ case "$_rim" in
                "podman ps ; podman exec wordpress ls -l /etc/apache2/conf-enabled/remoteip.conf" ;;
 esac
 
+# The daily vulnerability scan alerts when it fails, but only if it can tell, and
+# a VM with no source at all has nothing to fail. Read from the scan's own record.
+_vsc=/etc/wp-install/vuln-sources.conf
+_vst=/var/cache/wp-vulns/.last-scan
+if ! grep -qE '^WORDFENCE_API_KEY=.' "$_vsc" 2>/dev/null \
+   && grep -qE '^WPVULNERABILITY=0' "$_vsc" 2>/dev/null; then
+  warn "No vulnerability data source is configured" \
+       "The daily plugin and theme scan cannot run, so nothing here watches for known vulnerabilities." \
+       "wp-plugins.sh set-key wordfence <token>   # or: wp-plugins.sh vuln-source wpvulnerability on"
+elif [ -r "$_vst" ]; then
+  _vat=$(sed -n 's/^at=//p' "$_vst" | head -1)
+  _vres=$(sed -n 's/^result=//p' "$_vst" | head -1)
+  case "$_vat" in ''|*[!0-9]*) _vat=0 ;; esac
+  if [ "$_vres" != complete ]; then
+    warn "The last vulnerability scan did not complete" \
+         "$(sed -n 's/^reason=//p' "$_vst" | head -1)" \
+         "wp-plugins.sh vulns"
+  elif [ $(( $(date +%s) - _vat )) -gt 259200 ]; then
+    warn "The last vulnerability scan is over three days old" \
+         "It runs daily from cron, so it has stopped running." \
+         "wp-plugins.sh vulns ; crontab -l | grep vuln"
+  else
+    pass "Vulnerability scan completed within three days"
+  fi
+fi
+
 # --- Custom login slug: the end-to-end test this script never had ---
 if [ -n "${WP_ADMIN_SLUG}" ]; then
   # The BARE slug is the login URL. The "-login" suffix was removed because a
@@ -665,13 +695,13 @@ if [ -f "$MU_MFA" ]; then
       _wpcli_img=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
       [ -n "$_wpcli_img" ] || _wpcli_img="docker.io/library/wordpress:cli"
       if podman run --rm --network "container:wordpress" --user 33:33 \
-           --env-file /etc/wordpress/env -e WORDPRESS_DB_HOST=mariadb:3306 \
+           --env-file "$WP_ENV_FILE" -e WORDPRESS_DB_HOST=mariadb:3306 \
            -v /home/wpuser/wp/html:/var/www/html \
            "$_wpcli_img" wp --path=/var/www/html plugin is-active two-factor >/dev/null 2>&1; then
         pass "MFA enforced for admins and the Two Factor plugin is active"
       else
         fail "MFA is ENFORCED but the Two Factor plugin is not active" \
-             "Admins past their grace window cannot enrol and will be locked out." \
+             "Enforcement depends on that plugin, so right now administrators have no second factor." \
              "wp-plugins.sh install two-factor --activate"
       fi
     else
@@ -725,6 +755,41 @@ for pat in 'xmlrpc.php' 'wp-config' 'wp-content/uploads'; do
          "grep -n '${pat}' ${APACHE_CONF}    # re-run provisioning to regenerate"
   fi
 done
+
+# Live, because a rule can read correctly and do nothing. A handler override is
+# planted the way an attacker would plant one, then fetched. The marker is built
+# at run time, so a file served as plain text cannot match it.
+_wup=/home/wpuser/wp/html/wp-content/uploads
+if [ -d "$_wup" ]; then
+  _wpd="${_wup}/wasp-probe-$$"
+  mkdir -p "$_wpd" 2>/dev/null
+  printf 'AddType application/x-httpd-php .jpg\n' > "${_wpd}/.htaccess" 2>/dev/null
+  printf "<?php echo 'WASP' . 'PROBE';" > "${_wpd}/p.jpg" 2>/dev/null
+  chown -R 33:33 "$_wpd" 2>/dev/null
+  _wpb=$(wget -qO- -U "wp-health-check/1.0" \
+    "http://127.0.0.1:${WEB_CHECK_PORT:-80}/wp-content/uploads/$(basename "$_wpd")/p.jpg" 2>/dev/null)
+  rm -rf "$_wpd"
+  if ! printf '%s' "$_wpb" | grep -q 'PROBE'; then
+    warn "Could not test PHP execution in uploads" \
+         "The probe file could not be fetched, so this says nothing either way." \
+         "wget -S -O- http://127.0.0.1/wp-content/uploads/"
+  elif printf '%s' "$_wpb" | grep -q 'WASPPROBE'; then
+    fail "PHP ran from uploads through a .htaccess handler override" \
+         "Blocking .php by name is not enough: one .htaccess turns shell.jpg into PHP. wp-security.conf should set 'php_admin_flag engine off' for uploads." \
+         "grep -n 'php_admin_flag' ${APACHE_CONF}    # then: doas wp-hardening.sh enable uploads-php"
+  else
+    pass "PHP does not run from uploads, even with a .htaccess handler override"
+  fi
+fi
+
+# The root password has no business in a container that runs plugin code.
+if podman exec wordpress sh -c 'test -z "${MARIADB_ROOT_PASSWORD:-}"' 2>/dev/null; then
+  pass "The database root password is not in the WordPress container"
+else
+  warn "The database root password is in the WordPress container's environment" \
+       "Any PHP on the site can read it. VMs built before 10.10 are like this until the container is recreated." \
+       "doas update.sh    # creates /etc/wordpress/wp.env; WordPress uses it from its next recreate"
+fi
 
 if nft list tables 2>/dev/null | grep -q filter; then
   pass "nftables ruleset loaded"

@@ -525,7 +525,10 @@ do_restore() {
     printf "  Type REPLACE to load %s into the live database: " "$_file"
     read -r _c
     [ "$_c" = "REPLACE" ] || { echo "  Cancelled — nothing changed."; rm -rf "$_work"; return 0; }
-    if gzip -dc "$_src" | podman exec -i mariadb mariadb -u root -p"${MARIADB_ROOT_PASSWORD:-}" 2>/dev/null; then
+    # Expanded inside the container. The variable does not exist on this host, so
+    # this used to pass an empty password and the restore could not log in.
+    if gzip -dc "$_src" | podman exec -i mariadb sh -c \
+         'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD"' 2>/dev/null; then
       _ok "Restored into the live database"
       _note "Verify now: validate-wordpress.sh --section database"
       _note "If the site misbehaves, the pre-restore backup is the newest file"

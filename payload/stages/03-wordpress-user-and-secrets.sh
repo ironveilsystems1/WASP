@@ -17,6 +17,10 @@ DB_WP_PASS=$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 32)
 WP_TABLE_PREFIX="wp$(openssl rand -hex 3)_"
 
 mkdir -p /etc/wordpress
+# Private from the first byte. chmod after the write left a window in which the
+# passwords were in a world-readable file.
+_prev_umask=$(umask)
+umask 077
 cat > /etc/wordpress/env << WPCREDS
 MARIADB_ROOT_PASSWORD=${DB_ROOT_PASS}
 MARIADB_DATABASE=wordpress
@@ -30,6 +34,11 @@ WORDPRESS_TABLE_PREFIX=${WP_TABLE_PREFIX}
 WPCREDS
 chmod 600 /etc/wordpress/env
 ok "/etc/wordpress/env written (chmod 600)"
+# WordPress and wp-cli run site and plugin code, so they get only their own
+# values. The full file, with the database root password, goes to MariaDB alone.
+grep '^WORDPRESS_' /etc/wordpress/env > /etc/wordpress/wp.env
+chmod 600 /etc/wordpress/wp.env
+ok "/etc/wordpress/wp.env written (WordPress values only, chmod 600)"
 
 cat > /root/.wp-credentials << WPCREDSINFO
 # ============================================================
@@ -50,6 +59,7 @@ cat > /root/.wp-credentials << WPCREDSINFO
 WPCREDSINFO
 chmod 600 /root/.wp-credentials
 ok "/root/.wp-credentials written (chmod 600)"
+umask "$_prev_umask"
 
 ts "Creating Podman wp-front / wp-db networks"
 # Explicit subnets keep the nftables forward chain rules exact:

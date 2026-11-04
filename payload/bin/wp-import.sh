@@ -12,8 +12,7 @@
 #   wp-import.sh staged                what is currently staged
 #   wp-import.sh apply [id]            normalise, import, re-harden
 #
-# This is steps 1 and 2 of docs/IMPORT-DESIGN.md: get the archive here, and
-# report what it contains. It does not extract, import, or modify anything.
+# Reads zip, tar.gz, gzip dumps and All-in-One WP Migration .wpress archives.
 #
 # `inspect` is deliberately the first thing built. "Tell me what is in this
 # backup before I touch it" is useful on its own, and it is the only part of
@@ -23,9 +22,10 @@
 # WHY INSPECT NEVER EXTRACTS
 #
 # Reading an archive's index is safe. Extracting is where path traversal,
-# symlink escapes and decompression bombs happen. Those are checked HERE,
+# link escapes and decompression bombs happen. Those are checked HERE,
 # against the listing, so a hostile archive is refused before any of its
-# contents exist on disk.
+# contents exist on disk. extract checks the listing again, then checks what
+# actually landed, because a listing is only as good as the tool that read it.
 # =============================================================================
 set -u
 
@@ -39,15 +39,128 @@ INBOX=/var/lib/wasp-import/incoming
 STAGING=/var/lib/wasp-import/staging
 WP_ROOT=/home/wpuser/wp/html
 RCLONE_CONF=/etc/wp-install/rclone.conf
+WPRESS_READER=/usr/local/lib/wasp/wasp-wpress-reader.php
+# Only the WORDPRESS_* values. The root password stays out of containers that
+# run site code. A VM built before 10.10 has just the one file.
+WP_ENV_FILE=/etc/wordpress/wp.env
+[ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
 mkdir -p "$INBOX" "$STAGING" 2>/dev/null || true
 chmod 700 "$STAGING" 2>/dev/null || true
-chmod 750 "$INBOX" 2>/dev/null || true
+# Same owner and mode as stage 08. This used to be a flat `chmod 750` on every
+# run, which took away the group write that `scp -O` as the admin user needs,
+# so the first import broke every later upload. Not world-readable: a client's
+# backup contains their database.
+if [ -n "${ADMIN_USER:-}" ] && id "$ADMIN_USER" >/dev/null 2>&1; then
+  chown "root:${ADMIN_USER}" "$INBOX" 2>/dev/null || true
+  chmod 2770 "$INBOX" 2>/dev/null || true
+else
+  chmod 750 "$INBOX" 2>/dev/null || true
+fi
+
+# ── Archive safety ──────────────────────────────────────────────────────────
+# A backup needs plain files and directories, nothing else. Hard links matter
+# as much as symlinks: BusyBox tar follows a hard-link target out of the
+# extraction directory (CVE-2026-26158), and `cp -a` then copies that file's
+# CONTENT into the docroot. Reproduced: a member linked to /etc/wordpress/env
+# passed inspect, extract, scan and apply, and came out in uploads, mode 644.
+#
+# The pattern covers both listing styles. GNU tar marks hard links with a
+# leading "h" and "link to". BusyBox prints them as regular files with " -> ".
+_tar_special() { tar -tzvf "$1" 2>/dev/null | grep -cE '^[^-d]| -> | link to '; }
+
+# `unzip -Z` is Info-ZIP only. BusyBox unzip rejects it, and that used to leave
+# the listing empty, so every check below was skipped without a word. Callers
+# refuse when these return nothing for a file that is a zip.
+_zip_members() { unzip -Z1 "$1" 2>/dev/null; }
+_zip_special() { unzip -Z "$1" 2>/dev/null | grep -c '^l'; }
+_zip_bytes()   { unzip -l "$1" 2>/dev/null | tail -1 | awk '{print $1+0}'; }
+
+# Links and special files in a tree that has already been written. This is the
+# check that does not depend on any listing. It prints a count, and returns
+# non-zero when it could not look, which callers treat as a refusal.
+_staged_special() {
+  _ss=$(find "$1" \( ! -type f ! -type d \) -o \( -type f -links +1 \) 2>/dev/null) || return 1
+  [ -n "$_ss" ] || { echo 0; return 0; }
+  printf '%s\n' "$_ss" | wc -l
+}
 
 _ok()   { printf '  \033[32m✔\033[0m  %s\n' "$1"; }
 _bad()  { printf '  \033[31m✗\033[0m  %s\n' "$1" >&2; }
 _warn() { printf '  \033[33m⚠\033[0m  %s\n' "$1"; }
 _note() { printf '     %s\n' "$1"; }
 _hdr()  { printf '\n\033[1m%s\033[0m\n%s\n' "$1" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
+
+_wpcli_image() {
+  _wi=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
+  [ -n "$_wi" ] || _wi="docker.io/library/wordpress:cli"
+  printf '%s' "$_wi"
+}
+
+# ── .wpress: the reader runs in a box, not on the VM ─────────────────────────
+# A custom binary parser fed an untrusted file is exactly the code to keep away
+# from this host, so it runs in the pinned wp-cli image: no network, read-only
+# root, no capabilities, an unprivileged uid, bounded memory, and write access
+# to the staging directories and nothing else.
+#
+#   _wpress_run <archive> <staging|-> <reader mode> [reader args...]
+#
+# --group-add: the archive arrives root- or admin-group owned at mode 640. A
+# bind mount of the file itself needs no directory access, only that group.
+# The colon check is because `-v` would split the path on it.
+_wpress_run() {
+  _wr_a=$1; _wr_s=$2; _wr_m=$3; shift 3
+  case "$_wr_a" in
+    *:*) _bad "The archive path contains ':', which a bind mount cannot express. Rename it."
+         return 1 ;;
+  esac
+  [ -r "$WPRESS_READER" ] || { _bad "Reader missing: ${WPRESS_READER}"; return 1; }
+  if [ "$_wr_s" = "-" ]; then
+    # shellcheck disable=SC2086
+    podman run --rm -i --network none --read-only \
+      --cap-drop ALL --security-opt no-new-privileges:true \
+      --user 33:33 --group-add "$(stat -c %g "$_wr_a")" \
+      --pids-limit 16 --memory 512m \
+      --tmpfs /tmp:size=8M,noexec,nosuid,nodev \
+      -v "${WPRESS_READER}:/wasp/reader.php:ro" \
+      -v "${_wr_a}:/wasp/archive.wpress:ro" \
+      --entrypoint php "$(_wpcli_image)" \
+      -d memory_limit=256M /wasp/reader.php "$_wr_m" /wasp/archive.wpress "$@"
+  else
+    # shellcheck disable=SC2086
+    podman run --rm -i --network none --read-only \
+      --cap-drop ALL --security-opt no-new-privileges:true \
+      --user 33:33 --group-add "$(stat -c %g "$_wr_a")" \
+      --pids-limit 16 --memory 512m \
+      --tmpfs /tmp:size=8M,noexec,nosuid,nodev \
+      -v "${WPRESS_READER}:/wasp/reader.php:ro" \
+      -v "${_wr_a}:/wasp/archive.wpress:ro" \
+      -v "${_wr_s}/files:/wasp/out/files" \
+      -v "${_wr_s}/db:/wasp/out/db" \
+      -v "${_wr_s}/meta:/wasp/out/meta" \
+      --entrypoint php "$(_wpcli_image)" \
+      -d memory_limit=256M /wasp/reader.php "$_wr_m" /wasp/archive.wpress /wasp/out "$@"
+  fi
+}
+
+# Reader exit codes -> what the operator is told. 2 is hostile or damaged and
+# has no override, per the design's gate table.
+_wpress_status() {
+  case "$1" in
+    0) return 0 ;;
+    2) _bad "REFUSED. This archive is hostile or damaged; see the line above."
+       _note "Nothing was written. A .wpress that stops part way is usually an"
+       _note "interrupted upload: compare its size with the original." ;;
+    3) _bad "This archive cannot be imported as it stands; see the line above." ;;
+    *) _bad "The .wpress reader did not run (status ${1})."
+       _note "Is the wp-cli image present?  podman images | grep wordpress"
+       _note "Is the archive readable by its group?  chmod 640 <file>" ;;
+  esac
+  return 1
+}
+
+_wpress_read_meta() {  # key -> value, from the reader's scan output in $_wpx
+  printf '%s\n' "$_wpx" | sed -n "s/^M $1 //p" | head -1
+}
 
 case "${1:-where}" in
 
@@ -155,10 +268,10 @@ fetch)
       case "$_src" in https://*|http://*) : ;; *) _bad "Give a http(s) URL"; exit 1 ;; esac
       _name=$(basename "${_src%%\?*}")
       # BUG FIX: a share link ends in an ACCESS TOKEN, not a filename:
-      #   .../share/331434/backup/melroseg.zip/5eDFlx9VLGw
-      # basename gave "5eDFlx9VLGw", so a 653 MB archive landed with no
+      #   .../share/<id>/backup/client-a.zip/<token>
+      # basename gave the token, so a 653 MB archive landed with no
       # extension and a name that matches nothing the operator asked for.
-      # `inspect melroseg.zip` then reported "Not found", which reads as the
+      # `inspect client-a.zip` then reported "Not found", which reads as the
       # download having failed when it had in fact succeeded.
       #
       # Prefer a path segment that looks like an archive, which is where
@@ -191,6 +304,33 @@ fetch)
         _note "  If this is refused, allow the host first:"
         _note "    doas wasp-egress.sh allow $(printf '%s' "$_src" | sed 's|^[a-z]*://||; s|/.*||')"
       fi
+      # A named import source opens for this download and closes after it.
+      # See import-source in wasp-egress.sh for why it is not on the allowlist.
+      _imp_win=0
+      _imp_close() {
+        [ "$_imp_win" = 1 ] || return 0
+        _imp_win=0
+        /usr/local/bin/wasp-egress.sh maintenance disable >/dev/null 2>&1 \
+          || _warn "Could not close the egress window now. It expires by itself."
+      }
+      _imp_host=$(printf '%s' "$_src" | sed 's|^[a-zA-Z]*://||; s|[/:?#].*||' | tr 'A-Z' 'a-z')
+      if [ -n "$_imp_proxy" ] \
+         && /usr/local/bin/wasp-egress.sh import-source has "$_imp_host" 2>/dev/null; then
+        if /usr/local/bin/wasp-egress.sh maintenance status 2>/dev/null | grep -q 'window OPEN'; then
+          _warn "An egress window is already open, so it is left as it is."
+          _note "If ${_imp_host} is not in it, the proxy will refuse this download."
+        elif /usr/local/bin/wasp-egress.sh maintenance enable --duration 120 \
+               --reason "import download from ${_imp_host}" --host "$_imp_host" >/dev/null; then
+          _imp_win=1
+          trap '_imp_close' EXIT
+          trap 'exit 130' INT TERM
+          _note "Opened ${_imp_host} for this download only."
+          sleep 2   # squid -k reconfigure returns before the new list is live
+        else
+          _bad "Could not open the egress window for ${_imp_host}."
+          exit 1
+        fi
+      fi
       _note "Downloading to ${INBOX}/${_name} …"
       if [ -n "$_imp_proxy" ]; then
         curl -fL --progress-bar -x "$_imp_proxy" -o "${INBOX}/${_name}" "$_src" \
@@ -201,6 +341,7 @@ fetch)
       else
         curl -fL --progress-bar -o "${INBOX}/${_name}" "$_src" || { _bad "Download failed."; exit 1; }
       fi
+      _imp_close
       # A share page returns HTML that is the right shape and the wrong thing.
       # Catching it here saves a confusing failure three steps later.
       if head -c 512 "${INBOX}/${_name}" | grep -qi '<!doctype html\|<html'; then
@@ -256,20 +397,48 @@ inspect)
   case "$(basename "$_f")" in
     *.wpress)
       _fmt="All-in-One WP Migration (.wpress)"
-      _warn "Custom binary format — not a standard archive."
-      _note "Extract it on your workstation first with a .wpress extractor,"
-      _note "then bring the resulting folder here. Native support is planned."
-      echo ""; exit 0 ;;
+      # The whole archive is walked and its checksum verified here, which is
+      # the one place inspect reads more than an index: this format has none.
+      _note "Reading every header and verifying the checksum…"
+      _wprc=0; _wpx=$(_wpress_run "$_f" - scan </dev/null) || _wprc=$?
+      _wpress_status "$_wprc" || exit "$_wprc"
+      _listing=$(printf '%s\n' "$_wpx" | sed -n 's/^F [0-9]* //p')
+      printf '  Source site : %s\n' "$(_wpress_read_meta site_url)"
+      printf '  WordPress   : %s   exported by plugin %s\n' \
+        "$(_wpress_read_meta wp_version)" "$(_wpress_read_meta plugin_version)"
+      printf '  Theme       : %s\n' "$(_wpress_read_meta stylesheet)"
+      printf '  Checksum    : %s\n' \
+        "$([ "$(_wpress_read_meta format)" = crc ] && echo "verified ($(_wpress_read_meta archive_crc))" || echo "none (exported before plugin 7.104)")"
+      [ -n "$(_wpress_read_meta compression)" ] && \
+        _note "Compressed: $(_wpress_read_meta compression)"
+      [ "$(_wpress_read_meta encrypted)" = 1 ] && \
+        _warn "Password-protected. Names are readable; extract will ask for the password."
+      [ "$(_wpress_read_meta multisite)" = 1 ] && {
+        _bad "Multisite export. WASP is single-site: export the one site instead."; exit 3; }
+      [ "$(_wpress_read_meta database)" = 1 ] || \
+        _bad "No database.sql: this was exported with the database excluded."
+      [ "$(_wpress_read_meta plugins_rejected)" = 0 ] || \
+        _bad "$(_wpress_read_meta plugins_rejected) active-plugin name(s) in package.json are not plausible names — ignored. A real export does not produce these."
+      echo ""
+      ;;
     backup_*-db.gz|backup_*.gz) _fmt="UpdraftPlus (database part)" ;;
     backup_*.zip)               _fmt="UpdraftPlus (files part)" ;;
   esac
 
+  _is_zip=0
   if tar -tzf "$_f" >/dev/null 2>&1; then
     [ "$_fmt" = "unknown" ] && _fmt="tar.gz"
     _listing=$(tar -tzf "$_f" 2>/dev/null)
   elif unzip -l "$_f" >/dev/null 2>&1; then
     [ "$_fmt" = "unknown" ] && _fmt="zip"
-    _listing=$(unzip -Z1 "$_f" 2>/dev/null)
+    _is_zip=1
+    _listing=$(_zip_members "$_f")
+    if [ -z "$_listing" ]; then
+      _bad "This is a zip, but its member list could not be read."
+      _note "Reading it needs Info-ZIP. BusyBox unzip cannot list members:"
+      _note "  doas apk add unzip"
+      exit 2
+    fi
   elif gzip -t "$_f" >/dev/null 2>&1; then
     [ "$_fmt" = "unknown" ] && _fmt="gzip (probably a SQL dump)"
   fi
@@ -290,13 +459,16 @@ inspect)
       _hostile=$(( _hostile + _trav )); }
     _abs=$(printf '%s\n' "$_listing" | grep -c '^/') || _abs=0
     [ "${_abs:-0}" -gt 0 ] && { _bad "${_abs} member(s) use absolute paths"; _hostile=$(( _hostile + _abs )); }
-    if tar -tzvf "$_f" >/dev/null 2>&1; then
-      _lnk=$(tar -tzvf "$_f" 2>/dev/null | grep -c '^l') || _lnk=0
-      [ "${_lnk:-0}" -gt 0 ] && { _bad "${_lnk} symlink(s)"
-        _note "A backup does not need symlinks. They can point outside the target."
-        _hostile=$(( _hostile + _lnk )); }
+    _lnk=0
+    if [ "$_is_zip" = 1 ]; then
+      _lnk=$(_zip_special "$_f") || _lnk=0
+    elif tar -tzvf "$_f" >/dev/null 2>&1; then
+      _lnk=$(_tar_special "$_f") || _lnk=0
     fi
-    [ "$_hostile" -eq 0 ] && _ok "No path traversal, absolute paths or symlinks"
+    [ "${_lnk:-0}" -gt 0 ] && { _bad "${_lnk} link or special member(s)"
+      _note "A backup does not need them. Links can reach outside the target."
+      _hostile=$(( _hostile + _lnk )); }
+    [ "$_hostile" -eq 0 ] && _ok "No path traversal, absolute paths or links"
 
     # ── Content the operator should know about ──────────────────────────────
     echo ""
@@ -327,6 +499,8 @@ inspect)
 
     # ── Expansion ratio ─────────────────────────────────────────────────────
     _un=$(tar -tzvf "$_f" 2>/dev/null | awk '{s+=$3} END{print s+0}')
+    [ "$_is_zip" = 1 ] && _un=$(_zip_bytes "$_f")
+    [ -n "${_wpx:-}" ] && _un=$(_wpress_read_meta stored_bytes)
     if [ "${_un:-0}" -gt 0 ]; then
       _ratio=$(( _un / (_sz > 0 ? _sz : 1) ))
       printf '  Expands to roughly %s (ratio %sx)\n' "$(numfmt --to=iec "$_un" 2>/dev/null || echo "${_un}B")" "$_ratio"
@@ -338,7 +512,7 @@ inspect)
 
     echo ""
     if [ "$_hostile" -gt 0 ]; then
-      _bad "REFUSED: this archive contains members that would write outside"
+      _bad "REFUSED: this archive contains members that can reach outside"
       _bad "the extraction directory. There is no legitimate reason for that."
       exit 2
     fi
@@ -369,26 +543,52 @@ extract)
   # must not depend on the operator having run inspect first -- a security
   # check that only fires when someone remembers to ask for it is not a
   # control.
-  _listing=""
-  tar -tzf "$_f" >/dev/null 2>&1 && _listing=$(tar -tzf "$_f" 2>/dev/null)
-  [ -z "$_listing" ] && unzip -l "$_f" >/dev/null 2>&1 && _listing=$(unzip -Z1 "$_f" 2>/dev/null)
+  _listing=""; _is_zip=0
+  if tar -tzf "$_f" >/dev/null 2>&1; then
+    _listing=$(tar -tzf "$_f" 2>/dev/null)
+  elif unzip -l "$_f" >/dev/null 2>&1; then
+    _is_zip=1
+    _listing=$(_zip_members "$_f")
+    if [ -z "$_listing" ]; then
+      _bad "This is a zip, but its member list could not be read, so it cannot"
+      _bad "be checked. Refusing to extract it unchecked."
+      _note "Reading it needs Info-ZIP:  doas apk add unzip"
+      exit 2
+    fi
+  fi
   if [ -n "$_listing" ]; then
     _h=0
     printf '%s\n' "$_listing" | grep -q '\.\./' && { _bad "Path traversal in archive members"; _h=1; }
     printf '%s\n' "$_listing" | grep -q '^/'      && { _bad "Absolute paths in archive members"; _h=1; }
-    tar -tzvf "$_f" 2>/dev/null | grep -q '^l'     && { _bad "Symlinks in archive"; _h=1; }
+    _lnk=0
+    if [ "$_is_zip" = 1 ]; then
+      _lnk=$(_zip_special "$_f") || _lnk=0
+    else
+      _lnk=$(_tar_special "$_f") || _lnk=0
+    fi
+    [ "${_lnk:-0}" -gt 0 ] && { _bad "${_lnk} link or special member(s) in the archive"; _h=1; }
     [ "$_h" = 1 ] && { _bad "Refusing to extract. Nothing legitimate needs these."; exit 2; }
   fi
 
   _id="$(date -u +%Y%m%d-%H%M%S)-$(basename "$_f" | tr -c 'a-zA-Z0-9._-' '_' | cut -c1-32)"
   _st="${STAGING}/${_id}"
-  mkdir -p "${_st}/files" "${_st}/db"
+  # The id has one-second resolution. Re-using one would merge two extractions,
+  # and every failure path below removes the directory, so a clash would delete
+  # the earlier, good staging set.
+  if [ -e "$_st" ]; then
+    _bad "Staging set ${_id} already exists. Wait a second and retry."
+    exit 1
+  fi
+  mkdir -p "${_st}/files" "${_st}/db" "${_st}/meta"
   chmod 700 "$_st"
+  _is_wpress=0
+  case "$(basename "$_f")" in *.wpress) _is_wpress=1 ;; esac
 
   # Space check before writing, not after. Running out mid-extract leaves a
   # half-populated staging directory and a disk too full for the live site to
   # write its own logs or backups.
   _un=$(tar -tzvf "$_f" 2>/dev/null | awk '{s+=$3} END{print s+0}')
+  [ "$_is_zip" = 1 ] && _un=$(_zip_bytes "$_f")
   if [ "${_un:-0}" -gt 0 ]; then
     _needk=$(( _un / 1024 + 524288 ))
     _freek=$(df -Pk / | awk 'NR==2{print $4}')
@@ -397,11 +597,90 @@ extract)
       rm -rf "$_st"; exit 1; }
   fi
 
-  _note "Extracting to ${_st}/files …"
+  if [ "$_is_wpress" = 1 ]; then
+    # Hostile members, sizes and the checksum are all re-checked by the reader
+    # before it writes, so this does not depend on inspect having been run.
+    # 512 MB stays free for the live site; a compressed archive's real size is
+    # only known as it decodes, so the limit is enforced while writing.
+    _freek=$(df -Pk / | awk 'NR==2{print $4}')
+    _sizek=$(( $(stat -c %s "$_f") / 1024 ))
+    if [ "${_freek:-0}" -lt $(( _sizek + 524288 )) ]; then
+      _bad "Not enough disk: needs ~$(( (_sizek + 524288) / 1048576 ))GB, have $(( _freek / 1048576 ))GB"
+      rm -rf "$_st"; exit 1
+    fi
+    _budget=$(( (_freek - 524288) * 1024 ))
+
+    _wprc=0; _wpx=$(_wpress_run "$_f" - scan </dev/null) || _wprc=$?
+    _wpress_status "$_wprc" || { rm -rf "$_st"; exit "$_wprc"; }
+
+    # The password goes to the reader on stdin. printf is a shell builtin, so
+    # it never appears in a process listing, and the reader writes it nowhere.
+    _pwopt=""; _wpw=""
+    if [ "$(_wpress_read_meta encrypted)" = 1 ]; then
+      if [ ! -t 0 ]; then
+        _bad "This archive is password-protected and there is no terminal to ask on."
+        _note "Run it from a console: qm terminal <vmid>"
+        rm -rf "$_st"; exit 3
+      fi
+      printf '  Archive password: '
+      stty -echo 2>/dev/null
+      IFS= read -r _wpw || _wpw=""
+      stty echo 2>/dev/null
+      echo ""
+      _pwopt="--password-stdin"
+    fi
+
+    # Unprivileged inside, so only these three directories are writable to it.
+    chown 33:33 "${_st}/files" "${_st}/db" "${_st}/meta"
+    _note "Extracting to ${_st}/files/wp-content …"
+    # shellcheck disable=SC2086
+    printf '%s\n' "$_wpw" | _wpress_run "$_f" "$_st" extract \
+      "--max-bytes=${_budget}" $_pwopt
+    _wprc=$?
+    _wpw=""
+    chown -R root:root "$_st" 2>/dev/null
+    _wpress_status "$_wprc" || { rm -rf "$_st"; exit "$_wprc"; }
+
+    # The format cannot express a link or a device. Anything other than plain
+    # files and directories means something other than the reader wrote here.
+    _odd=$(find "$_st" ! -type f ! -type d 2>/dev/null | grep -c .) || _odd=0
+    if [ "${_odd:-0}" -gt 0 ]; then
+      _bad "REFUSED: ${_odd} non-regular file(s) in the extracted tree."
+      rm -rf "$_st"; exit 2
+    fi
+
+    # database.sql names everything with the plugin's placeholder. Turned back
+    # into the source site's real prefix HERE, before anything else reads the
+    # dump, because the scan below and `apply` both key on table names:
+    # unconverted, the option-row check matches nothing and reports "No code in
+    # option rows", and the prefix detection reads the wrong thing entirely.
+    _pfx=$(sed -n 's/^db_prefix=//p' "${_st}/meta/wpress.meta" | head -1)
+    case "$_pfx" in ''|*[!A-Za-z0-9_]*)
+      _warn "No usable table prefix in package.json — assuming wp_"; _pfx=wp_ ;; esac
+    _dmp="${_st}/db/database.sql"
+    if ! sed "s/SERVMASK_PREFIX_/${_pfx}/g" "$_dmp" > "${_dmp}.tmp" \
+       || ! mv "${_dmp}.tmp" "$_dmp"; then
+      _bad "Could not normalise the dump's table prefix."
+      rm -rf "$_st"; exit 1
+    fi
+    if grep -q 'SERVMASK_PREFIX_' "$_dmp"; then
+      _bad "The dump still carries the plugin's placeholder prefix."
+      rm -rf "$_st"; exit 1
+    fi
+    if [ "$(sed -n 's/^file_crc_mismatch=//p' "${_st}/meta/wpress.meta")" != 0 ]; then
+      _warn "$(sed -n 's/^file_crc_mismatch=//p' "${_st}/meta/wpress.meta") file(s) did not match their stored checksum."
+    fi
+    _wm=$(sed -n 's/^plugins_missing=//p' "${_st}/meta/wpress.meta")
+    [ "${_wm:-0}" = 0 ] || _warn "${_wm} plugin(s) were active on the source but are not in this archive."
+  fi
+
+  [ "$_is_wpress" = 1 ] || _note "Extracting to ${_st}/files …"
   # --no-same-owner / --no-same-permissions: never honour ownership or mode
   # bits from an untrusted archive. A setuid binary or a root-owned file
   # inside a client's backup is not something to reproduce faithfully.
-  if tar -tzf "$_f" >/dev/null 2>&1; then
+  if [ "$_is_wpress" = 1 ]; then
+    :
+  elif tar -tzf "$_f" >/dev/null 2>&1; then
     tar -xzf "$_f" -C "${_st}/files" --no-same-owner --no-same-permissions 2>/dev/null \
       || { _bad "Extraction failed"; rm -rf "$_st"; exit 1; }
   elif unzip -l "$_f" >/dev/null 2>&1; then
@@ -412,6 +691,19 @@ extract)
     _note "Gzip input treated as a database dump"
   else
     _bad "Unrecognised archive format"; rm -rf "$_st"; exit 1
+  fi
+
+  # What actually landed, checked before anything touches it. This has to come
+  # before the chmod below: on a hard link, chmod changes the file it points at.
+  if ! _sp=$(_staged_special "${_st}/files"); then
+    _bad "Could not check the extracted files for links. Refusing to continue."
+    rm -rf "$_st"; exit 2
+  fi
+  if [ "${_sp:-1}" -gt 0 ]; then
+    _bad "${_sp} link or special file(s) landed in staging. Nothing was imported."
+    _note "If a real backup holds hard links, re-pack it without them:"
+    _note "  tar --hard-dereference -czf site.tar.gz <dir>"
+    rm -rf "$_st"; exit 2
   fi
 
   # Nothing extracted is executable. The staging directory is not served and
@@ -442,7 +734,11 @@ extract)
   # taking the first one found is how a site gets restored from a backup
   # eighteen months older than the operator believed. Collect them all and,
   # when there is more than one, refuse to guess.
-  find "${_st}/files" -maxdepth 8 \
+  #
+  # Not for .wpress: its dump is one known member, already in db/. Sweeping the
+  # tree there would pull schema.sql out of any plugin that ships one, breaking
+  # the plugin and tripping the several-dumps refusal below.
+  [ "$_is_wpress" = 1 ] || find "${_st}/files" -maxdepth 8 \
     \( -name '*.sql' -o -name '*.sql.gz' -o -name '*-db.gz' -o -name '*.sql.bz2' \) \
     -exec mv {} "${_st}/db/" \; 2>/dev/null || true
 
@@ -485,10 +781,14 @@ scan)
   # ── Files: reuse the existing scanner against the staged tree ────────────
   if [ -x /usr/local/bin/wp-malware-scan.sh ]; then
     _note "File scan (structural + signatures) …"
-    /usr/local/bin/wp-malware-scan.sh --path "${_st}/files" structural 2>&1 | sed 's/^/  /'
-    _c=$(/usr/local/bin/wp-malware-scan.sh --path "${_st}/files" structural 2>/dev/null \
-         | grep -c 'CRITICAL') || _c=0
-    _crit=$(( _crit + _c ))
+    # This said "signatures" for years while running only `structural`.
+    for _sc in structural yara; do
+      _so=$(/usr/local/bin/wp-malware-scan.sh --path "${_st}/files" "$_sc" 2>&1)
+      printf '%s\n' "$_so" | sed 's/^/  /'
+      _mc=$(printf '%s\n' "$_so" | grep -c '\[CRITICAL\]') || _mc=0
+      _mh=$(printf '%s\n' "$_so" | grep -c '\[HIGH\]') || _mh=0
+      _crit=$(( _crit + _mc )); _high=$(( _high + _mh ))
+    done
   else
     _warn "wp-malware-scan.sh not available — file scan skipped"
   fi
@@ -508,7 +808,10 @@ scan)
 
       # Autoloaded options are the highest-value target: they run on every
       # page load, are invisible in the filesystem, and survive any file clean.
-      _ao=$(_rd | grep -ciE "INSERT INTO \`?wp[a-z0-9_]*options\`?.*(eval\(|base64_decode|<\?php|gzinflate|assert\()") || _ao=0
+      # Any prefix. This pattern used to require one beginning "wp", so a dump
+      # from a site that changed its prefix -- which hardening guides advise --
+      # matched nothing here and reported "No code in option rows".
+      _ao=$(_rd | grep -ciE "INSERT INTO [\`\"]?[a-z0-9_]*options[\`\"]?.*(eval\(|base64_decode|<\?php|gzinflate|assert\()") || _ao=0
       if [ "${_ao:-0}" -gt 0 ]; then
         _bad "${_ao} option row(s) contain code"
         _note "Autoloaded options run on EVERY page load and survive a file clean."
@@ -544,6 +847,65 @@ scan)
     done
   fi
 
+  # ── Known vulnerabilities, before this code is installed ─────────────────
+  # The cheapest moment to learn a plugin is vulnerable is now: nothing is live.
+  # Versions come from the file headers as TEXT. Nothing staged is executed, and
+  # wp-cli is not used because it would load the code to read its version.
+  # An unverified version is still only a claim by the archive: a site can lie
+  # about being patched, which is why the full scan runs again after import.
+  _hdr "Known vulnerabilities in the staged plugins and themes"
+  _vuln_unchecked=0
+  _pd=$(find "${_st}/files" -maxdepth 7 -type d -path '*/wp-content/plugins' 2>/dev/null \
+        | awk '{n=gsub("/","/"); print n "\t" $0}' | sort -n | head -1 | cut -f2)
+  _vinv="${_st}/meta/vuln-inventory.csv"
+  mkdir -p "${_st}/meta"; : > "$_vinv"
+  _vtext() { sed -n '1,80p' "$1" 2>/dev/null | tr -d '\r' \
+             | sed -n 's/^[ 	/*#@]*Version:[ 	]*\([0-9A-Za-z.+_-]*\).*/\1/p' | head -1; }
+  if [ -n "$_pd" ]; then
+    for _pp in "$_pd"/*/; do
+      [ -d "$_pp" ] || continue
+      _sl=$(basename "$_pp")
+      for _mf in "$_pp"*.php; do
+        [ -f "$_mf" ] || continue
+        if sed -n '1,80p' "$_mf" 2>/dev/null | grep -qE '^[ 	/*#@]*Plugin Name:'; then
+          _ve=$(_vtext "$_mf")
+          [ -n "$_ve" ] && printf 'plugin,%s,%s\n' "$_sl" "$_ve" >> "$_vinv"
+          break
+        fi
+      done
+    done
+    for _tt in "$(dirname "$_pd")"/themes/*/; do
+      [ -f "${_tt}style.css" ] || continue
+      _ve=$(_vtext "${_tt}style.css")
+      [ -n "$_ve" ] && printf 'theme,%s,%s\n' "$(basename "$_tt")" "$_ve" >> "$_vinv"
+    done
+  fi
+  if [ ! -s "$_vinv" ]; then
+    _note "No plugin or theme versions could be read from the staged tree."
+    _vuln_unchecked=1
+  elif [ ! -x /usr/local/bin/wp-plugins.sh ]; then
+    _warn "wp-plugins.sh not available — staged components not checked"
+    _vuln_unchecked=1
+  else
+    _vrc=0
+    _vout=$(/usr/local/bin/wp-plugins.sh vulns --inventory "$_vinv" 2>&1) || _vrc=$?
+    printf '%s\n' "$_vout" | grep -E '^  \[|^        |^  INCOMPLETE:|^  Sources:' || true
+    _vh=$(printf '%s\n' "$_vout" | grep -cE '^  \[(CRITICAL|HIGH)\]') || _vh=0
+    # HIGH, not CRITICAL. A vulnerable plugin is a door, not proof anyone came
+    # through it, and an old site is the normal reason to be importing.
+    if [ "${_vh:-0}" -gt 0 ]; then
+      _high=$(( _high + _vh ))
+      _warn "${_vh} serious known vulnerabilit(ies) in the staged site. Each is also a"
+      _note "likely way in, if the source was compromised."
+    fi
+    if [ "$_vrc" -ne 0 ]; then
+      _vuln_unchecked=1
+      _warn "These were NOT fully checked (see INCOMPLETE above)."
+    elif [ "${_vh:-0}" -eq 0 ]; then
+      _ok "No serious known vulnerabilities in the staged versions"
+    fi
+  fi
+
   # ── Verdict ──────────────────────────────────────────────────────────────
   _hdr "Verdict"
   printf '  critical %s   high %s\n\n' "$_crit" "$_high"
@@ -567,6 +929,7 @@ scan)
     exit 1
   fi
   _ok "Nothing critical found in the staged content."
+  [ "${_vuln_unchecked:-0}" = 1 ] && _warn "Known-vulnerability check did not run or did not finish."
   _note "That is a statement about what the scanners detect, not proof the"
   _note "site is clean. A backdoored plugin looks like a working plugin."
   ;;
@@ -669,6 +1032,18 @@ apply)
   _hdr "Normalising"
   _q="${_st}/quarantined"; mkdir -p "$_q"
   _src="${_st}/files"
+  # Checked here too. A set staged by an older build, or changed by hand since
+  # extract, reaches `cp -a` below, and a link or a hard link would be copied
+  # into the docroot.
+  if ! _sp=$(_staged_special "$_src"); then
+    _bad "Could not check the staged files for links. Nothing was imported."
+    exit 2
+  fi
+  if [ "${_sp:-1}" -gt 0 ]; then
+    _bad "${_sp} link or special file(s) in this staging set. Nothing was imported."
+    _note "Remove it with:  rm -rf ${_st}"
+    exit 2
+  fi
   # Some archives nest the site. A cPanel/WHM full-account backup puts it at
   # <account>/public_html/, which is depth 2 -- and this searched to
   # maxdepth 2 for wp-content itself, i.e. depth 3. It therefore found
@@ -778,6 +1153,10 @@ apply)
     _theirpfx=$(_rd | grep -oiE "INSERT INTO [\`\"']?[a-z0-9_]+options[\`\"']?" | head -1 \
                 | grep -oE '[a-z0-9_]+options' | sed 's/options$//')
     [ -n "$_theirpfx" ] || _theirpfx="wp_"
+    # A .wpress states its prefix, which beats inferring one from the first
+    # table ending in "options": wp_aiowps_options sorts ahead of wp_options.
+    _wmpfx=$(sed -n 's/^db_prefix=//p' "${_st}/meta/wpress.meta" 2>/dev/null | head -1)
+    case "$_wmpfx" in ''|*[!A-Za-z0-9_]*) : ;; *) _theirpfx="$_wmpfx" ;; esac
     printf '  Source prefix: %s   This VM: %s\n' "$_theirpfx" "$_ourpfx"
 
     _sql="${_st}/db/normalised.sql"
@@ -863,16 +1242,11 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
   # NOT ship wp-cli, so `podman exec wordpress wp ...` fails with "wp: not found".
   # This shares the running container's network and env-file so wp-config resolves
   # exactly as it does for the site itself.
-  _wpcli_image() {
-    _wi=$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env 2>/dev/null | tr -d '"' | head -1)
-    [ -n "$_wi" ] || _wi="docker.io/library/wordpress:cli"
-    printf '%s' "$_wi"
-  }
   _wp() {
     podman run --rm \
       --network "container:wordpress" \
       --user 33:33 \
-      --env-file /etc/wordpress/env \
+      --env-file "$WP_ENV_FILE" \
       -e WORDPRESS_DB_HOST=mariadb:3306 \
       -v /home/wpuser/wp/html:/var/www/html \
       "$(_wpcli_image)" wp --path=/var/www/html "$@" 2>/dev/null
@@ -881,6 +1255,98 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
   _url="${WP_SCHEME:-https}://${WP_DOMAIN:-localhost}"
   _wp option update home "$_url"    >/dev/null && _ok "home    -> ${_url}"
   _wp option update siteurl "$_url" >/dev/null && _ok "siteurl -> ${_url}"
+
+  # ── What a .wpress dump leaves out ───────────────────────────────────────
+  # The plugin empties `template`, `stylesheet` and `active_plugins` in its dump
+  # and records them in package.json, restoring them itself after an import.
+  # Loaded as a plain dump, the site comes up with no theme and no plugins and
+  # nothing reports a fault. These were validated by the reader against patterns
+  # that exclude a leading dash, because `--exec=<php>` as a wp-cli argument is
+  # code execution; they are checked again here because this file is being read
+  # back. Written as options, as the plugin does, so no activation hook runs.
+  _wmeta() { sed -n "s/^$1=//p" "${_st}/meta/wpress.meta" 2>/dev/null | head -1; }
+  if [ -n "$_dump" ] && [ -f "${_st}/meta/wpress.meta" ]; then
+    _hdr "Restoring what the .wpress dump left out"
+    for _t in template stylesheet; do
+      _tv=$(_wmeta "$_t")
+      case "$_tv" in
+        ''|-*|*[!A-Za-z0-9._-]*)
+          # Older exports keep the theme in the dump instead. Believed only if
+          # that theme is actually here.
+          _tc=$(_wp option get "$_t" --skip-plugins --skip-themes 2>/dev/null)
+          if [ -n "$_tc" ] && [ -d "${WP_ROOT}/wp-content/themes/${_tc}" ]; then
+            _ok "${_t} kept from the dump: ${_tc}"
+          else
+            _bad "No usable ${_t} recorded — the site has NO THEME until you set one."
+            _tm=$(_wmeta "${_t}_missing")
+            [ -n "$_tm" ] && _note "The source used ${_tm}, which is not in this archive."
+            _note "  wp-plugins.sh doctor, then activate a theme"
+          fi ;;
+        *)
+          if _wp option update "$_t" "$_tv" --skip-plugins --skip-themes >/dev/null; then
+            _ok "${_t} -> ${_tv}"
+          else
+            _bad "Could not set ${_t}. The site has NO THEME until this is done."
+          fi ;;
+      esac
+    done
+
+    _ap=$(_wmeta plugins_json)
+    case "$_ap" in
+      '['*']')
+        if [ -n "$(printf '%s' "$_ap" | tr -d 'A-Za-z0-9._/,"[]-')" ]; then
+          _bad "The active-plugin list is malformed. No plugins were activated."
+        elif _wp option update active_plugins "$_ap" --format=json --skip-plugins --skip-themes >/dev/null; then
+          _ok "Active plugins restored from the archive"
+        else
+          _bad "Could not restore active plugins. Forms, builders and shops will be missing."
+        fi ;;
+      '') _note "No plugin list in package.json — keeping the one in the dump." ;;
+      *) _bad "The active-plugin list is malformed. No plugins were activated." ;;
+    esac
+
+    # home/siteurl above are not the only places the old address lives. Posts,
+    # builder data and widgets carry it too, serialised and JSON-escaped, which
+    # is why this is wp-cli's search-replace and not sed.
+    for _su in "$(_wmeta site_url)" "$(_wmeta home_url)"; do
+      case "$_su" in
+        http://*|https://*) : ;;
+        *) continue ;;
+      esac
+      case "$_su" in *[!A-Za-z0-9.:/_~%-]*) continue ;; esac
+      _bare=${_su#*://}
+      for _old in "https://${_bare}" "http://${_bare}"; do
+        [ "$_old" = "$_url" ] && continue
+        _oldj=$(printf '%s' "$_old" | sed 's|/|\\/|g')
+        _urlj=$(printf '%s' "$_url" | sed 's|/|\\/|g')
+        _wp search-replace "$_old" "$_url" --all-tables-with-prefix --skip-columns=guid \
+          --skip-plugins --skip-themes >/dev/null \
+          && _wp search-replace "$_oldj" "$_urlj" --all-tables-with-prefix --skip-columns=guid \
+               --skip-plugins --skip-themes >/dev/null \
+          || _warn "search-replace failed for ${_old}"
+      done
+      _ok "Rewrote ${_bare} -> ${_url}"
+      [ "$(_wmeta home_url)" = "$(_wmeta site_url)" ] && break
+    done
+  fi
+
+  # ── Two Factor, whatever the source format ───────────────────────────────
+  # Any imported database replaces active_plugins, and the enforcement mu-plugin
+  # no-ops unless the provider is loaded -- so an import that does not say
+  # otherwise leaves admin login password-only while enforcement reads as
+  # present. Verified after the attempt, because that gap was found once by
+  # reading validator output on a live client site.
+  _mfa_gap=0
+  if [ "${MFA_ENFORCE:-0}" = "1" ] && [ -n "$_dump" ]; then
+    _wp plugin activate two-factor --skip-plugins --skip-themes >/dev/null 2>&1 || true
+    if _wp plugin is-active two-factor --skip-plugins --skip-themes >/dev/null 2>&1; then
+      _ok "Two Factor active — MFA enforcement is armed"
+    else
+      _mfa_gap=1
+      _bad "Two Factor is NOT active. Admin login is password-only."
+      _note "  wp-plugins.sh install two-factor --activate"
+    fi
+  fi
 
   # The old salts may be known to whoever had the source site. Every existing
   # session is invalidated, which is the point.
@@ -920,6 +1386,10 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
   _note "  wp-plugins.sh vulns            you have just installed someone else's plugins"
   echo ""
   [ "${_qp:-0}" -gt 0 ] && _note "Quarantined files kept at ${_q} — evidence, not rubbish."
+  if [ "${_mfa_gap:-0}" = 1 ]; then
+    _bad "Import finished with MFA NOT ACTIVE. Fix that before this site is public."
+    exit 1
+  fi
   _ok "Import complete. Recorded in ${STAGING}/import-log.txt"
   ;;
 

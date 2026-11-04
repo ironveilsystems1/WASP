@@ -51,8 +51,10 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root: doas sh $0" >&2; exit 1
 fi
 
-OUT="/tmp/wasp-testreport-$(date -u +%Y%m%d-%H%M%S).txt"
-STATUS="/tmp/.wasp-testreport-status.$$"
+# mktemp, not a name built from the date and the PID: this runs as root, in a
+# directory anyone can write to, so a predictable name can be a planted symlink.
+OUT=$(mktemp "/tmp/wasp-testreport-$(date -u +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
+STATUS=$(mktemp /tmp/.wasp-testreport-status.XXXXXX) || exit 1
 
 # Everything runs inside main() and the whole thing is piped to tee at the
 # bottom. The obvious form -- exec > >(tee "$OUT") -- is process substitution,

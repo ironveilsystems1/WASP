@@ -564,7 +564,7 @@ podman run -d \
   --memory=768m \
   --cpu-shares=512 \
   --tmpfs /tmp:size=64M,noexec,nosuid,nodev \
-  --env-file /etc/wordpress/env \
+  --env-file /etc/wordpress/wp.env \
   -e WORDPRESS_DB_HOST=mariadb:3306 \
   -e WORDPRESS_DEBUG="" \
   -e WORDPRESS_CONFIG_EXTRA="${WP_CONFIG_EXTRA}" \

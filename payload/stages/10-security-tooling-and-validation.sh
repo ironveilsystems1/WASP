@@ -131,15 +131,18 @@ if ! grep -q '^TRIVY_VER=' /etc/wp-install/pinned.env 2>/dev/null; then
   chmod 600 /etc/wp-install/pinned.env 2>/dev/null || true
 fi
 
-# Try edge/testing first (clean apk) then fall back to commit-pinned installer
-if apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing \
-     trivy >/dev/null 2>&1; then
-  ok "Trivy installed via apk edge/testing"
-elif apk add --no-cache wget >/dev/null 2>&1 && _trivy_verified_install; then
+# The checksum-verified install comes first. It used to be the fallback, so on
+# any VM where edge/testing answered, the pinned version and its recorded anchor
+# were never used. An apk from edge/testing is signed by Alpine, which is why it
+# is still acceptable as a fallback, but it is whatever version is there today.
+if apk add --no-cache wget >/dev/null 2>&1 && _trivy_verified_install; then
   ok "Trivy ${TRIVY_VER} installed and CHECKSUM-VERIFIED against the recorded anchor"
 elif [ -x /usr/local/bin/trivy ]; then
   warn "Verified install failed but a Trivy binary is already present — keeping it."
   warn "  It has NOT been verified by this run. Confirm before relying on a scan."
+elif apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+     trivy >/dev/null 2>&1; then
+  warn "Trivy installed from edge/testing: signed by Alpine, but not the pinned ${TRIVY_VER}"
 else
   warn "Trivy unavailable — update.sh will skip vulnerability scanning"
 fi
@@ -198,21 +201,9 @@ if [ "$LYNIS_OK" = "0" ]; then
     lynis >/dev/null 2>&1 && LYNIS_OK=1
 fi
 
-# Try 3: Direct install from CISOfy's stable release tarball (no OS dependency)
-if [ "$LYNIS_OK" = "0" ]; then
-  warn "Lynis not in apk repos — trying GitHub release tarball"
-  apk add --no-cache wget >/dev/null 2>&1 || true
-  LYNIS_TAG=$(wget -qO- https://api.github.com/repos/CISOfy/lynis/releases/latest 2>/dev/null \
-    | grep '"tag_name"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-  LYNIS_TAG="${LYNIS_TAG:-3.1.3}"  # pinned fallback if API unavailable
-  if wget -qO /tmp/lynis.tar.gz \
-       "https://github.com/CISOfy/lynis/archive/refs/tags/${LYNIS_TAG}.tar.gz" 2>/dev/null; then
-    tar xzf /tmp/lynis.tar.gz -C /usr/local/lib 2>/dev/null
-    ln -sf "/usr/local/lib/lynis-${LYNIS_TAG}/lynis" /usr/local/bin/lynis 2>/dev/null
-    rm -f /tmp/lynis.tar.gz
-    command -v lynis >/dev/null 2>&1 && LYNIS_OK=1 && ok "Lynis ${LYNIS_TAG} installed from GitHub release"
-  fi
-fi
+# There was a third try here: a GitHub tarball, taken with no checksum, unpacked
+# into /usr/local/lib and run weekly as root. Going without Lynis for a while
+# costs an audit score. Running an unverified download as root costs more.
 
 if [ "$LYNIS_OK" = "1" ]; then
   ok "Lynis $(lynis --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) ready"
@@ -223,7 +214,6 @@ cat "${PAYLOAD_DIR}/cron/lynis-audit.cron" >> /etc/crontabs/root
 else
   warn "Lynis could not be installed — all install methods failed"
   warn "  Manual install: apk add --repository https://dl-cdn.alpinelinux.org/alpine/edge/testing lynis"
-  warn "  Or: wget https://github.com/CISOfy/lynis/archive/refs/tags/3.1.3.tar.gz"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
