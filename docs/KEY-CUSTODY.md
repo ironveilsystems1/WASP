@@ -71,7 +71,7 @@ All of these can be regenerated from the provider. None loses data.
 | Secret | Where it lives on the VM | If lost |
 |---|---|---|
 | MariaDB root password | `/etc/wordpress/env` (0600) | Rotate with `wp-rotate-secrets.sh db` |
-| WordPress DB password | `/etc/wordpress/env` (0600) | Rotate with `wp-rotate-secrets.sh db` |
+| WordPress DB password | `/etc/wordpress/env` and `wp.env` (0600) | Rotate with `wp-rotate-secrets.sh db` |
 | WordPress salts | `wp-config.php` | Rotate with `wp-rotate-secrets.sh salts` — logs everyone out |
 | SMTP relay password | `/home/wpuser/wp/secrets/smtp.ini` (0440) | Reissue at the relay, then `wp-rotate-secrets.sh smtp` |
 | Admin account password | Not stored — set at install | WordPress password reset, or console |

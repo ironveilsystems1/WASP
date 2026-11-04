@@ -6,6 +6,329 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.10 — the code review
+
+Everything found in the review of 10.9, plus what turned up while fixing it. Each
+item says how it was checked. "Reproduced" means run against real WordPress 7.1.4,
+real Apache or BusyBox, and tested again after the fix.
+
+### Importing a hostile archive (reproduced)
+
+**Tar hard links.** `wp-import.sh` looked for symlinks only. BusyBox tar follows a
+hard-link target out of the extraction directory (CVE-2026-26158, with no Alpine
+fix found), and `cp -a` copies that file's content. A member linked to
+`/etc/wordpress/env` passed `inspect`, `extract`, `scan` and `apply` and came out
+in `uploads/`, mode 644. GNU tar refuses such an archive, so no test host could show it.
+
+**Zips were not checked at all.** Listing used `unzip -Z1`. BusyBox unzip has no
+`-Z`, no stage installed Info-ZIP, and the resulting empty list skipped every
+check without a word. A symlink to `wp-config.php` was then served by Apache.
+
+Listings now refuse anything but files and directories, a zip that cannot be
+listed is refused, and zips get the disk-space check. What actually landed in
+staging is checked before anything touches it, and again at `apply`. A real
+backup that holds hard links is refused too, and the message says how to re-pack
+it. Stage 08 installs GNU tar and Info-ZIP.
+
+`wp-import.sh` also reset the inbox to mode 750 on every run, removing the group
+write that `scp -O` as the admin user depends on. It now keeps stage 08's owner
+and 2770. `scan` said "structural + signatures" and ran only `structural`. It now
+runs both, and counts HIGH as well as CRITICAL.
+
+### The login lockout did not stop a login (reproduced)
+
+The guard returned a `WP_Error` at priority 5, but core's authenticators run at 20
+and do not stop for an incoming error. The right password logged in during a lock,
+and guessing continued throughout. It now removes core's authenticators for that
+request, so no hash is computed, and a last filter refuses again so an
+authentication plugin cannot undo a lock. Attempts refused by a lock are no longer
+counted, because counting them let anyone extend a lock, double it and send mail by
+hammering a locked account. The username in the lockout email is now cleaned.
+
+### MFA past the grace window is a wall (reproduced)
+
+With only a stolen password for an unenrolled administrator past grace, the blocked
+login's cookies stayed valid, because `wp_destroy_current_session()` reads
+`$_COOKIE`, which is empty during a login. `?action=logout` then opened any admin
+screen, and `user-edit.php` promoted another account to administrator, which got a
+fresh grace window and the whole of wp-admin.
+
+That list of open pages is gone. It was not serving its purpose either: TOTP setup
+goes through REST, which was already closed, so nobody past grace could enrol.
+
+Past grace the login is now refused after the password check and before any cookie
+exists, so a wrong password reveals nothing. A session that outlives the window is
+destroyed on its next wp-admin, admin-ajax or admin-post request. Recovery is from
+the console: `SUPPORT-RUNBOOK.md`, *An admin hit the two-factor wall*.
+
+### The malware scanner reported clean after finding things (reproduced)
+
+Eight loops counted inside a pipe, which is a subshell, so the counts were lost. It
+printed `[CRITICAL]`, then "critical 0" and "Nothing critical found", and exited 0.
+A backdoor in an autoloaded option sent no email. Only PHP in uploads was counted.
+`check-subshell-counters.py` now fails on this pattern.
+
+New: handler overrides and symlinks in uploads are findings. The media check covers
+`.jpeg`, `.webp` and `.svg`, and handles names with spaces. Scanning a staged path
+no longer replaces the site's last result or sends mail about the site.
+
+### Apache (reproduced)
+
+**PHP ran from uploads.** `AddType application/x-httpd-php .jpg` in
+`uploads/.htaccess` ran `pic.jpg`. Uploads now sets `php_admin_flag engine off`,
+which `.htaccess` cannot undo. `AllowOverride None` was the first idea and was
+rejected: it would silently drop the deny rules plugins keep there, such as
+WooCommerce's private downloads. Deny rules there were tested and still work.
+
+**Public AJAX returned 403 under an allowlist.** That includes WASP's own contact
+form, which posts to `admin-post.php`. `admin-ajax.php` and `admin-post.php` are now
+open at Apache and in the nginx snippet, and the rest of wp-admin stays closed.
+
+**The slug could be walked past.** With no allowlist, `/wp-login.php/x` reached the
+login form and logged in. Closed. `?author=` is now anchored, so `?post_author=1`
+is no longer blocked.
+
+### Secrets
+
+**The database root password was in the WordPress container.** Any PHP on the site
+could read it. WordPress and wp-cli now use `/etc/wordpress/wp.env`, which holds the
+`WORDPRESS_*` values only. `update.sh` creates it on an older VM. The validator
+warns if the password is still there. Read only: not run here, because there is no
+podman.
+
+**Rotating the database password took the site down.** `wp-rotate-secrets.sh db`
+used `podman restart`, which keeps the old environment, while `wp-config.php` reads
+the password from it. Its check used wp-cli, which reads the new file, so it passed
+with the site down. It now recreates the container and checks from inside it. The
+new password is kept off the host's process list. Found by reading. The new sequence
+is tested with a stubbed podman, not a real one.
+
+**After a rotation `mariadb-health-check.sh` failed.** It read the password from the
+MariaDB container's environment, which rotation does not change. It now reads the
+file. **Live restore could not log in.** `wasp-offsite-backup.sh` expanded
+`MARIADB_ROOT_PASSWORD` on the host, where it is not set. Both read only.
+
+`/etc/wordpress/env` is now private from the first byte.
+
+### Downloads and config
+
+- `mod_maxminddb` is now fixed at 1.3.0 with a hash. It was "latest", unverified,
+  and compiled into Apache. 1.3.0 was test-built against Ubuntu's `apxs`. The
+  rebuilt GeoIP image has not been run.
+- The Lynis tarball path is gone: it was an unverified download run weekly as root.
+  If Alpine cannot supply Lynis, the VM goes without it and says so.
+- Trivy tries the checksum-verified install first. It was the fallback, so the pin
+  was skipped whenever `edge/testing` answered.
+- `vuln-sources.conf` and `cti.conf` are parsed, not sourced as root.
+  `check-config-sourcing.py` now follows a path held in a variable, which is how
+  both got past it.
+
+### Egress
+
+`.docker.io`, `ghcr.io`, `.githubusercontent.com` and the Docker CDN left the Squid
+allowlist. `update.sh` runs on the host and never used it, so the only thing they
+did was let a compromised site reach GitHub and registries. A plugin updater that
+needs GitHub: `doas wasp-egress.sh allow raw.githubusercontent.com`.
+
+The forward chain now drops traffic from `eth0` to the database network. The rule
+was syntax-checked with `nft -c`, but has not been run.
+
+### Not changed
+
+- The slug can still be learned from `/wp-admin/` and `/index.php/wp-login.php` when
+  there is no allowlist. Treat it as public. The allowlist is the control.
+- `wasp-selftest.sh` and the restore drill keep passwords on `podman exec`
+  argv, for throwaway containers with random passwords. The review listed these,
+  but the code already explains why, and it is right.
+- `FollowSymLinks` stays. `SymLinksIfOwnerMatch` would not help, because everything
+  in the docroot has the same owner.
+
+### Tests
+
+`test-busybox-run.sh` runs the import and scan tools with BusyBox in place of GNU
+tools, then runs the import and scan suites again the same way. It is required: the
+suite fails without BusyBox. It fails 34 checks against 10.9 and passes all 56 here.
+New as well:
+`test-login-guard.php` (10 failures against 10.9), a rewritten MFA harness, and
+regression checks in `test-fail-closed.sh`.
+
+No build from 10.5 onward is recorded as installed on real hardware. Build one
+with a reboot before relying on this.
+
+## 10.9 — WPVulnerability on by default
+
+Otherwise 10.8. The installer now defaults to yes, and an unset value means on, so
+a VM with no Wordfence token is scanned rather than unscanned. The cost is the one
+10.8 stated: the provider sees each VM's address and the name of everything it
+runs. It is said at the prompt and in `vuln-sources`, and declining writes
+`WPVULNERABILITY=0`, which stays off. `WPV_SKIP` keeps named slugs on the VM.
+
+Documentation promising the plugin inventory never leaves the VM was true only of
+Wordfence, and now says so. An outage of this source makes that day's scan
+INCOMPLETE on every VM using it, which is the intended behaviour.
+
+## 10.8 — a scan that could not run now says so
+
+### Client share link in the repository
+
+A comment in `wp-import.sh`, and two lines of this file, quoted a real download
+link: share id, archive name and access token. It reached the public repository
+with 10.6, and earlier client scrubs missed it because they looked for known
+names and addresses, not link shapes. Replaced with placeholders.
+`check-no-client-material.py` now rejects share-link shapes in any text file.
+Removing it from the tree does not remove it from git history. **Revoke the link.**
+
+### The daily scan failed silently
+
+`wp-vuln-cron.sh` ran `vulns || true` and alerted only on findings. With no
+Wordfence token (the installer allows that) or a feed that stopped downloading,
+`vulns` exited with an error, no findings were possible, and the job looked
+healthy. A VM could go unscanned indefinitely with nothing said.
+
+`vulns` now exits 3 and prints one `INCOMPLETE:` line per reason when it cannot
+check everything: no source, a feed that failed to refresh or is over three days
+old, an unreadable feed, an inventory that could not be listed, a lookup that went
+unanswered. The daily job logs and emails that. Its outcome is recorded in
+`/var/cache/wp-vulns/.last-scan`, and `validate-wordpress.sh` warns on a VM with no
+source, an incomplete last scan, or one over three days old.
+
+### Sources that were never queried
+
+`Sources:` printed Patchstack, WPScan and NVD when configured. No code ever queried
+any of them; the keys were stored and the labels printed. Removed. `set-key
+patchstack|wpscan` now refuses and says why, and `--nvd` says it did nothing.
+
+### WPVulnerability, opt-in
+
+`wp-plugins.sh vuln-source wpvulnerability on`, or at install. No token. Adds
+WordPress core, PHP and MariaDB, which were not checked at all, plus an `unfixed`
+flag and a notice for plugins closed on WordPress.org.
+
+It is per-component, so the provider sees the VM's address and the name of
+everything it runs, and core, PHP and MariaDB versions. That is why it is off by
+default. `WPV_SKIP` in `vuln-sources.conf` keeps named slugs on the VM. Lookups run
+from the VM like the Wordfence download, so nothing is added to the Squid
+allowlist.
+
+Answered, unknown and failed are kept apart. The vendor's client folds all three
+into "no vulnerabilities". Here a 404 or an API error flag is an honest no-record,
+normal for a commercial plugin, and anything else is INCOMPLETE, including a 200
+in an unexpected shape, which a pipeline would have read as an empty list.
+
+### Severity
+
+Results were split on tabs, which `read` treats as whitespace, so an empty CVE
+field collapsed and the CVSS score slid into it. A 9.8 with no CVE yet printed as
+LOW, and the daily alert drops LOW. Fields now use a separator that holds empty
+values. A record with no score is MEDIUM rather than LOW.
+
+### Staged plugins are checked before import
+
+`wp-import.sh scan` reads plugin and theme versions from their headers as text and
+matches them before anything is installed. Serious findings count as HIGH at the
+gate. A version in a header is the archive's claim, which is why the full scan
+still runs after import.
+
+### Import sources
+
+`wasp-egress.sh import-source add <host>`, or at install, with
+`activeit.syncedtool.com` offered as an option, off by default. The host is NOT
+added to the allowlist: a file-sharing service is an exfiltration route, and that
+list is what a compromised WordPress can reach at any hour. `wp-import.sh fetch
+url` opens it in a maintenance window for that download and closes it after,
+including on failure, and the window expires by itself regardless. Exact hostnames
+only, because a leading dot would admit every customer of a shared platform.
+
+### Tested, and not
+
+`test-vuln-scan.sh` (38 cases) and `test-import-source.sh` (17). Reverting the cron
+fix, the separator, the jq capture or the window close each fails them.
+
+**Not run:** any live WPVulnerability response, because the API was unreachable and
+the shape comes from the maintainer's client code and test fixture; a real
+SyncedTool download, which may redirect to a storage host the window does not
+cover; Squid honouring the window; anything on real hardware or under busybox.
+
+## 10.7 — native .wpress import
+
+`wp-import.sh` used to decline a `.wpress` and tell the operator to extract it
+elsewhere. It now takes one through `inspect`, `extract`, `scan` and `apply` like
+any other archive.
+
+### The reader
+
+`payload/lib/wasp-wpress-reader.php`. It settles the design's open question of
+shell or Python with neither: PHP in the pinned wp-cli image, which every VM
+already has, started with no network, a read-only root, no capabilities and an
+unprivileged uid. Nothing new is installed on the VM, and a parser of hostile
+binary input does not run on the host.
+
+Every extract walks the whole archive first, so a hostile last member stops the
+first write. Refused with no override: traversal in either field, including
+through backslashes; absolute paths; control characters and NULs in names; a size
+past the end of the file; a file used as a directory; duplicates. Truncated files,
+data after the end block and checksum failures are refused as damage. Decoded
+chunks are capped, which stops a decompression bomb, and total output is held to
+the disk budget while writing, because a compressed archive's size is not known
+until it decodes.
+
+Reads pre-7.104 archives, the 7.104+ CRC32 layout, gzip, and password-protected
+archives, with the password passed on stdin. Refuses bzip2, because the wp-cli
+image has no bz2 extension, and multisite exports, because WASP is single-site.
+
+### What a .wpress dump leaves out
+
+Reading the format was the small part. The dump is not a normal dump, and loading
+it as one produces a passing run of a broken pipeline:
+
+- **`SERVMASK_PREFIX_` tables.** `scan`'s option-row check matched only prefixes
+  beginning `wp`, so it would have matched nothing and reported "No code in option
+  rows". The placeholder is now converted before anything reads the dump.
+- **That check was already wrong for any custom prefix**, on every format: a site
+  that had changed its prefix, as hardening guides advise, passed unchecked. Fixed
+  in the pattern.
+- **Blank theme and plugins.** The plugin empties `template`, `stylesheet` and
+  `active_plugins` in the dump and restores them from `package.json` itself.
+  Imported as-is, the site has no theme, and `apply` reported success.
+- **Prefix detection** took the first table ending `options`, and
+  `wp_aiowps_options` sorts ahead of `wp_options`. A `.wpress` states its prefix.
+- **`*.sql` sweep.** The sweep for dumps would have pulled `schema.sql` out of any
+  plugin shipping one, then refused for having several dumps. It does not run for
+  `.wpress`.
+- **Old addresses** in posts and builder data are rewritten with
+  `wp search-replace`, in plain and JSON-escaped form, from the addresses
+  `package.json` records.
+
+`package.json` is attacker-controlled and these values reach wp-cli, where
+`--exec=<php>` is code execution. Every value is held to a pattern that excludes a
+leading dash, whitespace and quotes, dropped rather than repaired if it fails, and
+checked again by the shell. Plugins are written as an option, not activated, so no
+activation hook runs, and only those present in the extracted tree are listed.
+
+### Defect 30 closed
+
+`apply` now reactivates Two Factor after any import, of any format, verifies it,
+and does not report success if it stayed inactive. Earlier notes said this could
+not be coded because no database-load step existed. That was wrong: `apply` has
+loaded databases since it was written.
+
+### Staging id clash
+
+Ids have one-second resolution, and every failure path removes the directory, so
+a clash would have deleted the earlier, good staging set. It now refuses.
+
+### Tested, and not
+
+`test-wpress-reader.php` (52 cases) and `test-wpress-import.sh` (31 cases), the
+second driving the real `wp-import.sh` with `podman` stubbed. Re-breaking the
+prefix conversion or the scan pattern fails them.
+
+The legacy path was checked against an archive written by the plugin's own 4.5
+code. The 7.x layout, chunking and encryption were checked against a third-party
+byte-for-byte builder, not a real export. **Not run: a real 7.x export; the
+container itself, whose flags are asserted only as text; busybox `ash` (the tests
+ran under `dash`); anything on real hardware.**
+
 ## 10.6 — the mask that unmasked itself, and one version meaning one version
 
 ### Defect 38: the 10.5 `remoteip.conf` mask did not survive the GeoIP rebuild
@@ -1023,9 +1346,9 @@ on a correctly configured install. It now routes through Squid, prints the
 failure points at Squid's log instead of saying only "Download failed".
 
 **A share link ends in an access token, not a filename.** `basename` of
-`.../backup/melroseg.zip/5eDFlx9VLGw` gave the token, so a 653 MB archive
+`.../backup/client-a.zip/<token>` gave the token, so a 653 MB archive
 landed with no extension under a name matching nothing the operator had
-asked for — and `inspect melroseg.zip` then said "Not found" about a file
+asked for — and `inspect client-a.zip` then said "Not found" about a file
 that had downloaded perfectly. The real name is now recovered from the path.
 
 **`SCAN_PATH` was wiped before it was read.** An unconditional

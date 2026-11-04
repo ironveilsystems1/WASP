@@ -140,7 +140,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.6` — and both exist only because the codebase
+same value — currently `10.10` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -269,6 +269,8 @@ wp-import.sh extract backup.tar.gz    # to staging, outside the docroot
 wp-import.sh scan                      # files AND the dump
 wp-import.sh staged                    # what's currently staged
 ```
+
+Links are refused. A backup needs files and directories, nothing else, so a symlink, hard link or device in an archive stops it at `inspect` and again at `extract`, and whatever actually landed in staging is checked before anything touches it. Zips need Info-ZIP to be listed, and the installer adds it. A zip that cannot be listed is refused rather than extracted unchecked.
 
 Extraction is bounded rather than trusting: hostile members are re-checked (a check that only runs when someone remembers `inspect` isn't a control), ownership and permission bits from the archive are never honoured, disk headroom is verified *before* writing, and **everything extracted has its execute bit removed**. Duplicator's installer is deleted at extraction, not at import — there's no stage where keeping it is useful.
 
@@ -1717,7 +1719,7 @@ The slug hides the login and the guard slows down guessing, but both still rest 
 
 This uses the **Two Factor plugin maintained by the WordPress core contributors** — TOTP, backup codes, and passkeys via its WebAuthn companion — for the actual machinery, and a small WASP mu-plugin (`03-wpvm-mfa-enforce.php`) for the enforcement the plugin deliberately leaves out. Administrators (anyone with `manage_options`) must enrol; everyone else is untouched.
 
-It is built so that **enabling it cannot lock anyone out**, because enforcement without a recovery path is how a lost phone becomes a rebuild:
+It is built so that **nobody is stranded**, because enforcement without a recovery path is how a lost phone becomes a rebuild. Past the grace window an unenrolled administrator hits a wall from the network, on purpose: no session, no wp-admin, no admin-ajax, no admin-post, no REST. The way back is the console:
 
 - **A grace window.** A new or newly-promoted admin is steered to enrol with an admin notice counting down the days, not blocked on their first login. The window is set at install (default 7 days, capped at 30) and held as a constant so a compromised session cannot widen it.
 - **Backup codes count as a factor.** An admin with TOTP plus printed backup codes can get back in from any device — the property that makes requiring 2FA safe. Email-as-second-factor is deliberately *not* sufficient for admins, because the email inbox is usually also the password-reset channel, which would collapse both factors into one.
@@ -1766,9 +1768,7 @@ wp-plugins.sh install two-factor --activate   # what the installer runs for you
 | Source | Cost | Default | Notes |
 |---|---|---|---|
 | **Wordfence Intelligence** | Free (personal + commercial), **free account token required** | **Primary** | Fetched as one **bulk feed**, matched locally |
-| **NVD** | Free | On demand (`vulns --nvd`) | Keyword matching only; sparse and noisy for WP plugins, rate-limited to 5 req/30s without a key |
-| **Patchstack** | Free browse, commercial API | Opt-in | Often fastest on new disclosures |
-| **WPScan** | Free tier (25 calls/day) | Opt-in | Long-standing; powers the WPScan CLI |
+| **WPVulnerability** | Free, **no token** | **On** (`vuln-source wpvulnerability off` to stop) | One request per component, so the provider sees the VM's address and what it runs. Adds core, PHP and MariaDB |
 
 **A free Wordfence token is required.** The old v2 feed was open with no key and has been retired, so v3 with a token is the only way to read the database now. Generate one under **Integrations** in a free [Wordfence account](https://www.wordfence.com/products/wordfence-intelligence/). The installer asks for it alongside the CrowdSec enrolment key; add it later with `wp-plugins.sh set-key wordfence <token>`.
 
@@ -1776,10 +1776,8 @@ Without a token, `wp-plugins.sh status` (update availability) still works — yo
 
 ```sh
 wp-plugins.sh vulns                          # scan (Wordfence)
-wp-plugins.sh vulns --nvd                    # also query NVD
 wp-plugins.sh vuln-sources                   # what's enabled and why
-wp-plugins.sh set-key patchstack <key>       # opt in
-wp-plugins.sh set-key wpscan <token>
+wp-plugins.sh vuln-source wpvulnerability off # stop sending component names
 wp-plugins.sh vuln-refresh                   # force a feed refresh
 ```
 
@@ -1795,7 +1793,7 @@ wp-plugins.sh vuln-refresh                   # force a feed refresh
 
 Change it later: `wp-plugins.sh set-key wordfence <token>` then edit `WORDFENCE_FEED` in `/etc/wp-install/vuln-sources.conf`.
 
-**Wordfence is primary for a privacy reason as much as a cost one.** It's downloaded as a single complete feed and queried on the VM, so **your plugin inventory never leaves the machine** — the token authenticates the download, it doesn't report what you run. The **Scanner** feed is used rather than Production: Production carries full analysed records and is well over 100 MB, which is a poor thing to hand `jq` on a 4 GB VM, while Scanner is the minimal detection format *and* includes newly discovered vulnerabilities not yet fully analysed — smaller and earlier. The opt-in sources query per plugin slug, which discloses your exact attack surface to that provider. Reasonable trade for better coverage — but it should be your decision, so they're off by default.
+**Wordfence is primary for a privacy reason as much as a cost one.** It's downloaded as a single complete feed and queried on the VM, so **Wordfence never sees your plugin inventory**. WPVulnerability does: it is on by default for its coverage and because it needs no token, and it can be turned off per VM, or per plugin with `WPV_SKIP` in `vuln-sources.conf` — the token authenticates the download, it doesn't report what you run. The **Scanner** feed is used rather than Production: Production carries full analysed records and is well over 100 MB, which is a poor thing to hand `jq` on a 4 GB VM, while Scanner is the minimal detection format *and* includes newly discovered vulnerabilities not yet fully analysed — smaller and earlier. The opt-in sources query per plugin slug, which discloses your exact attack surface to that provider. Reasonable trade for better coverage — but it should be your decision, so they're off by default.
 
 Keys live in `/etc/wp-install/vuln-sources.conf` (0600, root-only).
 
@@ -3172,7 +3170,8 @@ established.
 |---|---|
 | `/root/.wp-credentials` | MariaDB root/WordPress passwords, table prefix (`chmod 600`) |
 | `/root/.wp-admin-credentials` | The SSH admin account's `doas` password — only written when an SSH key was supplied (`chmod 600`) |
-| `/etc/wordpress/env` | Env-file mounted into both the WordPress and MariaDB containers (`chmod 600`) |
+| `/etc/wordpress/env` | Env-file for the MariaDB container, including the root password (`chmod 600`) |
+| `/etc/wordpress/wp.env` | Env-file for WordPress and wp-cli: the `WORDPRESS_*` values only, derived from `env` (`chmod 600`) |
 | `/etc/wp-install/vars.sh` | Installer-time choices — slug, GeoIP, network mode, admin user, digest-pinning toggle, deployment profile — sourced by every management script |
 | `/etc/wp-install/pinned.env` | Currently-pinned tag + digest per component; authoritative for `update.sh`; written atomically |
 | `/etc/wp-install/.maxmind-netrc` | MaxMind credentials for `curl --netrc-file` (`chmod 600`) — never on a command line |

@@ -65,7 +65,8 @@ changing. Your job here is to check three things and report clearly.
   code, and — this part matters — **print or save the backup codes it gives
   you.** Those codes are how you get back in from any device if you lose your
   phone. If you are blocked because a grace period ended before you set it up,
-  ask an engineer; they can help you enrol.
+  ask an engineer. They reopen the window from the console, and you can then log
+  in and enrol.
 
 ### You received an alert email from the system
 
@@ -118,6 +119,7 @@ If SSH itself does not connect, go straight to **[the console](#when-nothing-res
 | **Whole site down, 503** | `validate-wordpress.sh --check` | Overload or a rate limiter. Check `podman logs --tail 40 wordpress`. If disk is full (`--check` says so), that is the cause |
 | **Site down, "database connection"** | `podman ps` | MariaDB not ready. `mariadb-health-check.sh`. After a reboot this self-clears in ~1 minute |
 | **403 on the admin area** | `wp-hardening.sh proxy-check` | Your IP is not allowed, or the proxy is not passing it. See *The 403 tree* below |
+| **"Two-factor authentication is required" at login** | — | The grace window ended before they enrolled. Nothing is broken. See *An admin hit the two-factor wall* |
 | **Admin login rejects a good password** | — | Ordinary reset. Not an outage. `wp-rotate-secrets.sh` is **not** for this — that rotates system creds, not user passwords |
 | **A plugin or update fails silently** | `wasp-egress status` | If egress filtering is on, the plugin may be calling a blocked destination. `wasp-egress discovery` shows what was denied — check *before* blaming the plugin |
 | **Contact form / site email not arriving** | `wp-mail.sh status` | `wp-mail.sh test you@example.com`. A wrong SMTP password fails silently — that is the usual cause |
@@ -328,7 +330,7 @@ wp-plugins.sh doctor    # confirm wp-cli can reach the site first
 # A small wrapper, so the rest of this section stays readable:
 wpcli() {
   podman run --rm --network container:wordpress --user 33:33 \
-    --env-file /etc/wordpress/env -e WORDPRESS_DB_HOST=mariadb:3306 \
+    --env-file /etc/wordpress/wp.env -e WORDPRESS_DB_HOST=mariadb:3306 \
     -v /home/wpuser/wp/html:/var/www/html \
     "$(sed -n 's/^WPCLI_IMAGE=//p' /etc/wp-install/pinned.env | tr -d '"')" \
     wp --path=/var/www/html "$@"
@@ -367,6 +369,28 @@ If `wp-cli` itself cannot reach the site, the site has a bigger problem than
 > far more than a WordPress login. What this procedure must never become is a
 > network-reachable reset — that would turn the second factor back into a
 > single factor.
+
+### An admin hit the two-factor wall
+
+The symptom is specific: the right password, then "Two-factor authentication is
+required". A wrong password never shows this message. The admin's grace window
+ended before they enrolled, so from the network the account has no session, no
+wp-admin and no API. That is deliberate, and nothing they can do from a browser
+changes it.
+
+Reopen the window for that one account from the console, using the `wpcli`
+wrapper from the section above:
+
+```sh
+wpcli user meta delete <login> wpvm_mfa_grace_start
+```
+
+The next login starts a fresh grace window. Have them enrol in that same session
+and print the backup codes. If they leave it, the wall comes back when the window
+ends.
+
+Confirm who is asking before you run it. This is the one step between a stolen
+password and a working admin session on an unenrolled account.
 
 ### The things that need you specifically
 

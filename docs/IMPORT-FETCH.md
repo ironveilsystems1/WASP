@@ -22,13 +22,13 @@ involved.
 
 | Control | Governs | Affects a fetch? |
 |---|---|---|
-| **Squid allowlist** (`EGRESS_PROXY=1`) | the **containers** — WordPress itself, source `10.89.10.0/24` | **No.** `wp-import.sh` runs on the VM's OS, not inside WordPress. |
+| **Squid allowlist** (`EGRESS_PROXY=1`) | the **containers**, and `wp-import.sh fetch url`, which is sent through it deliberately | **Yes for `fetch url`.** No for `fetch s3`. |
 | **Host egress** (`RESTRICT_EGRESS=1`) | the **VM's own** outbound connections | **Yes.** This is the one. |
 
-So: **do not open a Squid maintenance window to fetch a backup.** Squid never
-sees the request. `wasp-egress maintenance enable` is for letting *WordPress*
-reach something — a licence server, a page builder's CDN — and it will not
-help here.
+So: `fetch url` goes through Squid whenever Squid is present, so its host must be
+allowed. Use an import source (Method 2) for a host you return to, or `wasp-egress
+allow` for a one-off. `fetch s3` uses rclone directly and does not touch Squid, so
+a window will not help there.
 
 ### What host egress permits
 
@@ -133,6 +133,18 @@ Dropbox, Drive, WeTransfer, a signed S3 link.
 ```sh
 doas wp-import.sh fetch url 'https://designer.example.com/backup.zip'
 ```
+
+**A file host you use repeatedly.** Name it as an import source once:
+
+```sh
+doas wasp-egress.sh import-source add files.example.net
+```
+
+It is not added to the allowlist. `fetch url` opens that host for the download
+and closes it afterwards, because a file-sharing service reachable at all hours
+is an exfiltration route for a compromised site. Exact hostnames only. A share
+that redirects to a storage host needs that host named as well; if the proxy
+refuses, `doas wasp-egress.sh discovery` shows where it tried to go.
 
 **With a checksum, if you can get one.** Ask the sender for it — on any Unix
 `sha256sum backup.zip`, on Windows `certutil -hashfile backup.zip SHA256`:

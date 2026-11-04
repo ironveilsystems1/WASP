@@ -439,6 +439,10 @@ ${PVE_BLOCK_FORWARD}
         # database connection while looking like a hardening win.
 ${WEB_CIDR_FORWARD}
 ${EGRESS_PROXY_FORWARD}
+        # The database network is never a destination from outside. This VM
+        # forwards, so a neighbour with a static route could otherwise reach
+        # MariaDB through it, whatever the bridge rules say.
+        iifname "eth0" ip daddr 10.89.20.0/24 drop
         ip daddr 10.89.10.0/24 accept
         ip daddr 10.89.20.0/24 accept
         # wp-db (10.89.20.0/24) is --internal: netavark never routes it to
@@ -559,6 +563,15 @@ ${REQUIRE_ADMIN}
 <Files "wp-login.php">
 ${REQUIRE_ADMIN}
 </Files>
+
+# Two files under wp-admin serve logged-out visitors, so they stay open:
+# admin-ajax.php (forms, page builders, most interactive plugins) and
+# admin-post.php (WASP's own contact form). WordPress checks each action.
+# LocationMatch merges after DirectoryMatch, so it replaces the rule above for
+# these two URLs and for nothing else.
+<LocationMatch "^/wp-admin/admin-(ajax|post)\.php\$">
+    Require all granted
+</LocationMatch>
 ADMINBLOCK
 )
 else
@@ -722,7 +735,8 @@ ${SLUG_RULES}
       RewriteCond %{ENV:REDIRECT_WPVM_SLUG} !=1
       RewriteCond %{REQUEST_URI} !install\.php$
       RewriteCond %{REQUEST_URI} !setup-config\.php$
-      RewriteRule ^wp-login\.php$ - [F,L]
+      # (/.*)? because Apache also serves /wp-login.php/anything as wp-login.php.
+      RewriteRule ^wp-login\.php(/.*)?$ - [F,L]
     </IfModule>
 SLUGEOF
 )
@@ -801,7 +815,7 @@ ${SLUG_BLOCK}
     # above) into this per-directory context.
     <IfModule mod_rewrite.c>
         RewriteEngine On
-        RewriteCond %{QUERY_STRING} author=
+        RewriteCond %{QUERY_STRING} (^|&)author=
         RewriteRule ^ - [F,L]
     </IfModule>
 </Directory>
@@ -810,6 +824,12 @@ ${SLUG_BLOCK}
 # Prevents a successfully uploaded webshell from being executed —
 # the highest-impact single PHP restriction for WordPress security.
 <DirectoryMatch "^/var/www/html/wp-content/uploads">
+    # The deny below only knows file names. With AllowOverride All, one
+    # .htaccess here maps .jpg to PHP and shell.jpg runs. Turning the engine off
+    # stops that whatever the file is called, and .htaccess cannot turn it back
+    # on. AllowOverride None would be blunter, but it would also silently drop
+    # the deny rules plugins keep here, such as WooCommerce's private downloads.
+    php_admin_flag engine off
     <FilesMatch "\.ph(p[0-9]?|tml)$">
         Require all denied
     </FilesMatch>

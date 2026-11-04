@@ -2043,6 +2043,14 @@ WP_ADMIN_SLUG=$(echo "${WP_ADMIN_SLUG}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a
 # a site that half-works in ways that are extremely hard to diagnose — the
 # rewrite fires for some paths and the real directory wins for others.
 case "$WP_ADMIN_SLUG" in
+  # Exact collisions first. *wp-* below matches most of them, and the message
+  # there would send the operator looking for the wrong problem.
+  wp-includes|wp-content|wp-json|index|xmlrpc|feed)
+    msg_warn "  '${WP_ADMIN_SLUG}' collides with a real WordPress path."
+    msg_warn "  Its rewrite would shadow, or be shadowed by, the real directory —"
+    msg_warn "  producing a site that half-works in ways that are hard to trace."
+    WP_ADMIN_SLUG=""
+    continue ;;
   # Reject anything containing a word a scanner would glob for. A slug like
   # "edith-login" or "myadmin" is found by the same wordlist that finds
   # wp-login.php, so it hides the page from nobody -- which is the entire
@@ -2053,12 +2061,6 @@ case "$WP_ADMIN_SLUG" in
     msg_warn "  finds wp-login.php in the first place. Anything matching"
     msg_warn "  *login*, *admin*, *auth*, *panel* or *dashboard* is."
     msg_warn "  Pick an unrelated word: a place, a colour, an inside joke."
-    WP_ADMIN_SLUG=""
-    continue ;;
-  wp-includes|wp-content|wp-json|index|xmlrpc|feed)
-    msg_warn "  '${WP_ADMIN_SLUG}' collides with a real WordPress path."
-    msg_warn "  Its rewrite would shadow, or be shadowed by, the real directory —"
-    msg_warn "  producing a site that half-works in ways that are hard to trace."
     WP_ADMIN_SLUG=""
     continue ;;
 esac
@@ -2433,6 +2435,7 @@ unset _EP
 # that runs Divi is pure surface for no benefit. Now nothing is allowed unless
 # it is asked for.
 PAGE_BUILDER_DOMAINS=""
+IMPORT_SOURCE_HOSTS=""
 if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
   echo ""
   echo -e "  ${BLD}Commercial themes or page builders?${CL}"
@@ -2478,6 +2481,21 @@ if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
     msg_ok "No builder domains allowed — add later with: doas wasp-egress.sh allow <domain>"
   fi
   unset _PB _n
+
+  echo ""
+  echo -e "  ${BLD}Import file host (optional)${CL}"
+  echo -e "  ${YW}Only useful if a site backup will be downloaded from this host with${CL}"
+  echo -e "  ${YW}wp-import.sh. It is NOT added to the allowlist: wp-import opens it for${CL}"
+  echo -e "  ${YW}that download and closes it again, so a compromised WordPress cannot${CL}"
+  echo -e "  ${YW}reach a file-sharing service the rest of the time.${CL}"
+  echo ""
+  read -rp "  Allow imports from activeit.syncedtool.com? [y/N] : " _IS
+  case "${_IS}" in
+    y|Y|yes|YES) IMPORT_SOURCE_HOSTS="activeit.syncedtool.com"
+                 msg_ok "Import source: ${IMPORT_SOURCE_HOSTS}" ;;
+    *)           msg_ok "No import source. Add later: doas wasp-egress.sh import-source add <host>" ;;
+  esac
+  unset _IS
 fi
 
 # ── Multi-factor authentication for admins ───────────────────────────────────
@@ -2601,6 +2619,21 @@ else
   msg_ok "CTI skipped — bans are still enforced, just without global context"
 fi
 
+# ── WPVulnerability ─────────────────────────────────────────────────────────
+WPVULNERABILITY=1
+echo ""
+echo -e "  ${BLD}Vulnerability source: WPVulnerability${CL}"
+echo -e "  ${YW}Free, no token, and adds WordPress core, PHP and MariaDB to the scan.${CL}"
+echo -e "  ${YW}The trade: it is queried per component, so the provider sees this${CL}"
+echo -e "  ${YW}VM's address and the name of every plugin and theme it runs, which${CL}"
+echo -e "  ${YW}is a client's inventory. Wordfence's feed sends nothing.${CL}"
+read -rp "  Use WPVulnerability? [Y/n] : " _WPV
+case "${_WPV}" in
+  n|N|no|NO) WPVULNERABILITY=0; msg_ok "WPVulnerability off. Later: wp-plugins.sh vuln-source wpvulnerability on" ;;
+  *)         msg_ok "WPVulnerability on. Off later: wp-plugins.sh vuln-source wpvulnerability off" ;;
+esac
+unset _WPV
+
 # ── Wordfence Intelligence API key ───────────────────────────────────────────
 echo ""
 echo -e "  ${BLD}Wordfence Intelligence API token (plugin vulnerability data)${CL}"
@@ -2619,7 +2652,7 @@ echo -e "  ${YW}  digest pinning secure the IMAGE; plugins and themes live in a$
 echo -e "  ${YW}  mounted volume that an image update never touches — and that is${CL}"
 echo -e "  ${YW}  where roughly 91% of WordPress vulnerabilities are found.${CL}"
 echo -e "  ${YW}  The feed is downloaded whole and matched on this VM, so your${CL}"
-echo -e "  ${YW}  plugin list is never sent to anyone. Skipping it costs you that${CL}"
+echo -e "  ${YW}  plugin list is not sent to Wordfence. Skipping it costs you that${CL}"
 echo -e "  ${YW}  visibility and nothing else — everything else still works.${CL}"
 echo -e "  ${YW}  It reports DISCLOSED issues. Roughly 46% of plugin${CL}"
 echo -e "  ${YW}  vulnerabilities have no patch when they are disclosed, and a${CL}"

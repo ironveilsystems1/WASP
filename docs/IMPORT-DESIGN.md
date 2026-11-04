@@ -82,8 +82,13 @@ all. This is the layer where a tool that "just untars it" has already lost.
   a missing `-plugins.zip` yields a site that half-works in confusing ways.
 - **`.wpress`** (All-in-One WP Migration) is a *custom* format, not an
   archive. Header per file: 255-byte name, 14-byte size, 12-byte mtime,
-  4096-byte path, then data, terminated by a null block. A small reader is
-  needed; the plugin itself is not.
+  4088-byte path, 8-byte CRC32 (the last two were one 4096-byte path before
+  plugin 7.104), then data, terminated by a null block or, since 7.104, a block
+  holding the archive's length and CRC32. Content may be gzip-chunked or
+  AES-encrypted. `payload/lib/wasp-wpress-reader.php` carries the full layout.
+  Its dump is not a normal dump: tables and keys use a `SERVMASK_PREFIX_`
+  placeholder, and the theme and active plugins are blank, with the real values
+  in `package.json`. The plugin restores them itself; any other importer must.
 
 ---
 
@@ -93,12 +98,12 @@ all. This is the layer where a tool that "just untars it" has already lost.
 |---|---|---|
 | **UpdraftPlus** | `backup_*-db.gz` + siblings | Multi-file; verify the set is complete first |
 | **Duplicator** | `archive.zip` + `installer.php` | Installer deleted on sight |
-| **All-in-One WP Migration** | `.wpress` | Custom reader required |
+| **All-in-One WP Migration** | `.wpress` | Implemented. Encrypted and gzip read; bzip2 and multisite refused |
 | **BackWPup / generic** | `.tar.gz` / `.zip` + `.sql` | Best effort |
 | **Manual** | a directory + a `.sql` file | The simplest and most predictable path |
 
-Start with **UpdraftPlus and manual**. They cover most real cases, and the
-`.wpress` reader is a self-contained piece that can follow.
+Started with **UpdraftPlus and manual**. `.wpress` followed as a self-contained
+reader.
 
 ---
 
@@ -268,10 +273,10 @@ Stated so the tool does not imply otherwise:
    rollback is `qm destroy`. Importing into a running site means a failed
    import has already replaced the working one. Leaning strongly toward
    requiring a fresh deployment for v1.
-3. **`.wpress` reader in shell or Python?** Fixed-width binary headers in
-   POSIX shell is unpleasant. Python is not installed on the VM by default,
-   and adding it for one format is a real cost. Possibly defer `.wpress` to v2
-   and document extracting it on the workstation first.
+3. ~~**`.wpress` reader in shell or Python?**~~ Neither. PHP, in the pinned
+   wp-cli image that every VM already has, run with no network, a read-only
+   root, no capabilities and an unprivileged uid. It adds no package to the VM,
+   and a parser of hostile binary input is the code to keep off the host anyway.
 4. **Where does the operator put the archive?** Uploading several GB over SSH
    to a VM is awkward. Options: `wasp-offsite-backup.sh`'s rclone remote,
    a URL fetch with checksum, or a Proxmox-side mount.
@@ -288,7 +293,7 @@ Stated so the tool does not imply otherwise:
 4. The gate and the record.
 5. Normalisation and import.
 6. Re-hardening.
-7. `.wpress`, if it still seems worth it.
+7. `.wpress`. Done.
 
 Steps 1–3 alone are worth shipping: *"tell me what is in this backup before I
 touch it"* is a real need on its own, and it is the part with no destructive

@@ -328,8 +328,9 @@ Proposed compromise, not yet done:
 ## Safe site import — IMPLEMENTED (v1), see docs/IMPORT-DESIGN.md
 
 `where`, `fetch`, `list`, `inspect`, `extract`, `scan`, `staged`, `apply`.
-Untested on real hardware. `.wpress` still declines with instructions
-rather than being half-handled.
+Untested on real hardware. `.wpress` is read natively since 10.7; it has been
+tested against the plugin's own 4.5 archiver and a third-party builder of the
+7.x format, not yet against a real 7.x export.
 
 
 Full design written after researching the actual backup formats. Three things

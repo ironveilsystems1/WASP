@@ -179,9 +179,9 @@ fi
 # that is silently wrong is worse than one that carries less information.
 #
 # If a build stamp is wanted again later, generate it rather than typing it.
-WASP_RELEASE="10.6"
-WASP_VERSION="10.6"
-WASP_VERSION_NOTE="remoteip mask survives every container rebuild and is asserted on the live container; validator judges the bouncer against the declared CrowdSec topology; CrowdSec v1.8.1"
+WASP_RELEASE="10.10"
+WASP_VERSION="10.10"
+WASP_VERSION_NOTE="Vulnerability scans report failure instead of silence; WPVulnerability on by default; staged plugins checked before import; time-boxed import sources"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
