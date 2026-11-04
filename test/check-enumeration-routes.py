@@ -139,6 +139,13 @@ def main():
         "match to outrank it, applying the generated config IP-restricts the "
         "site for ordinary visitors while every admin page keeps working.",
     )
+    check(
+        "nginx-snippet emits an exact-match admin-post location",
+        re.search(r"location = /wp-admin/admin-post\.php", hard) is not None,
+        "WASP's own contact form posts to admin-post.php. The admin regex "
+        "location matches it too, so without an exact match the form returns "
+        "403 to every visitor outside the allowlist.",
+    )
     # .find(), not .index(): a missing string must report as a failed check,
     # not raise and abandon every assertion after it. Found by running this
     # file against the unfixed source, which is the only way that gets found.

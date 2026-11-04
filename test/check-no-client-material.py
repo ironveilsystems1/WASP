@@ -126,6 +126,19 @@ _TEXT_SUFFIXES = (".sh", ".php", ".py", ".md", ".txt", ".conf", ".cron",
                   ".yar", ".xml", ".json", ".service", ".yaml", ".yml")
 
 
+# ADDED 2026-11-03. A comment quoting a real download link put a client's share
+# id, archive name and access token into a public repository, past every check
+# here: the name was not on any list, and nothing looked for link shapes. The
+# host was absent, so this was one guess from a working link to a full backup.
+#
+# Same scope rule as above: not a PII scanner, one answerable question. Does this
+# tree hold something shaped like a live share link? Examples use <id> and <token>.
+_SHARE_LINK = (
+    re.compile(r"/share/\d{3,}/"),
+    re.compile(r"\.(?:zip|wpress|tar\.gz|tgz|sql)/[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_.-])"),
+)
+
+
 def _routable_v4(text):
     """Public IPv4 literals in this text, deduplicated and in order."""
     found = []
@@ -154,6 +167,12 @@ def _routable_v4(text):
 
 
 def main():
+    # Built by concatenation so this file does not flag itself.
+    _sample = "x/share/" + "331999" + "/backup/a.zip/" + "AbCdEfGh1"
+    assert any(p.search(_sample) for p in _SHARE_LINK), \
+        "self-test: a share link was not caught"
+    assert not any(p.search("x/share/<id>/backup/a.zip/<token>") for p in _SHARE_LINK), \
+        "self-test: the placeholder form was flagged"
     problems = []
     for root, dirs, files in os.walk(REPO):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -178,6 +197,11 @@ def main():
                         problems.append(
                             f"{rel}: content reads as notes on a specific engagement")
                         break
+            for pat in _SHARE_LINK:
+                if pat.search(text):
+                    problems.append(
+                        f"{rel}: looks like a real share link — use <id> and <token>")
+                    break
             for addr in _routable_v4(text):
                 problems.append(
                     f"{rel}: routable IPv4 address {addr} — use a documentation "

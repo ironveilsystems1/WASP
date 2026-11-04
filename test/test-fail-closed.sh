@@ -1123,6 +1123,10 @@ for _src in "$REPO"/payload/bin/*.sh "$REPO"/lib/*.sh; do
   # Pull each <Location...> ... </Location> block and check any that contain
   # a Require directive for the AuthMerging declaration.
   _res=$(awk '
+    # The one deliberate exception: two public URLs under wp-admin. It names
+    # exactly those two files and nothing else, which is what makes it safe to
+    # replace the allowlist there, and it is asserted below.
+    /<LocationMatch "\^\/wp-admin\/admin-\(ajax\|post\)\\\.php\\?\$">/ { next }
     /<Location(Match)?[ >]/ { inblk = 1; blk = ""; hasreq = 0; hasmerge = 0 }
     inblk {
       blk = blk $0 "\n"
@@ -1141,6 +1145,22 @@ if [ -n "$_loc_bad" ]; then
      "it is applied after <DirectoryMatch>/<Files> and REPLACES the wp-admin allowlist"
 else
   _p "every generated <Location> authz block declares AuthMerging And"
+fi
+# The exception above must stay exactly that narrow, and must stay present: with
+# an allowlist set, Apache otherwise 403s the public admin-ajax.php and
+# admin-post.php, which WASP's own contact form posts to.
+if grep -q 'LocationMatch "^/wp-admin/admin-(ajax|post)\\.php' "$REPO/lib/03-dynamic-configs.sh"; then
+  _p "public admin-ajax.php and admin-post.php stay open under an allowlist"
+else
+  _f "Apache has no exception for public admin-ajax.php and admin-post.php" \
+     "with ADMIN_CIDR set, the contact form and every public AJAX call return 403"
+fi
+if grep -n '<LocationMatch' "$REPO/lib/03-dynamic-configs.sh" | grep -v 'admin-(ajax|post)' \
+     | grep -vE 'wp-admin/\|wp-login' | grep -q .; then
+  _f "a new LocationMatch appeared in the generated config" \
+     "check it cannot replace the wp-admin allowlist"
+else
+  _p "no other LocationMatch can replace the wp-admin allowlist"
 fi
 
 _guard "the generated geoip.conf merges with the admin rules rather than replacing them" \
@@ -1377,7 +1397,7 @@ _guard "a refused fetch tells the operator to allowlist the host" \
   "payload/bin/wp-import.sh" "not allowlisted"
 # A share link ends in an ACCESS TOKEN, not a filename. Taking basename gave
 # a 653 MB archive no extension and a name matching nothing the operator
-# asked for; `inspect melroseg.zip` then said "Not found", which reads as a
+# asked for; `inspect client-a.zip` then said "Not found", which reads as a
 # failed download when the download had succeeded.
 _guard "fetch recovers the real filename from a tokenised share URL" \
   "payload/bin/wp-import.sh" "URL ends in a token"
@@ -1587,6 +1607,55 @@ _vexpect "bouncer: local with none running warns"        WARN "$(_vrun "$_bnc_bl
 _vexpect "bouncer: local with one running passes"        PASS "$(_vrun "$_bnc_block" ':' "$_up"   local)"
 
 # ── Result ───────────────────────────────────────────────────────────────────
+# ── What the 10.9 review found ──────────────────────────────────────────────
+# These are text checks for generated config and stage code that no test here
+# can run. The behaviour itself is in test-busybox-run.sh, test-login-guard.php
+# and test-mfa-enforcement.php.
+echo ""
+echo "── Findings from the 10.9 review stay fixed"
+_has_text() { # description, file, pattern, why
+  if grep -qE -- "$3" "$REPO/$2" 2>/dev/null; then _p "$1"; else _f "$1" "$4"; fi
+}
+_no_text() { # description, file, pattern, why
+  if grep -qE -- "$3" "$REPO/$2" 2>/dev/null; then _f "$1" "$4"; else _p "$1"; fi
+}
+for _c in lib/03-dynamic-configs.sh payload/bin/wp-hardening.sh payload/apache-conf/wp-security-fallback.conf; do
+  _has_text "$_c turns PHP off in uploads" "$_c" 'php_admin_flag engine off' \
+    "denying .php by name is not enough: one .htaccess runs shell.jpg as PHP"
+done
+for _c in lib/03-dynamic-configs.sh payload/stages/04-apache-hardening.sh; do
+  _has_text "$_c blocks /wp-login.php/anything" "$_c" 'wp-login\\+\.php\(/\.\*\)\?' \
+    "Apache serves /wp-login.php/x as wp-login.php, which walks past the slug"
+  _has_text "$_c anchors author=" "$_c" '\(\^\|&\)author=' \
+    "a substring match also blocks ?post_author=1"
+done
+_has_text "stage 08 installs GNU tar and Info-ZIP" payload/stages/08-update-tooling.sh 'apk add --no-cache tar unzip' \
+  "BusyBox unzip cannot list members, and BusyBox tar follows hard-link targets"
+_has_text "WordPress runs from the file without the root password" payload/stages/06-containers-mariadb-wordpress.sh '--env-file /etc/wordpress/wp.env' \
+  "any PHP on the site could read MARIADB_ROOT_PASSWORD"
+_has_text "so does the boot service" payload/stages/07-openrc-services.sh '--env-file /etc/wordpress/wp.env' \
+  "the first reboot would put the root password back in the container"
+_has_text "stage 03 writes the secrets with a private umask" payload/stages/03-wordpress-user-and-secrets.sh '^umask 077' \
+  "chmod after the write leaves a window"
+_no_text "rotation does not use podman restart" payload/bin/wp-rotate-secrets.sh '^[^#]*podman restart wordpress' \
+  "restart keeps the old environment, so the site loses its database"
+_has_text "rotation recreates the container" payload/bin/wp-rotate-secrets.sh 'podman rm -f wordpress' \
+  "wp-config.php reads the password from the container environment"
+_has_text "mod_maxminddb is hash-pinned" payload/bin/wp-geoip-setup.sh 'sha256sum -c -' \
+  "this is compiled into Apache"
+_no_text "mod_maxminddb is not taken from 'latest'" payload/bin/wp-geoip-setup.sh 'releases/latest' \
+  "an unverified download compiled into every request"
+_no_text "Lynis is not installed from an unverified tarball" payload/stages/10-security-tooling-and-validation.sh 'lynis\.tar\.gz' \
+  "it would run weekly as root"
+_no_text "the WordPress container cannot reach container registries" payload/squid/allowlist-runtime.txt '^(\.docker\.io|ghcr\.io|\.githubusercontent\.com)' \
+  "update.sh goes direct from the host, so only a compromised site used these"
+_has_text "nothing outside reaches the database network" lib/03-dynamic-configs.sh 'iifname "eth0" ip daddr 10\.89\.20\.0/24 drop' \
+  "this VM forwards, so a neighbour with a static route could reach MariaDB"
+_no_text "no config is sourced by the vulnerability tool" payload/bin/wp-plugins.sh '^[^#]*\. "\$VULN_CONF"' \
+  "this runs as root"
+_no_text "no config is sourced by the hardening tool" payload/bin/wp-hardening.sh '^[^#]*\. "\$CTI_CONF"' \
+  "this runs as root"
+
 echo ""
 echo "──────────────────────────────────────────────────────"
 printf "  passed %d   failed %d\n" "$PASS" "$FAIL"

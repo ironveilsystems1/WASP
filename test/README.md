@@ -12,10 +12,16 @@ which does what:
   (each of which self-tests against its own fixture — including
   `check-menu-entries.py`, which verifies every `wasp-menu` entry maps to a tool
   that exists and a subcommand that tool actually accepts), and — when PHP is present
-  — `php -l` on every mu-plugin plus `test/test-mfa-enforcement.php`, the
-  21-case logic harness for the MFA enforcement decision (scope, enrollment,
-  grace maths, the enrollment-path gate). Run this on every change; it is fast
-  and catches the class of bug that has repeatedly bitten this project.
+  — `php -l` on every mu-plugin, the .wpress suites (`test-wpress-reader.php` and
+  `test-wpress-import.sh`), `test/test-mfa-enforcement.php`, the harness for the
+  MFA decision and the wall (scope, enrollment, grace maths, sessions), and
+  `test/test-login-guard.php`, which drives the lockout through a filter chain
+  shaped like core's. It finishes with `test/test-busybox-run.sh`, which runs
+  the import and scan tools with BusyBox applets in place of GNU tools, as they
+  run on the VM. That run is required: without BusyBox the suite fails, because
+  a skipped run is how two critical import bugs passed every test here. Install
+  busybox-static or set `BUSYBOX=/path/to/busybox`. Run this on every change; it
+  is fast and catches the class of bug that has repeatedly bitten this project.
 - **`test/test-wordpress-vm.sh`** (documented below) — the integration harness
   that runs against a real provisioned VM and checks live behaviour.
 

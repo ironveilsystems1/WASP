@@ -36,11 +36,27 @@ if command -v php >/dev/null 2>&1; then
   if [ -f test/test-mfa-enforcement.php ]; then
     php test/test-mfa-enforcement.php || rc=1
   fi
+  if [ -f test/test-login-guard.php ]; then
+    php test/test-login-guard.php 2>/dev/null | grep -v '^\[wpvm-login\]' || true
+    php test/test-login-guard.php >/dev/null 2>&1 || rc=1
+  else
+    echo "  test-login-guard.php MISSING"; rc=1
+  fi
+  if [ -f test/test-wpress-reader.php ]; then
+    php test/test-wpress-reader.php || rc=1
+  else
+    echo "  test-wpress-reader.php MISSING"; rc=1
+  fi
+  if [ -f test/test-wpress-import.sh ]; then
+    bash test/test-wpress-import.sh || rc=1
+  else
+    echo "  test-wpress-import.sh MISSING"; rc=1
+  fi
 else
   echo ""
   echo "── php checks ────────────────────────────────────────────"
-  echo "  SKIPPED — php not installed. The mu-plugin lint and the 21-case MFA"
-  echo "  harness did not run. A syntax error in an mu-plugin is a site-wide"
+  echo "  SKIPPED — php not installed. The mu-plugin lint, the MFA harness"
+  echo "  and both .wpress suites did not run. A syntax error in an mu-plugin is a site-wide"
   echo "  fatal that cannot be cleared from wp-admin, so do not read a clean"
   echo "  run here as covering them."
 fi
@@ -63,6 +79,13 @@ if [ -f test/test-topology.sh ]; then
 else
   echo "  test-topology.sh MISSING"; rc=1
 fi
+for _t in test-vuln-scan.sh test-import-source.sh test-busybox-run.sh; do
+  if [ -f "test/${_t}" ]; then
+    bash "test/${_t}" || rc=1
+  else
+    echo "  ${_t} MISSING"; rc=1
+  fi
+done
 echo ""
 [ $rc = 0 ] && echo "ALL CHECKS PASSED" || echo "CHECKS FAILED"
 exit $rc

@@ -27,12 +27,23 @@ class Two_Factor_Core {
     $keyed = []; foreach($flat as $c){ $keyed[$c] = true; } return $keyed;
   }
 }
-function add_action(){} function add_filter(){}
+// Hooks are recorded rather than ignored, so the wall itself can be driven below.
+$GLOBALS['_hooks'] = [];
+function add_action($n,$cb,$p=10,$a=1){ $GLOBALS['_hooks'][$n][]=[$cb,$p]; }
+function add_filter($n,$cb,$p=10,$a=1){ $GLOBALS['_hooks'][$n][]=[$cb,$p]; }
+class WP_Error { public $c; function __construct($c,$m=''){$this->c=$c;} function get_error_code(){return $this->c;} }
+function is_wp_error($x){ return $x instanceof WP_Error; }
+class WallDied extends Exception {}
+class WP_Session_Tokens { public $id; function __construct($i){$this->id=$i;}
+  static function get_instance($i){ return new self($i); }
+  function destroy_all(){ $GLOBALS['_destroyed'][]=$this->id; } }
+function wp_clear_auth_cookie(){ $GLOBALS['_cleared']=true; }
+function wp_die($m,$t='',$a=[]){ $GLOBALS['_died']=$a['response'] ?? 0; throw new WallDied(); }
+function wp_kses_post($s){ return $s; }
+function set_transient($k,$v,$e){ $GLOBALS['_nudged']=true; }
 function wp_doing_ajax(){ return $GLOBALS['_ajax'] ?? false; }
 function wp_get_current_user(){ return $GLOBALS['_current'] ?? null; }
-function wp_safe_redirect($u){ $GLOBALS['_redirected']=$u; }
 function admin_url($p=''){ return 'https://site/wp-admin/'.$p; }
-function in_array_poly(){ }
 
 $file = dirname(__DIR__) . '/payload/mu-plugins/03-wpvm-mfa-enforce.php';
 $src = file_get_contents($file);
@@ -65,18 +76,59 @@ check('enrolled admin=no block', !wpvm_mfa_user_enrolled(1), false);
 $GLOBALS['_providers'][2]=[];
 check('editor=never block', wpvm_mfa_user_in_scope($editor), false);
 
-// ── enrollment-path gate: the lockout-critical function ──────────────────────
-// If this wrongly blocks the profile or the TOTP setup endpoints, an unenrolled
-// admin past grace is redirected away from the one page they need -> lockout.
-function set_page($p){ $GLOBALS['pagenow']=$p; $_REQUEST=[]; }
-set_page('profile.php');       check('profile.php is an enrollment path', wpvm_mfa_request_is_enrollment_path(), true);
-set_page('user-edit.php');     check('user-edit.php (self-edit) allowed', wpvm_mfa_request_is_enrollment_path(), true);
-set_page('admin-ajax.php');    check('admin-ajax.php (TOTP verify) allowed', wpvm_mfa_request_is_enrollment_path(), true);
-set_page('admin-post.php');    check('admin-post.php (provider save) allowed', wpvm_mfa_request_is_enrollment_path(), true);
-set_page('wp-login.php');      check('wp-login.php (logout) allowed', wpvm_mfa_request_is_enrollment_path(), true);
-set_page('index.php'); $_REQUEST['action']='logout'; check('logout action allowed anywhere', wpvm_mfa_request_is_enrollment_path(), true);
-set_page('edit.php'); $_REQUEST=[]; check('a normal admin page is NOT an enrollment path', wpvm_mfa_request_is_enrollment_path(), false);
-set_page('plugins.php');       check('plugins.php is NOT an enrollment path', wpvm_mfa_request_is_enrollment_path(), false);
+// ── the wall: past grace, nothing is left open ───────────────────────────────
+// Reproduced against real WordPress: an allowlist of "enrolment" pages let a
+// stolen password reach plugins.php?action=logout and promote a second admin
+// through user-edit.php. So nothing here depends on the page being requested.
+function hook($n){ return $GLOBALS['_hooks'][$n][0] ?? [null,null]; }
+function reset_wall(){ $GLOBALS['_destroyed']=[]; $GLOBALS['_cleared']=false; $GLOBALS['_died']=0; $GLOBALS['_nudged']=false; }
+function run_admin_init(){ reset_wall(); [$cb]=hook('admin_init'); try { $cb(); } catch (WallDied $e) {} }
+function run_wp_login($u){ reset_wall(); [$cb]=hook('wp_login'); try { $cb('x',$u); } catch (WallDied $e) {} }
 
+$walled=new WP_User(10,true);   $GLOBALS['_providers'][10]=[];                  $GLOBALS['_meta']['10:wpvm_mfa_grace_start']=time()-(30*86400);
+$fresh=new WP_User(11,true);    $GLOBALS['_providers'][11]=[];                  $GLOBALS['_meta']['11:wpvm_mfa_grace_start']=time()-86400;
+$enrolled=new WP_User(12,true); $GLOBALS['_providers'][12]=['Two_Factor_Totp']; $GLOBALS['_meta']['12:wpvm_mfa_grace_start']=time()-(30*86400);
+$mailonly=new WP_User(13,true); $GLOBALS['_providers'][13]=['Two_Factor_Email'];$GLOBALS['_meta']['13:wpvm_mfa_grace_start']=time()-(30*86400);
+$plain=new WP_User(14,false);   $GLOBALS['_providers'][14]=[];                  $GLOBALS['_meta']['14:wpvm_mfa_grace_start']=time()-(30*86400);
+
+check('past grace, no factor = walled',          wpvm_mfa_is_walled($walled),   true);
+check('within grace = not walled',               wpvm_mfa_is_walled($fresh),    false);
+check('enrolled = not walled',                   wpvm_mfa_is_walled($enrolled), false);
+check('email only, past grace = walled',         wpvm_mfa_is_walled($mailonly), true);
+check('non-admin = not walled',                  wpvm_mfa_is_walled($plain),    false);
+check('the page allowlist is gone',              function_exists('wpvm_mfa_request_is_enrollment_path'), false);
+
+// The login itself. No cookies are ever issued, because nothing reaches wp_signon's
+// cookie step. wp_authenticate_user would run before the password check.
+[$auth,$prio]=hook('authenticate');
+check('refused after core password check (20) and spam check (99)', $prio>99, true);
+check('not on wp_authenticate_user, which runs before the password', isset($GLOBALS['_hooks']['wp_authenticate_user']), false);
+$r=$auth($walled);   check('walled login is refused', $r instanceof WP_Error && $r->get_error_code()==='wpvm_mfa_required', true);
+$r=$auth($fresh);    check('within grace login passes', $r, $fresh);
+$r=$auth($enrolled); check('enrolled login passes', $r, $enrolled);
+$r=$auth($plain);    check('non-admin login passes', $r, $plain);
+$e=new WP_Error('incorrect_password'); check('a wrong password stays a wrong password', $auth($e), $e);
+check('a failed lookup stays failed', $auth(null), null);
+
+// Sessions that already exist. The request does not matter, so these are the
+// exact requests that got through before.
+foreach ([ 'plugins.php?action=logout', 'user-edit.php?user_id=2', 'profile.php', 'admin-ajax.php', 'admin-post.php' ] as $page) {
+  $_SERVER['REQUEST_URI']='/wp-admin/'.$page;
+  $GLOBALS['_current']=$walled; run_admin_init();
+  check("$page: refused with 403", $GLOBALS['_died'], 403);
+  check("$page: sessions destroyed", $GLOBALS['_destroyed'], [10]);
+}
+$GLOBALS['_current']=$enrolled; run_admin_init(); check('enrolled admin keeps wp-admin', $GLOBALS['_died'], 0);
+$GLOBALS['_current']=$fresh;    run_admin_init(); check('within grace keeps wp-admin', $GLOBALS['_died'], 0);
+$GLOBALS['_current']=null;      run_admin_init(); check('anonymous admin-ajax is untouched', $GLOBALS['_died'], 0);
+
+// Second layer. destroy_all() rather than wp_destroy_current_session(), which
+// reads $_COOKIE and finds nothing during a login.
+run_wp_login($walled);
+check('wp_login: refused with 403', $GLOBALS['_died'], 403);
+check('wp_login: every session destroyed', $GLOBALS['_destroyed'], [10]);
+check('wp_login: cookies cleared', $GLOBALS['_cleared'], true);
+run_wp_login($fresh);
+check('wp_login: within grace is nudged, not refused', [$GLOBALS['_died'],$GLOBALS['_nudged']], [0,true]);
 if($fail>0){ echo "MFA enforcement: $fail FAILED\n"; exit(1); }
 echo "MFA enforcement logic: all $pass checks passed\n";
