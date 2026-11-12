@@ -93,7 +93,9 @@ flowchart TD
     L2B --> L2C{"wp-admin<br/>IP restriction"}
     L2C -->|"admin path, IP not allowed"| D5["403"]
 
-    L2C --> PHP["PHP + WordPress bootstrap<br/>first real cost"]
+    L2C --> AS{"CrowdSec AppSec<br/>optional, before WordPress<br/>(auto_prepend_file)"}
+    AS -->|"virtual patch or<br/>generic rule matched"| D8["403<br/>WordPress never runs"]
+    AS --> PHP["PHP + WordPress bootstrap<br/>first real cost"]
     PHP --> L4{"Login Guard<br/>mu-plugin"}
     L4 -->|"address locked out"| D6["rejected<br/>before password check"]
     L4 --> L5{"MFA enforcement<br/>mu-plugin (optional)"}
@@ -112,6 +114,8 @@ flowchart TD
     style PHP fill:#374151,stroke:#f59e0b,color:#fff
     style APP fill:#1f2937,stroke:#22c55e,color:#fff
     style D7 fill:#1f2937,stroke:#22c55e,color:#fff
+    style D8 fill:#1f2937,stroke:#22c55e,color:#fff
+    style AS fill:#374151,stroke:#3b82f6,color:#fff
     style TF fill:#374151,stroke:#3b82f6,color:#fff
     style L5 fill:#374151,stroke:#3b82f6,color:#fff
 ```
@@ -377,9 +381,10 @@ flowchart TD
 
     IN --> I1{"inspect<br/>reads the INDEX only"}
     I1 -->|"../ · absolute path · symlink"| R1["REFUSE<br/>no override"]
-    I1 -->|"clean index"| EX["extract to staging<br/>outside the docroot<br/>execute bit removed<br/>Duplicator installer deleted"]
+    I1 -->|"clean index"| EX["extract to staging<br/>outside the docroot<br/>execute bit removed<br/>Duplicator installer deleted<br/>(outside wp-content only)"]
 
-    EX --> SC1["scan files"]
+    EX --> ROOT["find the site root<br/>shallowest wp-content beside<br/>wp-includes or wp-config.php"]
+    ROOT --> SC1["scan files AT the site root<br/>index guards cleared by content"]
     EX --> SC2["scan the DUMP<br/>as a file, before loading"]
     SC2 --> D1["autoloaded options containing code"]
     SC2 --> D2["scheduled tasks — re-infect after cleaning"]
@@ -395,15 +400,19 @@ flowchart TD
     NM --> N1["core → pinned image"]
     NM --> N2["wp-config · .htaccess → this VM's"]
     NM --> N3["mu-plugins → quarantined"]
-    NM --> N4["executable uploads → quarantined as evidence"]
+    NM --> N4["executable uploads → quarantined as evidence<br/>relative paths kept"]
+    NM --> N5["renamed · obfuscated PHP → kept out"]
 
     NM --> IMP["import content, then the database<br/>table prefix rewritten, capability keys included"]
     IMP --> RH["re-harden"]
     RH --> H1["siteurl · home"]
     RH --> H2["salts regenerated — all sessions void"]
     RH --> H3["scheduled tasks cleared"]
-    RH --> H4["administrators listed for review"]
-    RH --> V(["verify: malware scan · vulns · validate"])
+    RH --> RM["remediate"]
+    RM --> M1["modified wordpress.org plugins<br/>reinstalled from wordpress.org"]
+    RM --> M2["planted accounts locked, not deleted"]
+    RM --> H4["administrators listed for review"]
+    RM --> V(["verify: malware scan · vulns · validate"])
 
     style R1 fill:#1f2937,stroke:#ef4444,color:#fff
     style R2 fill:#1f2937,stroke:#ef4444,color:#fff
@@ -465,6 +474,70 @@ So the outcome is asserted in SQL after import, where it is exact and
 format-blind, and it runs whether or not the text pass appeared to work —
 because "appeared to work" is exactly what went wrong.
 
+**Exact means exact.** Until 10.11 that SQL matched with `LIKE 'wp_%'`, and in
+`LIKE` the `_` matches any single character — so the source prefix `wp_`, as a
+pattern, also matched this VM's own `wp5c1e9a_`. The check reported correctly
+renamed keys as stranded, and because the `UPDATE` shared the predicate, a
+second `apply` renamed them again, to `wp5c1e9a_c1e9a_capabilities`: every user
+lost every role, and the count printed the same number either way. The
+comparison is now `LEFT(key, n) = 0x<prefix bytes>`. It has no wildcard to get
+wrong, and after one successful run nothing starts with the source prefix, so
+running it again changes nothing. The general lesson: a SQL pattern built from
+data is a pattern, whatever it was meant to be.
+
+### 7.3 What `inspect` and `scan` are allowed to conclude
+
+The first real compromised archive (10.10, a cPanel export) produced two false
+alarms at full confidence and missed the one real piece of malware. Each
+failure was a check that reached further than its evidence:
+
+- **`inspect` sees names, so it judges names only.** It called six
+  `uploads/*/index.php` "the single strongest indicator that the source site
+  was compromised". They were WordPress's own directory-index guards. Whether
+  an `index.php` is a guard is a question about content, so `inspect` now
+  counts them apart and leaves the verdict to `scan`, which reads them.
+- **A finding needs its whole signature.** "Duplicator" was a suffix match on
+  `installer.php`, which matched Composer's `Installer.php` a hundred times. A
+  Duplicator package is the installer *and* its archive.
+- **A check that found nothing to check must not pass.** `scan` was pointed at
+  the top of the staging tree. For a nested archive every structural check
+  looked for `wp-content` one level too high, found none, and printed `[ok]`.
+  `scan` now uses the same site-root rule as `apply` (§7.1), and the scanner
+  says when its target has no `wp-content`.
+- **The malware was renamed, not hidden.** `mu-plugins/<name>.php.bak` — a
+  hex-obfuscated injector that someone had found and disarmed by renaming.
+  YARA had no literal to match and no structural check looked at mu-plugins.
+  Nothing builds or ships a `.php.bak`, so `inspect` now lists PHP renamed so
+  it no longer runs, by name.
+
+### 7.4 Remediation removes the known shapes, and stops there
+
+The same release turned those detections into automated clean-up
+(`wp-malware-scan.sh remediate`, run by `wp-import.sh apply`). It is bounded
+on purpose, and each bound is a failure it would otherwise cause:
+
+- **It moves, it never deletes.** Every file goes to quarantine with its path,
+  after a timeline is captured. Evidence of the way in matters more than the
+  file, and a false positive must be undoable with one `mv`.
+- **A plugin is replaced, not patched.** A modified wordpress.org plugin is
+  moved aside and reinstalled at the version it claims, so a backdoor added
+  beside the real files cannot survive. With no published copy (commercial,
+  bespoke) there is nothing trustworthy to restore from, so it is left for a
+  human. If the clean copy cannot be fetched, the original goes back.
+- **An account is locked, not deleted.** Deleting loses the evidence and,
+  unless posts are reassigned, content. Locking removes every role, replaces
+  the password, ends sessions and changes the e-mail address — because the
+  attacker controls the real one and would otherwise reset the password.
+- **Only privileged accounts, and never a batch.** Two signals on a
+  subscriber are more often a bulk import than a backdoor, and more than five
+  matching accounts at once is a data artefact. Both go to a human.
+- **Nothing outside the shapes seen on real sites.** Database options holding
+  code, themes, and a backdoor written for one site are reported, not
+  touched. Remediation removes what was found; finding the way in is
+  `wp-forensics.sh entry-class`, and skipping it means doing this again.
+
+What is still open is in [TODO.md](TODO.md#import-pipeline--open-after-the-first-real-import).
+
 **Nothing is reachable by the web server, or executed by anything, until it
 has been scanned.** The natural implementation — extract into the document
 root, then scan — leaves a webshell live and serving for as long as the scan
@@ -477,8 +550,8 @@ checking for has already happened.
 **Normalisation discards rather than inspects**, wherever a good replacement
 exists. Core comes from the digest-pinned image, so comparing is strictly
 worse than replacing. `wp-config.php` carries the source site's credentials
-and salts. mu-plugins are active on arrival with no activation step to
-withhold. Each is thrown away rather than examined, which removes the entire
+and salts. Top-level mu-plugins are active on arrival with no activation step
+to withhold. Each is thrown away rather than examined, which removes the entire
 question.
 
 **The gate is graded, not binary.** Refusing outright would be useless —
@@ -733,6 +806,114 @@ be denied outright. That is permissive by design: it only satisfies the
 country layer. The allowlist layer is where breadth actually grants admin,
 and it should name specific addresses. `100.64.0.0/10` in the *allowlist*
 means every peer on the overlay reaches wp-admin, which is rarely intended.
+
+---
+
+### 2.1 AppSec: the one inspection that runs before WordPress, and its price
+
+AppSec is off unless `wasp-appsec.sh on` (or the installer) switched it on.
+When it is on, the PHP forwarder runs first in every PHP request. It sends
+the request to CrowdSec's AppSec listener: the method, URI, headers, the body
+up to 128 KiB, and the client address mod_remoteip resolved. A 403 from the
+listener ends the request there. The listener runs inside the CrowdSec
+container (host network, port 7422), and one nftables rule (`wasp:appsec`)
+admits only the WordPress container to it.
+
+Three properties are deliberate:
+
+- **Light rules only.** It loads virtual patches and generic rules in band.
+  The OWASP CRS is not loaded, in band or out of band.
+- **Fail-open by default.** A CrowdSec that is restarting must not take the
+  site down. `--fail-closed` exists for sites that would rather be down.
+- **A watchdog below the cap.** CrowdSec 1.8.x has an open report of AppSec
+  memory growing without bound (crowdsecurity/crowdsec#4797). The container
+  keeps its 512 MB cap, and `wasp-appsec.sh watchdog` restarts it at 448 MB
+  rather than letting the kernel kill it mid-request. The restart and its
+  reason are logged and reported to the Hive.
+
+---
+
+## 10. WASP Hive: watching a fleet without holding it
+
+The fleet console is a separate Alpine VM. The arrows are the whole design.
+Every one that carries fleet data points **towards** the Hive, and none
+points from the Hive to a WASP VM. Its single outbound connection is
+optional and read-only, to a Wazuh manager.
+
+```mermaid
+graph LR
+    subgraph VMS["WASP VMs (each)"]
+        JOBS["scheduled jobs<br/>vuln scan, malware scan,<br/>checksum verify, backups"]
+        REC[("recorded state<br/>last-report.txt, .last-scan,<br/>.last-verify, last-scan.tsv")]
+        REP["wasp-hive-report.sh<br/>cron, every 15 min<br/>reads, never scans"]
+        TOK[("hive.token 0600<br/>can replace THIS VM's<br/>report, nothing else")]
+        JOBS --> REC --> REP
+        TOK -.-> REP
+    end
+
+    subgraph HIVE["WASP Hive VM"]
+        NFT["nftables<br/>443 → 8443, SSH from admin CIDR"]
+        SRV["hive_server.py<br/>stdlib only, unprivileged"]
+        DB[("hive.db<br/>token hashes, reports,<br/>users, sessions, audit")]
+        CMP["compliance.json<br/>28 checks, 5 frameworks"]
+        ADM["hive-admin<br/>console only:<br/>enroll, revoke, users"]
+        NFT --> SRV
+        SRV --> DB
+        CMP --> SRV
+        ADM --> DB
+    end
+
+    REP -->|"HTTPS POST, key pinned<br/>Bearer token in a header file"| NFT
+    OPS(["MSP staff"]) -->|"password + TOTP<br/>read-only pages"| NFT
+    SRV -.->|"optional, read-only<br/>cert pinned before password"| WZ["Wazuh manager API"]
+
+    style TOK fill:#1f2937,stroke:#f5b301,color:#fff
+    style ADM fill:#1f2937,stroke:#22c55e,color:#fff
+    style WZ fill:#374151,stroke:#9ca3af,color:#fff
+```
+
+**What each part may conclude.** A report is the VM's account of itself.
+`wasp-hive-report.sh` assembles it only from what the scheduled jobs already
+recorded, plus a live health line and CrowdSec counts. The Hive treats the
+report as data:
+
+- it checks the shape;
+- it takes the node name from the token, not the body;
+- it renders every value as text.
+
+Evidence that must not come from the VM is held by the Hive under a
+reserved `_hive` key, which ingest strips from every report. At present that
+is whether Wazuh sees an active agent. A compromised VM can still report
+itself clean. Two signals it cannot fake from the inside are the Wazuh view
+and a report that stops arriving (**stale** after 45 minutes).
+
+**Why push.** A poller needs a credential for every VM it polls, and that
+would make the Hive the one machine whose compromise reaches the whole
+fleet. With push, the worst a compromised Hive can do is show wrong numbers.
+See [docs/FLEET.md](docs/FLEET.md) for the principle and
+[docs/HIVE.md](docs/HIVE.md) for operation.
+
+**How the report gets out.** The reporter runs on the VM host, so the
+WordPress egress proxy (Squid) is not in the path. Under `RESTRICT_EGRESS=1`
+the host's output chain already allows tcp/443. A Hive on another port gets
+one rule, `wasp:hive`, added by `wasp-egress.sh hive set`. The rule is to
+that address and port only, and is inserted above the egress list's final
+drop. A name is resolved once and the address pinned (`curl --resolve`), so
+the rule and the connection cannot disagree.
+`wasp-fw-rule.sh` holds both runtime rules, this one and `wasp:appsec`:
+applied live, persisted in `/etc/wp-install/wasp-rules.nft`, and checked
+with `nft -c` before they are kept.
+
+**Building the Hive.** `install.sh` builds the Hive VM too (role "WASP Hive").
+lib/01 asks the shared questions and three of its own. lib/03 writes the
+Hive's ruleset in place of WordPress's. lib/06 stages `hive/` with the signed
+manifest and a first-boot launcher. lib/07 creates the VM. On first boot,
+`install-hive.sh` verifies the signature again before installing.
+
+**Why a pinned key.** The VMs and the Hive share a management VLAN, not a
+public name. Pinning the Hive's public key on each VM authenticates the Hive
+without a CA. A changed key is treated as an attack until shown otherwise:
+the report is withheld and the mismatch is logged by name.
 
 ---
 

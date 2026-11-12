@@ -115,7 +115,7 @@ check's period to 15 minutes with a 30-minute grace.
 | Accepting a vulnerability | Operator; governance accountable | Written justification | Emailed automatically |
 | Restoring from backup | Client decides | Backup of current state | `wasp-selftest.sh` |
 | Proving offsite recovery works | Operator, monthly | — | `wasp-offsite-backup.sh remote-restore-drill` |
-| Egress allowlist change | Operator | Note why the destination is required | `wasp-egress test` |
+| Egress allowlist change | Operator | Note why the destination is required. Permanent (`--permanent`) only for a theme or builder vendor; anything else is temporary and closes within the hour | `wasp-egress test`, `wasp-egress temporary` |
 | Importing a client site | Client confirms the source | `wp-import.sh inspect` and `scan` | `wp-malware-scan.sh full` on the live site |
 
 **Confirm console access before any firewall change.** `qm terminal <VMID>`
@@ -177,6 +177,57 @@ uploads and code in autoloaded options is a cleanup engagement, not a
 migration, and finding that out afterwards is how a fixed-price migration
 becomes an unpaid incident response.
 
+**One page for the fleet: WASP Hive.** With more than a handful of VMs, run a
+[WASP Hive](docs/HIVE.md) and enroll each VM at handover (`hive-admin enroll`
+on the Hive, then the printed line on the VM, or menu → Security → 24). The
+daily check becomes one page sorted worst first. **Purple (stale)** means a VM
+stopped reporting, and it ranks above every other state, because a silent VM
+is the one you know least about. The compliance page answers the client
+question "which of our controls are evidenced right now". It is evidence for
+an auditor, not a certificate, and should be described that way to the
+client. The Hive holds no credential for any VM, so it can be given to
+first-line staff without handing them the fleet.
+
+Build the Hive with the same installer (`WASP_ROLE=hive ./install.sh`). For a
+scripted rollout of WASP VMs, enroll each VM on the Hive first and pass the
+printed line as `WASP_HIVE_ENROLL`: the VM joins at the end of its own
+install. Opt into request inspection the same way (`WASP_APPSEC=light`,
+plus `WASP_APPSEC_KEY` for a VM on a central LAPI), and only on VMs sized
+for it (2 GB / 2 vCPU). Then watch the Hive's AppSec memory and watchdog
+restarts for the first week.
+
+**Every VM reports every Monday.** The weekly security report is sent whether
+or not anything was found, so with a fleet the check is the inbox: one report
+per VM, and **ATTENTION** in the subject of any that needs you. A VM with no
+Monday report has stopped scanning or stopped sending; start with
+`wp-notify.sh --test` on it. Prove it on a new VM before handover:
+`doas wp-vuln-cron.sh --digest`.
+
+**Importing a site is one command.** Copy the backup into
+`/var/lib/wasp-import/incoming/` (for UpdraftPlus, every file it produced) and
+run `doas wp-import.sh restore`. The archives and the staging copy are deleted
+once the site is live; anything abandoned goes after 30 days.
+
+**Infected sites clean themselves on the way in.** `apply` keeps renamed and
+obfuscated PHP out of the import, reinstalls any wordpress.org plugin whose
+files were modified, and locks planted administrator accounts — then prints
+what it did, and what it left "for a human": commercial plugins, themes, and
+anything it was not sure enough to touch. For a batch of sites, that list is
+the work. `--no-remediate` imports as-is when you need to see the site exactly
+as it arrived.
+
+**Read the names, not just the counts.** On the first real compromised import
+the malware was a `mu-plugins/<name>.php.bak` that a previous cleaner had
+disarmed by renaming; `inspect` now lists renamed PHP by name, and every one
+deserves to be opened before the quote. The uploads `index.php` files that
+`inspect` counts as directory-index guards are confirmed or contradicted by
+`scan`. And `scan` says which site root it used — in a cPanel export that is
+`<account>/public_html`; if it says it found none, its structural results
+covered nothing.
+
+A second `apply` of the same staging id no longer damages role keys: the
+prefix repair compares keys exactly, so it changes nothing it already fixed.
+
 The gate refuses on CRITICAL without `--force`, and every override is
 recorded with who made it — useful when the client later asks what was known
 at the time.
@@ -210,7 +261,7 @@ scp -O divi.zip admin@vm:/var/lib/wasp-import/incoming/
 #   -O is required: no SFTP subsystem is enabled on the VM.
 #   rsync is only installed when the off-site method is rsync.
 doas wp-plugins.sh install-file /var/lib/wasp-import/incoming/divi.zip --activate
-doas wasp-egress.sh allow .elegantthemes.com
+doas wasp-egress.sh allow .elegantthemes.com --permanent
 ```
 
 Then enter the vendor API key in wp-admin. Without it the theme is frozen at

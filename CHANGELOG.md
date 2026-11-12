@@ -6,6 +6,641 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.14 — UpdraftPlus as one site, one-command restore, clean-up
+
+### UpdraftPlus sets import as one site
+
+An UpdraftPlus backup is a `-db.gz` and several zips (`-plugins`, `-themes`,
+`-uploads`, `-uploads2`…, `-others`). Each zip holds folders from *inside*
+`wp-content`, so no single file is a site. Importing one meant unpacking and
+re-packing by hand, outside every check `wp-import.sh` runs.
+
+- **Any part names the set.** `extract`, `restore` and `inspect` accept any
+  part, or the shared prefix, and take every part with that exact prefix
+  together, into one staging set.
+- **Checked before anything is unpacked.**
+  - Every zip is checked for traversal, absolute paths and links; one hostile
+    part refuses the whole set.
+  - A set without `-db.gz` is refused, and the message names the missing file.
+  - An encrypted database (`-db.gz.crypt`) is refused, with how to decrypt it
+    in UpdraftPlus.
+  - The space check covers the whole set.
+- **Unpacking.** Parts are unpacked with `unzip -n`, so none can overwrite
+  another. All uploads parts are merged. `-wpcore` and `-more` are skipped,
+  and the output says so.
+- **`list` and `inspect`** show which parts are present and which are missing.
+
+### `wp-import.sh restore`: the whole import in one command
+
+`restore` runs `extract → scan → apply`, stopping only where a person has to
+decide.
+
+- **Choosing the backup.** With nothing named, it takes the one backup in the
+  inbox (an UpdraftPlus set counts as one). With two or more there, it lists
+  them and asks which.
+- **HIGH findings.** At a terminal it asks whether to proceed with them
+  recorded as accepted; unattended, it stops and says how to continue.
+- **CRITICAL findings** need a deliberate `--force`, as before.
+- **Options passed through:** `--accept-findings`, `--force`,
+  `--no-remediate`, `--keep-files`.
+- **Menu:** Import → 6. Import → 7 lists the inbox, with UpdraftPlus sets
+  shown as one backup.
+
+### Clean-up of what an import leaves behind
+
+The archives in the inbox and the unpacked staging set are a second and third
+copy of a client's site and database.
+
+- **After a successful import,** `apply` deletes the staging copy and the
+  archives it was made from, recorded at extract in `meta/sources.txt`. It
+  keeps `quarantined/` and `meta/` as evidence. `--keep-files` keeps
+  everything.
+- **`wp-import.sh clean <id>`** does it later. A set that was never imported
+  is removed whole, with its archives.
+- **`clean --all`** clears every staging set and the inbox, after a typed
+  confirmation or `--yes`.
+- **`clean --stale <days>`** is run daily by cron at 30 days, and logged to
+  syslog as `wp-import`.
+- **Menu:** Import → 8.
+- **Only files inside the inbox are ever deleted,** and only those a set
+  recorded as its sources; a source list pointing elsewhere is ignored.
+
+### Tests
+
+- **`test/test-updraft-import.sh`, 21 checks, under BusyBox too.**
+  - A realistic set: database, plugins, themes, two uploads parts, others,
+    wpcore.
+  - The whole set from one part or from the prefix.
+  - Refusals: no database, an encrypted database, one hostile part.
+  - `restore` choosing the backup or refusing to guess, then importing.
+  - Clean-up after import and with `--keep-files`.
+  - A source outside the inbox, an abandoned set, `clean --stale`, and
+    `clean --all` with no one to confirm.
+
+## 10.13 — AppSec (light), the Hive from install.sh, and the path to it
+
+### CrowdSec AppSec: optional request inspection, light ruleset
+
+CrowdSec on WASP reads logs: it bans after an attempt. AppSec checks each PHP
+request, body included, *before* WordPress runs, and refuses a match with a 403.
+
+- **Off by default.** Offered at install (preset `WASP_APPSEC=light`) or with
+  `wasp-appsec.sh on`. Menu: Security → 27 (status), 28 (on), 29 (off).
+- **Light ruleset.** In-band virtual patches and generic rules only. No OWASP
+  CRS, in band or out of band.
+- **Memory warning.** Shown at install, in the menu card, in the tool and in
+  the README. CrowdSec 1.8.x has an open report of AppSec memory growing
+  without bound under load (crowdsecurity/crowdsec#4797; fix milestoned for
+  1.8.3).
+  - CrowdSec keeps its 512 MB cap.
+  - A new watchdog (cron, every 5 minutes) restarts it at 448 MB, logs why,
+    and reports each restart to the Hive.
+  - Recommended VM size for AppSec: 2 GB / 2 vCPU. The installer says so if
+    the VM is smaller.
+- **The forwarder.** `payload/php-conf/wasp-appsec.php`, loaded with
+  `auto_prepend_file`, implements CrowdSec's AppSec protocol.
+  - It drops any `X-Crowdsec-Appsec-*` header a client sends, so a client
+    cannot choose the address that is judged.
+  - It never uses the container's proxy.
+  - The body is forwarded up to 128 KiB. Multipart fields are forwarded
+    without the files.
+  - Fail-open by default; `--fail-closed` gives 503 instead.
+  - Failures are logged once a minute.
+- **One firewall rule.** The listener (port 7422 in the CrowdSec container)
+  is reachable from the WordPress container only, by one firewall rule.
+- **API key.** Made locally, or, on a VM reporting to a central LAPI, made
+  there and given with `--key-file` (or pasted at install).
+- **Rolls itself back.** If the listener does not come up or refuses the
+  key, everything is undone.
+- **`wasp-appsec.sh test`** proves that a clean request is allowed and that
+  CrowdSec's test request is blocked, by the engine and through the site.
+- **The mounts.** The forwarder and its `.ini` are mounted into every
+  WordPress container from install. They are in `WP_EXTRA_VOLS`, so every
+  path that recreates the container keeps them. On an existing VM,
+  `wasp-appsec.sh on` adds them and recreates the container once.
+
+**Found while doing this: AppSec was claimed and inert.** Every VM installed
+the `crowdsecurity/appsec-wordpress` collection, and the install banner listed
+"appsec-wp" among the active layers. Nothing ever configured an AppSec
+listener or sent a request to one, so those rules inspected nothing. Fixed:
+
+- **Install banner.** It now says "logs" or "logs + AppSec request
+  inspection".
+- **README.** The feature list says what runs.
+- **Compliance notes.** Two Hive compliance notes credited AppSec. CIS 13.10
+  and PCI 6.4.2 now score **partial** without AppSec and **pass** with it
+  (new evidence check `appsec_inline`).
+
+### install.sh builds a WASP Hive, and joins a VM to one
+
+- **Role choice.** The installer's first question is now what to build: a
+  WASP WordPress VM, or a WASP Hive (preset `WASP_ROLE=hive`).
+  - **Questions.** The Hive takes the shared VM, disk, network and SSH-key
+    questions (key-only SSH is required), plus three more: dashboard CIDRs,
+    WASP VM network CIDRs, and the certificate name.
+  - **Firewall.** It builds a 1 vCPU / 1 GB / 8 GB Alpine VM with the Hive's
+    own ruleset from the first boot: 443 redirected to 8443, the service
+    limited to the dashboard and VM networks, SSH limited.
+  - **First boot.** It stages `hive/` with `install.sh` and the signed
+    manifest. On first boot `install-hive.sh` verifies the signature again
+    and installs. The launcher removes itself only after a successful
+    install.
+  - **Unsigned releases.** An unsigned release is installed `--unverified`,
+    and the operator is told so.
+- **`install-hive.sh` options.** New `--ssh-cidr`, `--dashboard-cidr`,
+  `--ingest-cidr` (comma-separated lists) and `--pubkey`. With both a
+  dashboard and an ingest list, the service port is closed to everything else
+  at the firewall as well as in the service. All arguments are validated
+  before anything is touched.
+- **Joining at install.** A WordPress VM install asks for the line
+  `hive-admin enroll` prints (preset `WASP_HIVE_ENROLL`). It joins as the
+  last step of the install, and the line, which holds the token, is then
+  removed from `vars.sh`.
+
+### The path from a VM to its Hive, in the egress menu
+
+`wasp-egress.sh hive set | test | status | refresh | remove`. Menu: Security
+→ 25 (address) and 26 (test).
+
+- **One rule, only when needed.** The report leaves from the VM host, not
+  WordPress, so Squid is not involved. A Hive on 443 needs nothing; on
+  another port, under `RESTRICT_EGRESS=1`, exactly one rule is added, to that
+  address and port.
+- **Names are pinned.** A name is resolved once and its address recorded.
+  The reporter connects to that address (`curl --resolve`) and never through
+  a proxy (`--noproxy '*'`).
+- **`hive test`** shows the key the Hive presents and whether it matches the
+  enrolled pin.
+- **`wasp-fw-rule.sh` (new).** It holds the named runtime rules (`wasp:hive`,
+  `wasp:appsec`):
+  - applied live and persisted in `/etc/wp-install/wasp-rules.nft`, included
+    from new installs and added to existing ones on first use;
+  - checked with `nft -c` before they are kept;
+  - output rules for management and mail ports are refused.
+
+### Tests
+
+- **`test/test-appsec.sh`, 39 checks, runs under BusyBox too.**
+  - The real forwarder against a stand-in AppSec listener: the protocol,
+    bodies, spoofing, blocking, fail-open and fail-closed, the timeout, proxy
+    variables, max_body, and log throttling.
+  - `wasp-fw-rule.sh`.
+  - The watchdog across every unit podman prints.
+  - Rollback on a refused key.
+- **`test/test-hive-role.sh`, 18 checks.** The installer's Hive role, host
+  side.
+- **`test/test-hive-report.sh`** adds the egress path and `--resolve`.
+- **`test/test-hive.py`** adds AppSec evidence and state.
+
+**Not yet run live:**
+
+- AppSec against a real CrowdSec engine. The rule names and the light
+  configuration are checked by `wasp-appsec.sh test` on the first real VM.
+- The upstream-LAPI key path.
+- install.sh's Hive role on a real Proxmox host.
+
+## 10.12 — WASP Hive, the fleet console
+
+### WASP Hive
+
+A read-only web console for an MSP with many WASP VMs. It runs on its own small
+Alpine VM. Everything about it is in [docs/HIVE.md](docs/HIVE.md).
+
+- **Fleet page.** One tile per VM with its state (critical, warning, stale or
+  healthy), vulnerabilities by severity, malware, integrity, CrowdSec bans and
+  alerts, and a compliance score per framework. Filter by client.
+- **VM page.**
+  - Health and versions.
+  - Each known vulnerability, with its CVE.
+  - Malware findings.
+  - Tooling and core/plugin integrity.
+  - CrowdSec mode, LAPI, bouncer and top scenarios.
+  - Backups, egress open right now, and the controls switched on.
+  - 30-day trends.
+  - The Wazuh view, when configured.
+- **Compliance page.** One framework across the fleet, controls down and VMs
+  across, for CIS Controls v8, PCI DSS 4.0, the HIPAA Security Rule, SOC 2 and
+  NIST CSF 2.0. 94 controls are mapped onto 27 evidence checks. Rows a VM
+  cannot evidence are marked **operator** and rows that do not apply are
+  marked **exempt**, each with its reason. WASP's deliberate deviations carry
+  a note on the control they affect: no unattended plugin updates, an
+  unencrypted VM disk, 14-day local logs. The page states that this is
+  evidence mapping, not certification.
+- **Wazuh, optional and read-only.** Agent status, recent file-integrity
+  events and SCA results per VM, read from the manager's API with its
+  certificate pinned before the password is sent. The central-logging
+  controls pass only on the manager's word: a VM cannot claim them.
+
+**How it is built not to become the fleet's weakest point**
+
+- **Push, not pull.** A VM sends its report every 15 minutes
+  (`wasp-hive-report.sh`, from cron once enrolled). The Hive never connects
+  to a VM and holds no credential that could.
+- **One token per VM, with one power.** The token can only replace that VM's
+  own report. It is stored on the Hive as a hash, and the node is taken from
+  the token, never from the report body. On the VM it is passed to curl in a
+  header file, never in argv.
+- **Pinned TLS.** The Hive's key is pinned on each VM at enrollment, with no
+  CA involved. A changed key means reports are withheld, and that is logged
+  as a pin mismatch rather than as a network error.
+- **The dashboard.**
+  - Sign-in needs a password (PBKDF2, 600k iterations) and a TOTP code, which
+    cannot be replayed. Five failures in 15 minutes lock that address out.
+  - The cookie is `HttpOnly; Secure; SameSite=Strict`.
+  - A strict CSP with no inline script, plus a same-origin check on every
+    POST.
+  - Every value is rendered as text.
+  - It has no write path: all changes go through `hive-admin` on the console.
+- **Python standard library only.** No pip, npm or CDN.
+- **Signed install.** `install-hive.sh` verifies the release signature and
+  the `hive/` files against the signed manifest before installing.
+
+### On every WASP VM
+
+- **`wasp-hive-report.sh`.**
+  - Commands: `enroll`, `send`, `show`, `status` and `leave`.
+  - Menu: Security → 23 (status) and 24 (join a Hive).
+  - It runs no scan. It reads what the scheduled jobs recorded.
+- **The daily vulnerability scan saves its report**
+  (`/var/cache/wp-vulns/last-report.txt`, 0600) so the Hive can show each
+  finding.
+- **`wp-plugins.sh verify` records when it last ran and what it found**
+  (`.last-verify`). The existing Monday 04:30 run therefore supplies the
+  Hive's core/plugin integrity evidence, which is never more than a week old.
+- **`WASP_RELEASE` is now written to `/etc/wp-install/vars.sh`**, so a VM can
+  say which release it runs.
+
+### The manifest covers `hive/`
+
+`MANIFEST.sha256` is now built from `install.sh`, `lib/`, `payload/` **and
+`hive/`**:
+
+- `test/check-manifest-coverage.py` checks all four;
+- the recipe in [docs/SIGNING.md](docs/SIGNING.md) builds from all four;
+- `install-hive.sh` refuses a release whose manifest does not list
+  `hive/hive_server.py`.
+
+### Found and fixed while building it
+
+- The reporter's vulnerability parser used a bracket expression that BusyBox
+  awk does not support, so on Alpine every severity arrived as `[HIGH]`
+  instead of `HIGH`. The new BusyBox run of `test-hive-report.sh` caught it.
+- A refused POST (a wrong token, or a cross-origin login) was answered
+  without reading the request body. Closing a TLS socket with unread input
+  sends a reset, so the client saw "connection reset" instead of the 401. The
+  server now drains the body first.
+
+### Tests
+
+- **`test/test-hive.py`.**
+  - Crypto: the RFC 6238 TOTP vector, replay and window, and passwords.
+  - The compliance engine. Every check field must exist in a report, and
+    every exemption needs a reason.
+  - Node states.
+  - The HTTP layer, against a live server: ingest limits, sessions,
+    throttling, the same-origin check, security headers, and a client that
+    stalls the TLS handshake.
+  - The Wazuh connector, against a stand-in manager, including a wrong pin
+    sending no password.
+- **`test/test-hive-report.sh`.**
+  - The real reporter against the real server over pinned TLS.
+  - A re-keyed Hive, token rotation, and one VM posing as another.
+  - A VM claiming Hive-side evidence.
+  - The token never appearing on a command line.
+  - Every compliance field present in a real report.
+  - Runs under BusyBox too.
+
+**Not yet run live:** `install-hive.sh` on a real Alpine VM (its parts were
+each checked), and the Wazuh connector against a real manager.
+
+## 10.11 — the first real import
+
+Fixes from the first import of a real, compromised production site with 10.10: a
+cPanel account archive of about 3 GB, holding a WordPress site that had been
+backdoored for over two years. The import succeeded. Two findings were false alarms
+reported at full confidence, one check could destroy every user's role, and the one
+real piece of malware was reported by nothing. Each fix below has a fixture that
+fails against 10.10 (`test/test-import-findings.sh`, plus new assertions in
+`test/test-wpress-import.sh`), and all of it runs under BusyBox as well.
+
+### The prefix repair could rename a key twice (reproduced on MariaDB 10.11)
+
+After an import, `apply` renames option and user-meta keys from the source prefix to
+this VM's prefix, then counts any left behind. Both statements matched with
+`LIKE 0x<hex of "wp_%">`, and in `LIKE` the `_` matches any single character. So the
+pattern `wp_%` also matches this VM's own `wp5c1e9a_…`. The count reported correctly
+renamed keys as stranded ("Users will have no roles" about users who had them).
+Worse, the `UPDATE` matched them too: a second `apply` wrote back
+`wp5c1e9a_c1e9a_capabilities`, which strips every role from every user and prints
+the same count either way. Every prefix this installer generates has the exposed
+shape.
+
+The predicate is now `LEFT(col, n) = 0x<hex>`: an exact byte comparison, with no
+wildcard. Once a run succeeds nothing starts with the source prefix, so running it
+again changes nothing. Checked on a real MariaDB: 10.10 mangled keys on the first
+run and again on the second, and 10.11 leaves them correct on both.
+
+### `scan` checked the wrong directory on a nested archive
+
+`scan` handed the top of the staging tree to `wp-malware-scan.sh`. A cPanel archive
+puts the site at `<account>/public_html/`, so every structural check looked for a
+`wp-content` that was not there and printed `[ok]`. "No PHP files in
+wp-content/uploads" meant "no wp-content/uploads here". `scan` now finds the site
+root the same way `apply` does (shared as `_site_root`), says which one it used,
+and warns when there is none. The scanner says when its target has no `wp-content`
+rather than passing every check.
+
+### `inspect` cried wolf and missed the malware
+
+- **Directory-index guards.** Plugins put an `index.php` holding
+  `<?php // Silence is golden.` in each uploads subdirectory to stop directory
+  listing. Six of these were reported as "the single strongest indicator that the
+  source site was compromised". `inspect` sees only names, so it now counts
+  `index.php` in uploads separately and leaves the verdict to `scan`, which now
+  decides by content: a guard has nothing else in it and is at most 256 bytes. An
+  `index.php` with anything more in it is still CRITICAL. Any other PHP in uploads
+  is reported exactly as before, now with its name.
+- **Duplicator.** This was a suffix match on `installer.php`, which hit Composer's
+  `…/Installers/*Installer.php` and about a hundred similar files. A Duplicator
+  package is now an exact `installer.php` next to its `*archive.zip` or `.daf`, or
+  the `dup-installer/` directory. An `installer.php` without one is a note.
+- **Renamed PHP (new).** The malware was `mu-plugins/<name>.php.bak`: someone had
+  found it and disarmed it by renaming it, which is what you do to a file you are
+  afraid of. `inspect` now lists PHP renamed so it no longer runs: `.php.bak`,
+  `.old`, `.orig`, `.disabled`, `.suspected`, `.quarantine`, `.txt`, `~` and similar.
+  Renamed copies of `wp-config.php` are counted apart, as the old host's database
+  password.
+- **mu-plugins.** The count included the directory entry itself, and the message
+  said "active on arrival" about a `.php.bak`. It now counts files, and names as
+  loading on arrival only the top-level `*.php` that WordPress actually loads.
+
+### Extract and apply
+
+- **A plugin's own `installer.php` was deleted at extract.** The Duplicator
+  removal matched the name anywhere in the tree, so a plugin shipping
+  `includes/installer.php` arrived broken. Removal now covers only files outside
+  `wp-content`, which is where Duplicator puts its installer. It also removes
+  `dup-installer/`.
+- **Quarantined uploads lost files.** PHP from uploads was moved into one flat
+  directory, so six `*/index.php` became one, and two webshells with the same name
+  became one piece of evidence. Relative paths are now kept.
+
+### Building with an upstream CrowdSec LAPI and restricted egress
+
+With egress restricted, port 8080 was not open, and that is where nearly every
+CrowdSec LAPI listens. The agent-only install then waited about fifteen minutes and
+warned about loopback bindings and credentials, when the cause was this VM's own
+firewall. In upstream mode the LAPI's host and port are now allowed in the
+generated ruleset, to that address only. If the LAPI is given by hostname, its port
+goes into `egress-extra.nft`, exactly as `wp-hardening.sh egress-allow` would put it,
+and the install says the rule could not be narrowed. Ports 80 and 443 need nothing.
+
+`wp-hardening.sh cs-lapi`, for a LAPI added or moved after install, now checks this
+VM's egress filter *before* it removes the running agent. If the LAPI's port is
+closed it changes nothing and names the `egress-allow` command; opening a way out
+stays the operator's decision. Its failure hint printed a literal `${host} 8080`
+and now prints the LAPI's real host and port. `egress-list` shows the installer's
+LAPI rule (tagged `wasp-lapi` in the ruleset).
+
+### The proxy snippet did not survive copy and paste
+
+`wp-hardening.sh nginx-snippet` printed `\$host`, `\$remote_addr` and `\"…\"`: the
+lines were single-quoted `printf` formats, which keep the backslash. nginx reads
+`\$host` as a literal string, so `Host` reached the VM with a backslash in front of
+it. Stock nginx 1.24 refuses the `add_header` lines outright. All twenty lines are
+fixed, and the output passes `nginx -t` and forwards the right `Host`.
+`check-printf-escapes.py` stops it coming back.
+
+Section 2 now gives the right `http_top.conf` path for both proxies, and a command
+to confirm the zone was loaded. NPMplus reads `/opt/npmplus/custom_nginx/` on the
+host (`/data/custom_nginx/` in the container), and it migrates
+`/data/nginx/custom/` once and then deletes it, so a file put there later is never
+read. The README had the same wrong path.
+
+### Smaller
+
+- Every `cscli machines add` hint now ends in `-f /dev/null`. Without it, on a
+  LAPI host that already has credentials, cscli refuses with "credentials file
+  already exists". `--force` would overwrite that host's own login.
+- Stage 05 warned "logrotate config validation reported:" on every install, because
+  `logrotate --debug` narrates on stderr. Only `error:` lines count now.
+- `test-fail-closed.sh` extracted the remoteip block with `\$\(` in an `awk -v`
+  pattern. gawk processes that escape and then fails on an unmatched `(`; mawk and
+  BusyBox awk did not, so the suite passed or failed depending on which `awk` the
+  host had. Bracket expressions now, which mean the same thing to all three.
+- New cases in `test-fail-closed.sh`: the installer's LAPI rule (an IP gets a
+  host-and-port rule, a name gets its port, 80/443, local mode and unrestricted
+  egress get nothing), and `cs-lapi` refusing before it removes anything when the
+  port is closed — which fails on 10.10 — and staying quiet in the four cases where
+  the LAPI is reachable.
+
+### Automated remediation
+
+The field test found the malware by hand. This release finds that shape by itself
+and cleans it up, on import and on demand on a live site.
+
+**Detection, shared.** The new `wasp-threats.sh` holds the patterns, so the
+importer, the daily scan and the clean-up cannot disagree about them. It is
+read-only and also usable by hand.
+
+- **Renamed PHP** — `.php.bak`, `.orig`, `.suspected` and so on. The scanner now
+  reports these as HIGH, by name. Before, only `inspect` listed them.
+- **Escape-obfuscated PHP** — a file where at least 64 escape sequences, in runs,
+  make up at least 20% of the file. It is CRITICAL outside plugins and themes and
+  HIGH inside them. YARA has the same rule, `wpvm_escape_density`, for the weekly
+  scan.
+  - The threshold was measured on about 21,000 real PHP files: WordPress core,
+    WooCommerce, Yoast SEO, Elementor, Jetpack, PhpSpreadsheet, TCPDF, phpseclib
+    and wp-cli. The densest legitimate file was phpseclib's DES table, at 14%. A
+    stand-in built like the injector scored 48%.
+  - Only escapes in runs count. Counting every escape flagged WordPress core's
+    own HTML5 entity table, whose content is a quarter isolated `\x00`
+    separators.
+- **Foreign mu-plugins** — top-level PHP in `mu-plugins` that WASP did not
+  install. These are SUSPECT, or CRITICAL if obfuscated. That closes "scan does
+  not look at mu-plugins".
+- **Planted accounts** — four signals, any two of which flag an account:
+  - registered at exactly `00:00:00`;
+  - a registration date that runs backwards against the ID;
+  - a `wpadmin<random>`-style login;
+  - a role stripped to `a:0:{}`.
+
+  The dump scan now reads the users table as text and names every administrator
+  and every suspect account. It used to say "17 row(s) mention administrator".
+  The live database scan does the same. A customer import with midnight dates
+  in ID order shows one signal per account and is not flagged.
+- **cPanel account exports** are named at `inspect` instead of "unknown". Their
+  shell history is surfaced at `extract`: the WordPress-related lines are
+  printed, filtered because a command line can hold a password, and a root-only
+  copy is kept.
+
+**Remediation.** `wp-malware-scan.sh remediate` shows a plan. With `--apply` it
+does the following:
+
+- It quarantines the planted files with their paths: PHP in uploads that is not a
+  directory-index guard, renamed PHP, obfuscated PHP outside plugins and themes,
+  handler overrides in uploads, and renamed `wp-config.php` copies.
+- It reinstalls every wordpress.org plugin whose files differ from the published
+  copy (`wp-plugins.sh repair-modified`). The modified copy is moved aside first,
+  so an added backdoor file cannot survive. If no clean copy arrives, the
+  original goes back.
+- It locks planted accounts instead of deleting them (`wp-plugins.sh lock-user`):
+  every role is removed, the password replaced, sessions ended, and the e-mail
+  changed so a reset link goes nowhere. What the account was is recorded on it,
+  and `unlock-user` reverses the lock.
+  - Only administrators and role-stripped accounts are locked, and never more
+    than five at once. Anything else is listed "for a human".
+
+`wp-import.sh apply` runs remediation with `--apply --yes` after every import.
+Renamed and obfuscated files are also kept out before the copy. `--no-remediate`
+skips both. On a live site nothing changes without `--apply`, and the daily scan
+still only reports.
+
+The test is `test/test-threats.sh`, with 50 cases. It also runs under BusyBox.
+`test-import-findings.sh` grew to 28 cases.
+
+### Egress: nothing temporary outlives an hour
+
+- **`wasp-egress allow <domain>` is now temporary by default.** An entry opens
+  for 60 minutes, or `--for N` minutes up to 60, and then closes by itself.
+  `--permanent` keeps the old behaviour and is meant for theme and builder
+  vendors. The permanent list should hold WordPress.org, what WASP needs, and
+  those vendors. The CrowdSec LAPI is reached from the host, not through this
+  list.
+- **`wasp-egress fileshare open <service>`** opens Dropbox, Google Drive,
+  OneDrive, WeTransfer, Box or SyncedTool for at most an hour. Each service is
+  the full set of hosts its downloads redirect through.
+  - `wp-import.sh fetch url` opens the right service by itself for its download
+    and closes it afterwards. It uses its own tag, so it never closes something
+    an operator opened.
+- **The installer no longer asks about `activeit.syncedtool.com`.** It is the
+  `syncedtool` service.
+- **`wasp-egress temporary`** lists what is open and for how long.
+  **`wasp-egress close <domain> | --all`** closes it now. There are three new
+  menu entries and help cards.
+- Maintenance windows are capped at 60 minutes instead of 120. A 10.10 window
+  is carried over on upgrade and capped.
+
+**Found while building it: a window did not close on time.** Expiry was checked
+only when `wasp-egress` next ran. No cron job ran it, so a window that nobody
+looked at again stayed open in Squid indefinitely, while its own message said
+"Closes automatically. Nothing needs to remember to close it." Cron now runs
+`wasp-egress expire` every minute. When nothing has expired, it touches nothing.
+
+**Also found: `allow .com` was accepted.** The "too broad" check listed `.com`,
+`.net`, `.org` and `.io` in the branch that skipped the check. A one-word typo
+would have allowed every `.com` domain. These are now refused, along with any
+other wildcard over a single label.
+
+`test/test-egress-temporary.sh` has 49 cases, also run under BusyBox.
+
+### Vulnerability scanning: both sources, scheduled, and the e-mail actually sent
+
+**Alerts were not being sent (found while checking "sent out").**
+`wp-notify.sh`, which every scheduled job reports through, built msmtp's
+`--passwordeval` command for the old `smtp.php` line (`'pass' => '…'`). The relay
+settings have lived in `smtp.ini` (`pass_b64 = …`) since that file replaced it, so
+the command printed nothing and msmtp authenticated with an empty password. Every
+alert failed: vulnerability findings, CRITICAL malware, backup failures. The
+failure went to syslog as `SEND FAILED`, and the jobs that send exit 0 either way,
+so nothing looked wrong.
+
+- The password is now read from whichever file `_cfg` reads, decoded the same
+  way.
+- A VM still on `smtp.php` used to count as "not configured" and sent nothing at
+  all. It now sends.
+- If the shell does not set `HOSTNAME`, the subject now falls back to the
+  system's hostname. BusyBox ash on the VMs already set it.
+- `test/test-notify.sh` (9 cases) stubs msmtp to run the real password command,
+  as msmtp would, against an `smtp.ini` written the way the installer writes it.
+  It fails against 10.10.
+
+**On a VM already running, update `wp-notify.sh` and then run
+`wp-notify.sh --test`.**
+
+**WPVulnerability, checked against the provider's own client.** Its open-source
+client decides which entries apply, in `wpvulnerability_is_vulnerability_applicable`
+and `wpvulnerability_get_vulnerabilities`. Our reading was compared with that code:
+
+- **An entry with no version bounds does not apply** for a plugin, theme, PHP or
+  MariaDB. We treated it as applying to every version, and so reported entries
+  the provider itself would not. Core is the exception, because its endpoint is
+  per version.
+- **A refusal is retried.** A 429, a timeout or a 5xx gets three tries. The wait
+  is `Retry-After` when the server sends it, read case-insensitively because
+  HTTP/2 sends header names in lower case; otherwise 5 seconds, then 15. Waits
+  are capped at 60 seconds. Only a 429 that survives every try stops the run
+  asking. One refusal used to make the whole unattended daily scan INCOMPLETE.
+  That was the last item open from the field test.
+- Severity `n` (none) now maps to LOW rather than MEDIUM.
+
+With a Wordfence token, both sources run on every scan, and a CVE reported by
+both is printed once. Either source on its own is still a complete scan.
+
+**A weekly report that is always sent.** `wp-vuln-cron.sh --digest` runs from
+cron every Monday at 07:15 UTC. It contains:
+
+- a fresh vulnerability check and the sources it used;
+- when the daily vulnerability scan last ran, and whether it completed;
+- the last malware scan's result;
+- what egress is open temporarily.
+
+The daily jobs stay silent on a clean day. That silence also looks exactly like
+a VM whose scans or mail have stopped, so the Monday report is the fleet check.
+Its subject says ATTENTION when:
+
+- a daily scan has not run for 48 hours,
+- a scan is incomplete, or
+- there is a CRITICAL malware finding.
+
+The report's own scan restores the daily scan's record afterwards, so it cannot
+pose as a daily run that never happened. Menu: Security → 22 sends it now.
+
+The schedule, unchanged except for the new report:
+
+| When (UTC) | Job |
+|---|---|
+| daily 06:30 | Vulnerability scan |
+| daily 03:30 | Malware quick scan |
+| Sunday 03:45 | YARA |
+| Monday 07:15 | Weekly report |
+
+`test-vuln-scan.sh` grew from 44 to 70 cases, covering retry and back-off, the
+range rules, the weekly report and the schedule. It also runs under BusyBox.
+
+### Repository and documentation
+
+- `tools/PENTEST.md` and `tools/wasp-pentest.sh` are gone from the tree. The
+  harness moved to its own project in 10.5 and this file said so, but a web upload
+  never deletes, so both were still on `main`.
+- `docs/SIGNING.md` described `tools/wasp-sign-release.sh`, which no longer ships.
+  It now gives the same steps as plain `minisign` and `sha256sum`, including the
+  exact manifest recipe, how to read the embedded key out of `install.sh`, and
+  what a web upload means for a signed release: the new `.minisig` goes up in the
+  same commit as the files, and removals are done by hand.
+- README: what `inspect` reports and why; `scan`'s site root; the exact prefix
+  comparison; the guard rule in the scanner; the LAPI egress rule and the
+  `cs-lapi` pre-check; a note to regenerate any proxy snippet made by 10.10 or
+  earlier; the correct `http_top.conf` paths; changelog highlights for 10.5–10.11,
+  which stopped at 10.4; and a "not yet addressed" line that still said host
+  egress could not be restricted.
+- `ARCHITECTURE.md` §7: the flow now shows the site-root step, and a new §7.3 sets
+  out what `inspect` and `scan` are allowed to conclude from what they can see.
+- `docs/IMPORT-DESIGN.md` no longer ends "Nothing here is implemented yet", and
+  records the guard, renamed-PHP, Duplicator and cPanel lessons.
+- `TODO.md` lists what the first real import found and did not fix: no
+  mu-plugins check in `scan`, no YARA rule for escape density, administrators
+  counted rather than named, cPanel exports not identified, and WPVulnerability
+  giving up after one refusal.
+- README, `ARCHITECTURE.md` §7.4, `INCIDENT-PLAYBOOK.md`, `MSP-RUNBOOK.md`,
+  `SUPPORT-RUNBOOK.md`, `docs/IMPORT-FETCH.md` and `TODO.md` cover automated
+  remediation and time-boxed egress. All five "still open" import items are
+  closed in TODO.
+- Runbooks: `MSP-RUNBOOK.md` (read the names, not only the counts),
+  `SUPPORT-RUNBOOK.md` (imported users with no roles), `INCIDENT-PLAYBOOK.md`
+  (a pasted snippet that fails `nginx -t`), `docs/IMPORT-FETCH.md` (the LAPI rule),
+  `docs/VALIDATION.md` and `test/README.md` (the new checks).
+
 ## 10.10 — the code review
 
 Everything found in the review of 10.9, plus what turned up while fixing it. Each

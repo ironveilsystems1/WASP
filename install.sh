@@ -179,9 +179,9 @@ fi
 # that is silently wrong is worse than one that carries less information.
 #
 # If a build stamp is wanted again later, generate it rather than typing it.
-WASP_RELEASE="10.10"
-WASP_VERSION="10.10"
-WASP_VERSION_NOTE="Vulnerability scans report failure instead of silence; WPVulnerability on by default; staged plugins checked before import; time-boxed import sources"
+WASP_RELEASE="10.14"
+WASP_VERSION="10.14"
+WASP_VERSION_NOTE="UpdraftPlus backups import as one site; wp-import.sh restore runs the whole import in one command and cleans up the archives and staging copy afterwards. 10.13: Optional CrowdSec AppSec request inspection (light ruleset, memory watchdog); install.sh builds a WASP Hive and joins VMs to one; the egress path to the Hive from the menu. 10.12: WASP Hive: a read-only fleet console that VMs push signed-in reports to over pinned TLS, with vulnerability, malware, integrity, CrowdSec and backup state per VM, optional Wazuh, and compliance evidence mapped to CIS v8, PCI DSS 4.0, HIPAA, SOC 2 and NIST CSF 2.0"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
