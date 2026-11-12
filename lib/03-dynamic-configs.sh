@@ -5,6 +5,52 @@
 # depends on variables and functions (msg_*, TMPDIR, REPO_DIR, MNT, etc.)
 # that install.sh and earlier lib files set up.
 
+# ── WASP Hive: its own, much smaller ruleset, then nothing else here ───────
+# The same ruleset hive/install-hive.sh writes on first boot, so the VM is
+# protected from its first packet, not from the end of its first boot.
+# 443 is redirected to the unprivileged service on 8443. The service port is
+# limited to the dashboard and WASP VM networks when both are known; the
+# service also checks both itself (DASHBOARD_CIDRS / INGEST_CIDRS).
+if [[ "${WASP_ROLE:-wordpress}" == "hive" ]]; then
+  if [[ -n "$SSH_CIDR" ]]; then _HSSH="ip saddr { ${SSH_CIDR} } tcp dport 22 accept"
+  else _HSSH="tcp dport 22 accept"; fi
+  if [[ -n "${HIVE_DASHBOARD_CIDR:-}" && -n "${HIVE_INGEST_CIDR:-}" ]]; then
+    _HWEB="ip saddr { ${HIVE_DASHBOARD_CIDR}, ${HIVE_INGEST_CIDR} } tcp dport 8443 accept"
+  else
+    _HWEB="tcp dport 8443 accept"
+  fi
+  NFT_CONF=$(cat <<HIVENFT
+#!/usr/sbin/nft -f
+# WASP Hive. Written by install.sh; rewritten identically by install-hive.sh.
+flush ruleset
+
+table inet hive {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    tcp dport 443 redirect to :8443
+  }
+  chain input {
+    type filter hook input priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif lo accept
+    meta l4proto { icmp, ipv6-icmp } accept
+    ${_HSSH}
+    ${_HWEB}
+  }
+  chain forward { type filter hook forward priority filter; policy drop; }
+}
+HIVENFT
+)
+  if [[ "$_HWEB" == ip* ]]; then
+    msg_ok "WASP Hive firewall: SSH from ${SSH_CIDR:-any}; service from the dashboard and WASP VM networks only"
+  else
+    msg_ok "WASP Hive firewall: SSH from ${SSH_CIDR:-any}; service open (it checks addresses itself)"
+  fi
+  unset _HSSH _HWEB
+  return 0
+fi
+
 # WEB_CONTAINER_PORT is what the *filter* chain must match. Rootful Podman
 # always publishes -p 80:80, so this is fixed at 80.
 WEB_CONTAINER_PORT=80
@@ -281,11 +327,41 @@ fi
 # Operator-added ports live in the named sets declared on the table, so
 # `wp-hardening.sh egress-allow 8443` takes effect immediately and survives a
 # reboot, without regenerating or reloading this file.
+# The upstream CrowdSec LAPI. In upstream mode the agent runs with host
+# networking and reports to a LAPI that is almost always on :8080 -- a port
+# this list did not allow. The install then waited fifteen minutes for a LAPI
+# it had firewalled off, and warned about loopback bindings and credentials:
+# the component that failed was not the one named. Allowed here to that one
+# host and port only, not :8080 to everywhere. A hostname cannot go into the
+# ruleset (nft would resolve it once, at load), so then the port is opened
+# the same way `wp-hardening.sh egress-allow` would, and said so.
+EGRESS_LAPI=""
+EGRESS_LAPI_PORT=""
+if [[ "${RESTRICT_EGRESS:-0}" == "1" && "${CS_ENFORCEMENT:-local}" == "upstream" && -n "${CS_LAPI_URL:-}" ]]; then
+  _elh="${CS_LAPI_URL#*://}"; _elh="${_elh%%/*}"
+  _elport="${_elh##*:}"; _elhost="${_elh%%:*}"
+  if [[ "$_elport" == "$_elhost" ]]; then
+    [[ "$CS_LAPI_URL" == https://* ]] && _elport=443 || _elport=80
+  fi
+  if [[ "$_elport" =~ ^[0-9]+$ && "$_elport" != 80 && "$_elport" != 443 ]]; then
+    if [[ "$_elhost" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      EGRESS_LAPI="
+        # Upstream CrowdSec LAPI -- this host and port only.
+        ip daddr ${_elhost} tcp dport ${_elport} accept comment \"wasp-lapi\""
+      msg_ok "Egress: CrowdSec LAPI ${_elhost}:${_elport} allowed"
+    else
+      EGRESS_LAPI_PORT="$_elport"
+      msg_warn "Egress: LAPI '${_elhost}' is a name, so tcp/${_elport} is opened to any host."
+      msg_warn "  An IP address in the LAPI URL would let this be narrowed to that host."
+    fi
+  fi
+fi
+
 if [[ "${RESTRICT_EGRESS:-0}" == "1" ]]; then
   EGRESS_OUTPUT="        # ── Egress restriction ACTIVE (RESTRICT_EGRESS=1) ──
         # The host's own outbound traffic. ct-established and lo were already
         # accepted above, so only genuinely new connections reach here.
-        ip daddr { 10.89.10.0/24, 10.89.20.0/24 } accept
+        ip daddr { 10.89.10.0/24, 10.89.20.0/24 } accept${EGRESS_LAPI}
         udp dport { 53, 67, 68, 123 } accept
         tcp dport { 53, 80, 443 } accept
         tcp dport { 25, 465, 587 } accept

@@ -198,8 +198,24 @@ cat > "$MNT/etc/wp-install/egress-extra.nft" << 'EGRESSEXTRA'
 # Included from /etc/nftables.nft. Do not delete this file — an empty one is
 # valid and expected; a missing one makes the whole ruleset fail to load.
 EGRESSEXTRA
+# An upstream LAPI given by name (see lib/03): opened exactly as
+# `wp-hardening.sh egress-allow <port> tcp` would, so egress-list shows it and
+# egress-deny removes it.
+if [[ -n "${EGRESS_LAPI_PORT:-}" ]]; then
+  printf 'add element inet filter egress_extra_tcp { %s }\n' "$EGRESS_LAPI_PORT" \
+    >> "$MNT/etc/wp-install/egress-extra.nft"
+fi
 chmod 644 "$MNT/etc/wp-install/egress-extra.nft"
 printf '\ninclude "/etc/wp-install/egress-extra.nft"\n' >> "$MNT/etc/nftables.nft"
+# Single named rules WASP tools add after install (wasp-fw-rule.sh): the AppSec
+# listener for the WordPress container, the WASP Hive on a non-443 port.
+# Same rule as above: created empty, because a missing include is fatal.
+cat > "$MNT/etc/wp-install/wasp-rules.nft" << 'WASPRULES'
+# Runtime rules added by WASP tools (wasp-fw-rule.sh). Included from
+# /etc/nftables.nft. Do not delete: empty is valid, missing is fatal.
+WASPRULES
+chmod 644 "$MNT/etc/wp-install/wasp-rules.nft"
+printf 'include "/etc/wp-install/wasp-rules.nft"\n' >> "$MNT/etc/nftables.nft"
 msg_ok "nftables.nft injected (with egress-extra include)"
 
 # ─ Network addressing (DHCP or static) ────────────────────────────────────────

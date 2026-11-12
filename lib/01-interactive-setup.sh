@@ -7,6 +7,37 @@
 
 # ── Interactive setup ─────────────────────────────────────────────────────────
 clear
+# ── What is being built ──────────────────────────────────────────────────────
+# A WASP WordPress VM (everything below), or a WASP Hive: the read-only fleet
+# console the WASP VMs report to (docs/HIVE.md). The Hive takes the same VM,
+# disk, network, SSH-key and firewall questions and none of the WordPress
+# ones, and runs hive/install-hive.sh on first boot. Presettable: WASP_ROLE.
+WASP_ROLE="${WASP_ROLE:-}"
+if [[ -z "$WASP_ROLE" ]]; then
+  echo -e "\n${BLD}  What are you building?${CL}"
+  echo    "    1) A WASP WordPress VM"
+  echo    "    2) A WASP Hive — the fleet console your WASP VMs report to"
+  read -rp "  Choice [1] : " _ROLE
+  case "${_ROLE}" in 2) WASP_ROLE="hive" ;; *) WASP_ROLE="wordpress" ;; esac
+  unset _ROLE
+fi
+[[ "$WASP_ROLE" == "hive" || "$WASP_ROLE" == "wordpress" ]] || msg_error "WASP_ROLE must be wordpress or hive."
+if [[ "$WASP_ROLE" == "hive" ]]; then
+  # A console and a small database: these are the right size, not the
+  # minimum. Change them in Proxmox later if the fleet grows past ~100 VMs.
+  CORES=1; RAM=1024; DISK="8G"
+  clear
+  echo -e "\n${BLD}  WASP Hive — fleet console for WASP VMs${CL}"
+  echo -e "  ${YW}  build ${WASP_VERSION:-unknown}${CL}"
+  echo    "  Alpine (auto) + Python standard library + nftables. No containers."
+  echo    "  ${CORES} CPU · ${RAM} MB · ${DISK}"
+  echo ""
+  echo -e "  ${YW}Read-only. WASP VMs push a report to it every 15 minutes over TLS${CL}"
+  echo -e "  ${YW}pinned to its own key. It never connects to them and holds no${CL}"
+  echo -e "  ${YW}credential that could. Dashboard sign-in: password + authenticator.${CL}"
+  echo ""
+fi
+if [[ "$WASP_ROLE" == "wordpress" ]]; then
 echo -e "\n${BLD}  WASP — WordPress Alpine Security Platform${CL}"
 echo -e "  ${YW}  build ${WASP_VERSION:-unknown}${CL}"
 echo    "  Alpine (auto) + Podman (WordPress + MariaDB) + CrowdSec + nftables"
@@ -124,6 +155,8 @@ echo -e "  ${YW}  Press Enter to begin.${CL}"
 read -r _INTRO_ACK
 unset _INTRO_ACK
 echo ""
+fi   # end of the WordPress-only introduction
+
 # ── Security-reasoning blocks ────────────────────────────────────────────────
 # Several prompts below carry a short "what this does and does not buy you"
 # note. These exist because the failure mode of a security control is rarely
@@ -170,7 +203,11 @@ while [[ -z "$ROOT_PASS" ]]; do
     || echo -e "  ${RD}Passwords do not match.${CL}"
 done
 
-read -rp "  Hostname       [wordpress] : " HN; HN="${HN:-wordpress}"
+if [[ "$WASP_ROLE" == "hive" ]]; then
+  read -rp "  Hostname       [wasp-hive] : " HN; HN="${HN:-wasp-hive}"
+else
+  read -rp "  Hostname       [wordpress] : " HN; HN="${HN:-wordpress}"
+fi
 
 echo ""
 # ── Storage: listed correctly, defaulted to what exists, and validated ───────
@@ -727,8 +764,9 @@ fi
 # Sanitise: lowercase, alnum + underscore/hyphen, must start with a letter
 # (POSIX username rules) — same sanitisation style as WP_ADMIN_SLUG below,
 # plus an explicit leading-character check that a URL slug doesn't need.
-read -rp "  Admin account username [wpadmin] : " ADMIN_USER_RAW
-ADMIN_USER=$(echo "${ADMIN_USER_RAW:-wpadmin}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | sed 's/^-//;s/-$//')
+_ADMIN_DEFAULT="wpadmin"; [[ "$WASP_ROLE" == "hive" ]] && _ADMIN_DEFAULT="hiveadmin"
+read -rp "  Admin account username [${_ADMIN_DEFAULT}] : " ADMIN_USER_RAW
+ADMIN_USER=$(echo "${ADMIN_USER_RAW:-$_ADMIN_DEFAULT}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | sed 's/^-//;s/-$//')
 [[ "$ADMIN_USER" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || ADMIN_USER="wpadmin"
 # Reserved names: root (this whole feature's point), wpuser (already used
 # for file/volume ownership — see wpuser creation later — colliding would
@@ -934,6 +972,60 @@ if [ -n "$_OVL" ]; then
 fi
 unset _OVL _SRC
 SSH_CIDR=$(_ask_cidr "  Restrict SSH (22) to a CIDR?           (blank = any)  : ")
+
+# ── WASP Hive: the rest of its questions, then done ─────────────────────────
+# Everything after this point configures WordPress. The Hive needs three more
+# answers and a confirmation, and returns from here.
+if [[ "$WASP_ROLE" == "hive" ]]; then
+  DEPLOYMENT_PROFILE="production"
+  echo ""
+  echo -e "  ${BLD}Who may open the dashboard?${CL}"
+  echo -e "  ${YW}Your admin network. The dashboard is read-only and needs a password${CL}"
+  echo -e "  ${YW}and an authenticator code, and it shows every client's weak spots:${CL}"
+  echo -e "  ${YW}narrow this to where your staff work from. Blank = the SSH range above.${CL}"
+  HIVE_DASHBOARD_CIDR=$(_ask_cidr "  Dashboard CIDR(s)                       (blank = SSH range) : ")
+  HIVE_DASHBOARD_CIDR="${HIVE_DASHBOARD_CIDR:-$SSH_CIDR}"
+  echo ""
+  echo -e "  ${BLD}Which networks are the WASP VMs on?${CL}"
+  echo -e "  ${YW}Only these may send reports (each still needs its own token).${CL}"
+  echo -e "  ${YW}List every VLAN that holds a WASP VM. Blank = any address.${CL}"
+  HIVE_INGEST_CIDR=$(_ask_cidr "  WASP VM network CIDR(s)                 (blank = any)       : ")
+  echo ""
+  read -rp "  Name for the Hive's certificate [${HN}] : " HIVE_NAME
+  HIVE_NAME=$(printf '%s' "${HIVE_NAME:-$HN}" | tr -cd 'A-Za-z0-9.-')
+  HIVE_NAME="${HIVE_NAME:-$HN}"
+  # Key-only SSH, as for a production WASP VM: this machine sees the fleet.
+  if [[ "$DISABLE_PW_AUTH" != "1" ]]; then
+    msg_warn "A WASP Hive needs key-only SSH. Paste a public key, or a path to one (blank = done)."
+    while [[ "$DISABLE_PW_AUTH" != "1" ]]; do
+      read -rp "  Key or file path : " _HK
+      [[ -z "$_HK" ]] && { [[ "$_ssh_key_count" -gt 0 ]] && break; msg_warn "  At least one key is required."; continue; }
+      if [[ "$_HK" != *" "* && ( "$_HK" == /* || "$_HK" == ~* || "$_HK" == ./* || -f "$_HK" ) ]]; then
+        _load_ssh_key_file "$_HK"
+      else
+        _add_ssh_key "$_HK" "pasted"
+      fi
+    done
+    DISABLE_PW_AUTH=1
+    ADMIN_PASS=$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | head -c 24)
+    unset _HK
+  fi
+  echo ""
+  echo -e "  ${BLD}─── Summary ──────────────────────────────────────${CL}"
+  printf  "  %-18s %s\n"  "Building:"    "WASP Hive (fleet console)"
+  printf  "  %-18s %s\n"  "VM ID:"       "$VMID"
+  printf  "  %-18s %s\n"  "Hostname:"    "$HN"
+  printf  "  %-18s %s CPU · %s MB · %s\n" "Resources:"  "$CORES" "$RAM" "$DISK"
+  printf  "  %-18s %s\n"  "SSH:"         "${ADMIN_USER} — key-only (root SSH disabled), from ${SSH_CIDR:-any}"
+  printf  "  %-18s %s\n"  "Dashboard from:" "${HIVE_DASHBOARD_CIDR:-any}"
+  printf  "  %-18s %s\n"  "Reports from:" "${HIVE_INGEST_CIDR:-any}"
+  printf  "  %-18s %s\n"  "Certificate:"  "${HIVE_NAME} (self-signed; VMs pin its key)"
+  printf  "  %-18s %s\n"  "Network:"     "${NET_MODE}${VM_STATIC_IP:+ ($VM_STATIC_IP/$VM_PREFIX)}"
+  echo ""
+  read -rp "  Proceed? [Y/n] : " yn
+  [[ "${yn:-Y}" =~ ^[Yy] ]] || { echo "Aborted."; _DESTROY_VM=0; exit 0; }
+  return 0
+fi
 
 # ── Asked HERE, not after the wp-admin questions ─────────────────────────────
 # It used to be asked 34 lines later, which meant the operator answered BOTH
@@ -1329,8 +1421,8 @@ if [[ -n "$PROXY_IP" && "$_CS_PRESET" -eq 0 ]]; then
       echo -e "  ${YW}  The agent authenticates as a named machine that must${CL}"
       echo -e "  ${YW}  already exist on the LAPI. Register it there first:${CL}"
       echo ""
-      echo -e "  ${YW}    on the LAPI host        cscli machines add ${HN} --password '<pw>'${CL}"
-      echo -e "  ${YW}    on a containerised LAPI podman exec crowdsec cscli machines add …${CL}"
+      echo -e "  ${YW}    on the LAPI host        cscli machines add ${HN} --password '<pw>' -f /dev/null${CL}"
+      echo -e "  ${YW}    on a containerised LAPI podman exec crowdsec cscli machines add … -f /dev/null${CL}"
       echo ""
       echo -e "  ${YW}  One machine per tenant, never a shared login. Shared${CL}"
       echo -e "  ${YW}  credentials make 'cscli machines list' useless for working${CL}"
@@ -2410,8 +2502,9 @@ echo -e "  ${RD}  they do break. Expect to spend time on the allowlist.${CL}"
 echo -e "  ${YW}  Start allowed: wordpress.org, and what WASP itself needs${CL}"
 echo -e "  ${YW}  (Wordfence, CrowdSec, MaxMind, Alpine, registries).${CL}"
 echo -e "  ${YW}  Find what a site actually needs:  wasp-egress discovery${CL}"
-echo -e "  ${YW}  Add one:                          wasp-egress allow <domain>${CL}"
-echo -e "  ${YW}  Temporary window:                 wasp-egress maintenance enable${CL}"
+echo -e "  ${YW}  Open one for up to an hour:       wasp-egress allow <domain>${CL}"
+echo -e "  ${YW}  A theme vendor, for good:         wasp-egress allow <domain> --permanent${CL}"
+echo -e "  ${YW}  Dropbox, Drive, OneDrive, etc.:   wasp-egress fileshare open <name>${CL}"
 _sec_note
 EGRESS_PROXY=0
 read -rp "  Force web egress through the proxy? [y/N] : " _EP
@@ -2435,7 +2528,6 @@ unset _EP
 # that runs Divi is pure surface for no benefit. Now nothing is allowed unless
 # it is asked for.
 PAGE_BUILDER_DOMAINS=""
-IMPORT_SOURCE_HOSTS=""
 if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
   echo ""
   echo -e "  ${BLD}Commercial themes or page builders?${CL}"
@@ -2478,24 +2570,15 @@ if [[ "${EGRESS_PROXY:-0}" == "1" ]]; then
   if [[ -n "$PAGE_BUILDER_DOMAINS" ]]; then
     msg_ok "Builder domains allowed: ${PAGE_BUILDER_DOMAINS}"
   else
-    msg_ok "No builder domains allowed — add later with: doas wasp-egress.sh allow <domain>"
+    msg_ok "No builder domains allowed — add later with: doas wasp-egress.sh allow <domain> --permanent"
   fi
   unset _PB _n
 
   echo ""
-  echo -e "  ${BLD}Import file host (optional)${CL}"
-  echo -e "  ${YW}Only useful if a site backup will be downloaded from this host with${CL}"
-  echo -e "  ${YW}wp-import.sh. It is NOT added to the allowlist: wp-import opens it for${CL}"
-  echo -e "  ${YW}that download and closes it again, so a compromised WordPress cannot${CL}"
-  echo -e "  ${YW}reach a file-sharing service the rest of the time.${CL}"
-  echo ""
-  read -rp "  Allow imports from activeit.syncedtool.com? [y/N] : " _IS
-  case "${_IS}" in
-    y|Y|yes|YES) IMPORT_SOURCE_HOSTS="activeit.syncedtool.com"
-                 msg_ok "Import source: ${IMPORT_SOURCE_HOSTS}" ;;
-    *)           msg_ok "No import source. Add later: doas wasp-egress.sh import-source add <host>" ;;
-  esac
-  unset _IS
+  echo -e "  ${YW}File-sharing services (Dropbox, Drive, OneDrive, WeTransfer, Box,${CL}"
+  echo -e "  ${YW}SyncedTool) are never on this list. wp-import.sh opens the right one${CL}"
+  echo -e "  ${YW}for its own download, and anything else opens for an hour at most:${CL}"
+  echo -e "  ${YW}  doas wasp-egress.sh fileshare open dropbox${CL}"
 fi
 
 # ── Multi-factor authentication for admins ───────────────────────────────────
@@ -2540,6 +2623,94 @@ case "${_MFA}" in
     msg_warn "  and PRINT the backup codes. Without them a lost phone needs console recovery." ;;
 esac
 unset _MFA _MFG
+
+# ── CrowdSec AppSec: request and body inspection (opt-in, light) ────────────
+# Off by default. CrowdSec otherwise reads logs and bans afterwards; AppSec
+# shows each PHP request to the engine first and refuses a match. The cost is
+# memory (an open 1.8.x report of unbounded AppSec memory growth) and a little
+# CPU per request, so it is offered, explained and not assumed. Presettable for
+# fleet rollouts: WASP_APPSEC=light, and WASP_APPSEC_KEY for an upstream VM.
+APPSEC_MODE="off"
+APPSEC_KEY=""
+echo ""
+echo -e "  ${BLD}Inspect requests with CrowdSec AppSec (WAF, light ruleset)?${CL}"
+echo -e "  ${YW}Without it, CrowdSec bans an attacker after their requests appear in${CL}"
+echo -e "  ${YW}the logs. With it, each PHP request (body included) is checked first${CL}"
+echo -e "  ${YW}against virtual patches for known WordPress plugin CVEs and a few${CL}"
+echo -e "  ${YW}generic rules, and refused with a 403 if one matches.${CL}"
+echo ""
+_sec_head
+echo -e "  ${RD}  MEMORY. CrowdSec 1.8.x has an open report of AppSec memory growing${CL}"
+echo -e "  ${RD}  without bound under load (crowdsecurity/crowdsec#4797). WASP loads${CL}"
+echo -e "  ${RD}  the light set only (no OWASP CRS), keeps CrowdSec capped at 512 MB,${CL}"
+echo -e "  ${RD}  and restarts it at 448 MB. During a restart (~15 s) requests pass${CL}"
+echo -e "  ${RD}  uninspected. Recommended: 2 GB RAM and 2 vCPU (this VM: ${RAM} MB, ${CORES} vCPU).${CL}"
+echo -e "  ${YW}  CPU: one local round trip per PHP request, typically 1-5 ms.${CL}"
+echo -e "  ${YW}  Reach: PHP requests; bodies over 128 KiB are not inspected; files in${CL}"
+echo -e "  ${YW}  uploads are not forwarded. It can be switched on later instead:${CL}"
+echo -e "  ${YW}  wasp-appsec.sh on   (menu: Security → 28).${CL}"
+_sec_note
+if [[ -n "${WASP_APPSEC:-}" ]]; then
+  [[ "$WASP_APPSEC" == "light" ]] && APPSEC_MODE="light"
+  APPSEC_KEY="${WASP_APPSEC_KEY:-}"
+  msg_ok "AppSec from WASP_APPSEC: ${APPSEC_MODE}"
+else
+  read -rp "  Switch on AppSec (light) at install? [y/N] : " _ASC
+  case "${_ASC}" in y|Y|yes|YES) APPSEC_MODE="light" ;; esac
+fi
+if [[ "$APPSEC_MODE" == "light" ]]; then
+  if [[ "${CS_ENFORCEMENT:-local}" == "upstream" && -z "$APPSEC_KEY" ]]; then
+    msg_info "  This VM reports to ${CS_LAPI_URL:-a central LAPI}. AppSec checks the forwarder's"
+    msg_info "  API key against that LAPI, so make one there first:"
+    msg_info "      cscli bouncers add ${HN}-appsec"
+    read -rsp "  Paste that key (blank = switch AppSec on after install instead) : " APPSEC_KEY; echo
+    APPSEC_KEY=$(printf '%s' "$APPSEC_KEY" | tr -d ' \r\n')
+    if [[ -z "$APPSEC_KEY" ]]; then
+      APPSEC_MODE="off"
+      msg_warn "  AppSec left off. After install: doas wasp-appsec.sh on --key-file <file>"
+    fi
+  fi
+  if [[ -n "$APPSEC_KEY" && ! "$APPSEC_KEY" =~ ^[A-Za-z0-9_+/=-]+$ ]]; then
+    msg_warn "  That does not look like a CrowdSec API key — AppSec left off."
+    APPSEC_MODE="off"; APPSEC_KEY=""
+  fi
+  [[ "$APPSEC_MODE" == "light" ]] && msg_ok "AppSec (light) will be switched on at the end of the install"
+  if [[ "$APPSEC_MODE" == "light" ]] && (( RAM < 2048 || CORES < 2 )); then
+    msg_warn "  Below the 2 GB / 2 vCPU recommended for AppSec (${RAM} MB, ${CORES} vCPU)."
+  fi
+else
+  msg_ok "AppSec off — CrowdSec reads logs (the default)"
+fi
+unset _ASC
+
+# ── WASP Hive: report this VM to the fleet console (optional) ──────────────
+# The Hive is a separate VM (build one with this installer: role "WASP Hive").
+# Joining needs the one line `hive-admin enroll <node>` prints on the Hive. It
+# is used once, at the end of the install, and then removed from vars.sh.
+# Presettable: WASP_HIVE_ENROLL="https://hive <node> <token> <pin>".
+HIVE_ENROLL=""
+echo ""
+echo -e "  ${BLD}Report this VM to a WASP Hive (the MSP fleet console)?${CL}"
+echo -e "  ${YW}On the Hive:  doas hive-admin enroll ${HN} --client \"<client>\"${CL}"
+echo -e "  ${YW}then paste the line it prints. The Hive never connects to this VM;${CL}"
+echo -e "  ${YW}this VM sends it a report every 15 minutes over pinned TLS.${CL}"
+if [[ -n "${WASP_HIVE_ENROLL:-}" ]]; then
+  _HL="$WASP_HIVE_ENROLL"
+else
+  read -rp "  Enroll line (blank = not now) : " _HL
+fi
+_HL="${_HL#*enroll }"
+read -r _hu _hn _ht _hp _hx <<< "$_HL"
+if [[ -z "${_hu:-}" ]]; then
+  msg_ok "Not reporting to a Hive (join later: menu → Security → 24)"
+elif [[ "$_hu" == https://* && "$_hn" =~ ^[A-Za-z0-9._-]{1,64}$ && "$_ht" =~ ^[A-Za-z0-9_-]{20,}$ \
+        && "$_hp" =~ ^[A-Za-z0-9+/=]{40,}$ && -z "${_hx:-}" ]]; then
+  HIVE_ENROLL="${_hu} ${_hn} ${_ht} ${_hp}"
+  msg_ok "Will join the WASP Hive at ${_hu} as ${_hn} at the end of the install"
+else
+  msg_warn "That is not a line hive-admin prints — not joining. Join later: menu → Security → 24"
+fi
+unset _HL _hu _hn _ht _hp _hx
 
 # ── CrowdSec threat intelligence (CTI) ───────────────────────────────────────
 echo ""
@@ -3017,6 +3188,8 @@ printf  "  %-18s %s\n"  "Login URL:"  "$([ -n "$WP_ADMIN_SLUG" ] && printf '/%s 
 printf  "  %-18s %s\n"  "CS enrolment:" "$([ -n "$CROWDSEC_ENROLL_KEY" ] && printf 'key provided (auto-enrol)' || printf 'manual (after install)')"
 printf  "  %-18s WordPress + MariaDB (internal) + CrowdSec\n" "Containers:"
 printf  "  %-18s %s\n"  "Network:"     "${NET_MODE}${VM_STATIC_IP:+ ($VM_STATIC_IP/$VM_PREFIX)}"
+printf  "  %-18s %s\n"  "AppSec (WAF):" "$([[ "$APPSEC_MODE" == light ]] && echo 'light ruleset, on at install' || echo 'off (wasp-appsec.sh on, later)')"
+printf  "  %-18s %s\n"  "WASP Hive:"   "$([[ -n "$HIVE_ENROLL" ]] && echo "joins ${HIVE_ENROLL%% *}" || echo 'not reporting')"
 printf  "  %-18s %s\n"  "GeoIP:"       "$([[ $GEOIP_ENABLED -eq 1 ]] && echo "${GEOIP_MODE} (${GEOIP_WHITELIST:-$GEOIP_BLOCKLIST})" || echo 'disabled')"
 printf  "  %-18s %s\n"  "Digest pinning:" "$([[ $USE_DIGEST_PINNING -eq 1 ]] && echo 'enabled (SHA256-pinned images)' || echo 'disabled (tag-only)')"
 [[ -n "$WEB_CIDR" && -n "$PROXY_IP" ]] && msg_warn "WEB_CIDR set + PROXY_IP set → ${PROXY_IP} auto-added to nftables so NPM can reach port 80/443"

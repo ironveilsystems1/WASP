@@ -48,7 +48,40 @@ msg_info "Creating VM ${VMID} (${HN})…"
 # exactly that; test/check-heredoc-backticks.py flagged 27 of them. Quoting the
 # delimiter makes the whole block inert, and the values are substituted
 # afterwards where nothing can be interpreted.
+_wasp_hive_notes() {
+  # Quoted heredoc, values substituted after: the backticks are Markdown for
+  # the Proxmox notes panel and must never run.
+  cat <<'NOTES' | sed \
+    -e "s|@@BUILD@@|${WASP_VERSION:-unknown}|g" \
+    -e "s|@@ALPINE@@|${ALPINE_VER}|g" \
+    -e "s|@@DATE@@|$(date '+%Y-%m-%d')|g" \
+    -e "s|@@NAME@@|${HIVE_NAME:-$HN}|g" \
+    -e "s|@@ADMIN@@|${ADMIN_USER:-hiveadmin}|g" \
+    -e "s|@@IP@@|${VM_IP:-vm-ip}|g"
+WASP Hive — fleet console
+**Build** @@BUILD@@
+**Alpine** @@ALPINE@@
+**Installed** @@DATE@@
+---
+**Dashboard**
+https://@@NAME@@/  (or https://@@IP@@/)
+**SSH**
+`ssh @@ADMIN@@@@@IP@@`
+---
+1. `doas hive-admin user-add <name>`
+2. `doas hive-admin enroll <vm> --client "<client>"`
+   and run the printed line on that VM
+3. `doas hive-admin pin` — compare with the
+   browser's certificate before trusting it
+---
+Read-only. It holds no credential for any VM.
+First-boot log: /var/log/wasp-hive-install.log
+See docs/HIVE.md
+NOTES
+}
+
 _wasp_vm_notes() {
+  if [[ "${WASP_ROLE:-wordpress}" == "hive" ]]; then _wasp_hive_notes; return; fi
   # ── Proxmox VM notes ────────────────────────────────────────────────────────
   # Rendered in a NARROW side panel, so this is written for roughly 46 columns
   # and stacked vertically rather than laid out in wide rows. Proxmox scrolls
@@ -240,6 +273,29 @@ set -e
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
+if [[ "${WASP_ROLE:-wordpress}" == "hive" ]]; then
+  printf "${GN}${BLD}"
+  echo   "  ╔══════════════════════════════════════════════════════════════╗"
+  echo   "  ║        WASP Hive VM Created                                  ║"
+  echo   "  ╠══════════════════════════════════════════════════════════════╣"
+  printf "  ║  VM ID    :  %-47s║\n"  "$VMID"
+  printf "  ║  Hostname :  %-47s║\n"  "$HN"
+  printf "  ║  Resources:  %-47s║\n"  "${CORES} CPU · ${RAM} MB · ${DISK}"
+  printf "  ║  IP       :  %-47s║\n"  "${VM_IP:-see the Proxmox summary}"
+  printf "  ║  SSH      :  %-47s║\n"  "${ADMIN_USER} — key-only, from ${SSH_CIDR:-any}"
+  echo   "  ╠══════════════════════════════════════════════════════════════╣"
+  echo   "  ║  First boot installs the Hive (~2 min):                      ║"
+  printf "  ║    %-58s║\n" "ssh ${ADMIN_USER}@${VM_IP:-<vm-ip>}"
+  printf "  ║    %-58s║\n" "tail -f /var/log/wasp-hive-install.log"
+  echo   "  ║  Then:                                                       ║"
+  printf "  ║    %-58s║\n" "doas hive-admin user-add <name>"
+  printf "  ║    %-58s║\n" "doas hive-admin enroll <vm> --client \"<client>\""
+  printf "  ║    %-58s║\n" "https://${VM_IP:-<vm-ip>}/   (compare: doas hive-admin pin)"
+  echo   "  ╚══════════════════════════════════════════════════════════════╝"
+  printf "${CL}"
+  echo ""
+  return 0
+fi
 printf "${GN}${BLD}"
 echo   "  ╔══════════════════════════════════════════════════════════════╗"
 echo   "  ║        WordPress VM Created                                  ║"

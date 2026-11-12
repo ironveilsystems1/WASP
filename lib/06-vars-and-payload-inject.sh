@@ -31,6 +31,51 @@ _vars_q() {
   printf "'%s'" "$q"
 }
 
+# ── WASP Hive: stage the hive/ release and a first-boot launcher, and stop ──
+# None of the WordPress payload goes onto a Hive. What does: hive/, plus
+# install.sh and the signed manifest, so install-hive.sh on the VM verifies
+# the files again before installing them -- the same check it makes when run
+# by hand. The launcher runs once and removes itself on success; on failure
+# it stays, and the next boot tries again.
+if [[ "${WASP_ROLE:-wordpress}" == "hive" ]]; then
+  [[ -r "${REPO_DIR}/hive/install-hive.sh" ]] || msg_error "hive/ not found under ${REPO_DIR} — incomplete release."
+  _REL="$MNT/root/wasp-hive-release"
+  mkdir -p "$_REL"
+  cp -a "${REPO_DIR}/hive" "$_REL/hive"
+  rm -rf "$_REL/hive/__pycache__"
+  cp -a "${REPO_DIR}/install.sh" "$_REL/install.sh"
+  [[ -f "${REPO_DIR}/MANIFEST.sha256" ]] && cp -a "${REPO_DIR}/MANIFEST.sha256" "$_REL/"
+  [[ -f "${REPO_DIR}/MANIFEST.sha256.minisig" ]] && cp -a "${REPO_DIR}/MANIFEST.sha256.minisig" "$_REL/"
+  chmod -R go-w "$_REL"
+  _HARGS="--name $(_vars_q "${HIVE_NAME:-$HN}")"
+  [[ -n "$SSH_CIDR" ]] && _HARGS="${_HARGS} --ssh-cidr $(_vars_q "$SSH_CIDR")"
+  [[ -n "${HIVE_DASHBOARD_CIDR:-}" ]] && _HARGS="${_HARGS} --dashboard-cidr $(_vars_q "$HIVE_DASHBOARD_CIDR")"
+  [[ -n "${HIVE_INGEST_CIDR:-}" ]] && _HARGS="${_HARGS} --ingest-cidr $(_vars_q "$HIVE_INGEST_CIDR")"
+  [[ -n "${WASP_PUBKEY:-}" ]] && _HARGS="${_HARGS} --pubkey $(_vars_q "$WASP_PUBKEY")"
+  # Unverified only when the host install itself ran unverified, by the
+  # operator's explicit choice: the same release, the same verdict.
+  if [[ ! -f "${REPO_DIR}/MANIFEST.sha256.minisig" || "${WASP_DEV_UNVERIFIED:-0}" == "1" || "${WASP_ACCEPT_UNVERIFIED:-0}" == "1" ]]; then
+    _HARGS="${_HARGS} --unverified"
+    msg_warn "This release is not signed: the Hive will be installed UNVERIFIED."
+  fi
+  mkdir -p "$MNT/etc/local.d"
+  cat > "$MNT/etc/local.d/01-wasp-hive.start" << HIVELAUNCH
+#!/bin/sh
+# WASP Hive first boot (written by install.sh). Removes itself once it succeeds.
+[ -e /var/lib/wasp-hive/.installed ] && exit 0
+mkdir -p /var/log
+if sh /root/wasp-hive-release/hive/install-hive.sh ${_HARGS} >> /var/log/wasp-hive-install.log 2>&1; then
+  mkdir -p /var/lib/wasp-hive && : > /var/lib/wasp-hive/.installed
+  rm -f /etc/local.d/01-wasp-hive.start
+fi
+HIVELAUNCH
+  chmod +x "$MNT/etc/local.d/01-wasp-hive.start"
+  mkdir -p "$MNT/etc/runlevels/default"
+  msg_ok "WASP Hive release staged; install-hive.sh runs on first boot"
+  unset _REL _HARGS
+  return 0
+fi
+
 # Write installer variables that can't go in the INSTALLER_EOF heredoc
 # (which is single-quoted on the host, so host variables don't expand inside).
 # The installer sources this file early in Stage 2.
@@ -72,6 +117,7 @@ MAXMIND_ACCOUNT_ID=$(_vars_q "${MAXMIND_ACCOUNT_ID:-}")
 MAXMIND_LICENSE_KEY=$(_vars_q "${MAXMIND_LICENSE_KEY:-}")
 USE_DIGEST_PINNING=$(_vars_q "${USE_DIGEST_PINNING:-1}")
 DEPLOYMENT_PROFILE=$(_vars_q "${DEPLOYMENT_PROFILE:-production}")
+WASP_RELEASE=$(_vars_q "${WASP_RELEASE:-unknown}")
 ADMIN_USER=$(_vars_q "$ADMIN_USER")
 ADMIN_USER_CREATED=$(_vars_q "${ADMIN_USER_CREATED:-0}")
 # v7-16: persist the firewall/proxy values too. These were never written to
@@ -103,10 +149,12 @@ OFFSITE_APPEND_ONLY=$(_vars_q "${OFFSITE_APPEND_ONLY:-unknown}")
 GOVERNANCE_EMAIL=$(_vars_q "${GOVERNANCE_EMAIL:-}")
 EGRESS_PROXY=$(_vars_q "${EGRESS_PROXY:-0}")
 PAGE_BUILDER_DOMAINS=$(_vars_q "${PAGE_BUILDER_DOMAINS:-}")
-IMPORT_SOURCE_HOSTS=$(_vars_q "${IMPORT_SOURCE_HOSTS:-}")
 WPVULNERABILITY=$(_vars_q "${WPVULNERABILITY:-1}")
 MFA_ENFORCE=$(_vars_q "${MFA_ENFORCE:-0}")
 MFA_GRACE_DAYS=$(_vars_q "${MFA_GRACE_DAYS:-7}")
+APPSEC_MODE=$(_vars_q "${APPSEC_MODE:-off}")
+APPSEC_KEY=$(_vars_q "${APPSEC_KEY:-}")
+HIVE_ENROLL=$(_vars_q "${HIVE_ENROLL:-}")
 CTI_ENRICH_BANS=$(_vars_q "${CTI_ENRICH_BANS:-0}")
 WORDFENCE_API_KEY=$(_vars_q "${WORDFENCE_API_KEY:-}")
 CROWDSEC_WHITELIST=$(_vars_q "${CROWDSEC_WHITELIST:-}")
