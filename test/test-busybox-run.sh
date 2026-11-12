@@ -370,7 +370,7 @@ rm -f "$Z/down"
 # ── The suites again, with BusyBox underneath ───────────────────────────────
 echo ""
 echo "The import and scan suites with BusyBox underneath"
-for _t in test-wpress-import.sh test-vuln-scan.sh test-import-source.sh; do
+for _t in test-wpress-import.sh test-vuln-scan.sh test-import-source.sh test-import-findings.sh test-egress-temporary.sh test-threats.sh test-notify.sh test-hive-report.sh test-appsec.sh test-updraft-import.sh; do
   [ -f "$HERE/$_t" ] || { _f "$_t is missing" ""; continue; }
   _o=$(WASP_TEST_TOOLS="$T/bb" WASP_TEST_SH="$T/bb/sh" bash "$HERE/$_t" 2>&1); _rc=$?
   if [ "$_rc" = 0 ]; then

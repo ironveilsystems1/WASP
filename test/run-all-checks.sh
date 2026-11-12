@@ -79,7 +79,15 @@ if [ -f test/test-topology.sh ]; then
 else
   echo "  test-topology.sh MISSING"; rc=1
 fi
-for _t in test-vuln-scan.sh test-import-source.sh test-busybox-run.sh; do
+if command -v python3 >/dev/null 2>&1; then
+  echo ""; echo "  test-hive.py (WASP Hive server)"
+  _hv_rc=0; _hv=$(python3 -W ignore::ResourceWarning test/test-hive.py 2>&1) || _hv_rc=$?
+  printf '%s\n' "$_hv" | grep -E '^(Ran|OK|FAILED|FAIL:|ERROR:)' | sed 's/^/  /'
+  [ "$_hv_rc" = 0 ] || rc=1
+else
+  echo "  python3 missing: WASP Hive server tests NOT run"; rc=1
+fi
+for _t in test-vuln-scan.sh test-import-source.sh test-import-findings.sh test-egress-temporary.sh test-threats.sh test-notify.sh test-hive-report.sh test-appsec.sh test-hive-role.sh test-updraft-import.sh test-busybox-run.sh; do
   if [ -f "test/${_t}" ]; then
     bash "test/${_t}" || rc=1
   else

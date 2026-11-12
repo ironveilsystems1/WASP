@@ -13,7 +13,8 @@ settings) and every signature check would still pass.
 
 The manifest now covers everything under install.sh, lib/ and payload/ with no
 extension filter, because that is precisely the set install.sh executes or
-copies onto the VM. Documentation lives outside those paths, so nothing needs
+copies onto the VM. Since 10.12 it covers hive/ too: install-hive.sh refuses
+to install a WASP Hive whose files the signed manifest does not cover. Documentation lives outside those paths, so nothing needs
 excluding — the filter added risk for no benefit.
 
 This check re-derives that set and fails if a manifest exists that does not
@@ -21,7 +22,7 @@ cover all of it.
 """
 import os, sys, hashlib
 
-SIGNED_ROOTS = ['lib', 'payload']
+SIGNED_ROOTS = ['lib', 'payload', 'hive']
 SIGNED_FILES = ['install.sh']
 MANIFEST = 'MANIFEST.sha256'
 
@@ -30,6 +31,8 @@ for root in SIGNED_ROOTS:
     if not os.path.isdir(root):
         continue
     for d, _, fs in os.walk(root):
+        if '__pycache__' in d:
+            continue
         for f in fs:
             expected.add(os.path.join(d, f))
 
@@ -52,7 +55,7 @@ if missing:
     for m in missing:
         print(f"  {m}")
     print("\n  These are copied onto the VM but not covered by the signature.")
-    print("  Re-sign with a manifest built from ALL files under lib/ and payload/,")
+    print("  Re-sign with a manifest built from ALL files under lib/, payload/ and hive/,")
     print("  not from an extension allowlist.")
     sys.exit(1)
 if extra:

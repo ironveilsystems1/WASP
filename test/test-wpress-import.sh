@@ -182,9 +182,19 @@ sleep 1   # staging ids have one-second resolution
 _imp extract clean.wpress >/dev/null 2>&1 || _f "re-extract" "exit $?"
 _id=$(cat "$T/staging/.latest"); _imp scan "$_id" >/dev/null 2>&1
 : > "$T/log/wp"; : > "$T/log/sql"
-_o=$(printf 'IMPORT\n' | _imp apply "$_id" 2>&1); _rc=$?
+# --keep-files: the archive is extracted again below. (A plain apply deletes
+# it once the site is live; test-updraft-import.sh covers that.)
+_o=$(printf 'IMPORT\n' | _imp apply "$_id" --keep-files 2>&1); _rc=$?
 [ "$_rc" = 0 ] && _p "apply completes" || _f "apply" "exit $_rc: $_o"
+[ -f "$T/inbox/clean.wpress" ] && _p "--keep-files keeps the archive" || _f "--keep-files" "archive removed"
 grep -q 'wp_options' "$T/log/sql" && _p "tables reach this VM's prefix" || _f "table prefix" "$(head -3 "$T/log/sql")"
+# abc_ -> wp_. LIKE treats "_" as a wildcard, so "abc_%" also matched keys
+# already carrying this VM's prefix whenever its 4th character differed only
+# there; a second apply then mangled them. Exact LEFT() comparison only.
+grep -qF 'WHERE LEFT(option_name, 4) = 0x6162635f' "$T/log/sql" \
+  && grep -qF 'WHERE LEFT(meta_key, 4) = 0x6162635f' "$T/log/sql" \
+  && _p "prefix keys are matched exactly, with no LIKE wildcard" || _f "prefix predicate" "$(grep -i stranded "$T/log/sql")"
+grep -q 'LIKE 0x' "$T/log/sql" && _f "prefix predicate" "a LIKE pattern is still sent" || _p "no LIKE pattern reaches the prefix fix"
 grep -q 'option update template parent ' "$T/log/wp" && _p "the theme is restored" || _f "template" "$(cat "$T/log/wp")"
 grep -q 'option update stylesheet child ' "$T/log/wp" && _p "the child theme is restored" || _f "stylesheet" ""
 grep -qF 'option update active_plugins ["kept/kept.php"] --format=json' "$T/log/wp" \
@@ -210,6 +220,8 @@ _id=$(cat "$T/staging/.latest"); _imp scan "$_id" >/dev/null 2>&1
 _o=$(printf 'IMPORT\n' | WP_MFA_FAIL=1 _imp apply "$_id" 2>&1); _rc=$?
 { [ "$_rc" = 1 ] && printf '%s' "$_o" | grep -q 'MFA NOT ACTIVE'; } \
   && _p "an import that leaves MFA inactive does not report success" || _f "mfa gate" "exit $_rc"
+[ ! -e "$T/inbox/clean.wpress" ] && [ ! -d "$T/staging/$_id/files" ] \
+  && _p "a plain apply removes the archive and the staging copy" || _f "clean-up after apply" "$(ls "$T/inbox")"
 
 echo ""
 echo "── the reader's container"

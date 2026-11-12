@@ -1594,7 +1594,10 @@ _vexpect() {  # $1 description, $2 expected, $3 got
   if [ "$3" = "$2" ]; then _p "$1"
   else _f "$1" "expected $2, got '${3:-nothing}'"; fi
 }
-_rim_block=$(_vblock '^_rim=\$\(podman exec wordpress' '^esac$')
+# Bracket expressions, not \$\(: awk -v processes backslash escapes, so gawk
+# turned that into ^_rim=$(podman -- an unmatched ( and a fatal error -- while
+# mawk and BusyBox awk passed it through. Same harness, different verdict.
+_rim_block=$(_vblock '^_rim=[$][(]podman exec wordpress' '^esac$')
 _vexpect "remoteip: an empty file passes"         PASS "$(_vrun "$_rim_block" 'echo masked' ':' local)"
 _vexpect "remoteip: active directives FAIL"       FAIL "$(_vrun "$_rim_block" 'echo active' ':' local)"
 _vexpect "remoteip: a failed exec is not a pass"  WARN "$(_vrun "$_rim_block" 'return 125' ':' local)"
@@ -1655,6 +1658,83 @@ _no_text "no config is sourced by the vulnerability tool" payload/bin/wp-plugins
   "this runs as root"
 _no_text "no config is sourced by the hardening tool" payload/bin/wp-hardening.sh '^[^#]*\. "\$CTI_CONF"' \
   "this runs as root"
+
+# ── cs-lapi refuses before tearing anything down when egress blocks the LAPI ──
+# With restricted egress, :8080 is closed, and an agent that cannot reach its
+# LAPI fails exactly like a wrong password. The check must run BEFORE the
+# running agent is removed, and must not fire when the port is open, when the
+# LAPI is on 443, or when egress is unrestricted.
+echo ""
+echo "── cs-lapi checks this VM's own egress first"
+_CL=$(mktemp -d)
+sed -e '/^if \[ "\$(id -u)" -ne 0 \]; then$/,/^fi$/d' \
+    -e "s#/etc/wp-install/vars.sh#$_CL/vars.sh#g" \
+    -e "s#/etc/wp-install/crowdsec-topology#$_CL/topo#g" \
+    -e "s#/etc/wp-install/crowdsec-image#$_CL/img#g" \
+    "$REPO/payload/bin/wp-hardening.sh" > "$_CL/h.sh"
+mkdir -p "$_CL/bin"
+# podman: records every call; inspect fails so the run stops right after the
+# pre-check ("Cannot determine which CrowdSec image") without touching anything.
+cat > "$_CL/bin/podman" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$CL_LOG"
+exit 1
+STUB
+cat > "$_CL/bin/nft" <<'STUB'
+#!/bin/sh
+case "$*" in
+  "list chain inet filter output")
+    [ "$CL_RESTRICT" = 1 ] && echo '  log prefix "nft-egress-drop: " drop'
+    [ -n "$CL_RULE" ] && echo "  $CL_RULE" ;;
+  "list set inet filter egress_extra_tcp")
+    echo "  elements = { ${CL_SET:-9999} }" ;;
+esac
+exit 0
+STUB
+chmod +x "$_CL/bin/podman" "$_CL/bin/nft"
+_clrun() {  # $1 restrict $2 set-elements $3 rule $4 url -> prints output; log in $_CL/log
+  : > "$_CL/log"
+  CL_LOG="$_CL/log" CL_RESTRICT="$1" CL_SET="$2" CL_RULE="$3" PATH="$_CL/bin:$PATH" \
+    sh "$_CL/h.sh" cs-lapi "$4" wp01 pw 2>&1
+}
+_o=$(_clrun 1 9999 "" http://10.20.0.5:8080/)
+if printf '%s' "$_o" | grep -q 'egress-allow 8080 tcp' && ! grep -q 'rm' "$_CL/log"; then
+  _p "restricted egress, 8080 closed: refuses, names egress-allow, removes nothing"
+else _f "cs-lapi egress pre-check" "$(printf '%s' "$_o" | head -3) | podman: $(cat "$_CL/log")"; fi
+for _case in "1|8080||http://10.20.0.5:8080/|8080 in egress_extra_tcp" \
+             "1|9999|ip daddr 10.20.0.5 tcp dport 8080 accept comment \"wasp-lapi\"|http://10.20.0.5:8080/|the installer's host-specific rule" \
+             "1|9999||https://lapi.example/|a LAPI on 443" \
+             "0|9999||http://10.20.0.5:8080/|unrestricted egress"; do
+  IFS='|' read -r _r _s _rule _u _why <<EOF
+$_case
+EOF
+  _o=$(_clrun "$_r" "$_s" "$_rule" "$_u")
+  if printf '%s' "$_o" | grep -q 'egress-allow'; then
+    _f "cs-lapi pre-check fired with $_why" "$(printf '%s' "$_o" | head -2)"
+  else _p "cs-lapi pre-check stays quiet with $_why"; fi
+done
+rm -rf "$_CL"
+
+# ── the installer allows an upstream LAPI through restricted egress ──────────
+echo ""
+echo "── restricted egress lets the agent reach an upstream LAPI"
+_lapi_blk=$(awk '/^EGRESS_LAPI=""$/{f=1} /^if \[\[ "\$\{RESTRICT_EGRESS:-0\}" == "1" \]\]; then$/{if(f)exit} f' \
+            "$REPO/lib/03-dynamic-configs.sh")
+_lapi() {  # $1 restrict $2 mode $3 url -> "rule|port"
+  RESTRICT_EGRESS="$1" CS_ENFORCEMENT="$2" CS_LAPI_URL="$3" bash -c '
+    msg_ok() { :; }; msg_warn() { :; }
+    eval "$1"; printf "%s|%s" "$EGRESS_LAPI" "$EGRESS_LAPI_PORT"' _ "$_lapi_blk"
+}
+_r=$(_lapi 1 upstream http://10.20.0.5:8080/)
+case "$_r" in *"ip daddr 10.20.0.5 tcp dport 8080 accept"*"|") _p "an IP LAPI gets a rule for that host and port only" ;;
+  *) _f "LAPI egress rule" "$_r" ;; esac
+_r=$(_lapi 1 upstream http://lapi.example:8080/)
+[ "$_r" = "|8080" ] && _p "a LAPI given by name opens its port the egress-allow way" || _f "LAPI by name" "$_r"
+for _c in "1 upstream https://10.20.0.5/" "1 upstream http://10.20.0.5/" "0 upstream http://10.20.0.5:8080/" "1 local http://10.20.0.5:8080/"; do
+  set -- $_c
+  _r=$(_lapi "$1" "$2" "$3")
+  [ "$_r" = "|" ] && _p "nothing added for: egress=$1 mode=$2 $3" || _f "LAPI rule added for egress=$1 mode=$2 $3" "$_r"
+done
 
 echo ""
 echo "──────────────────────────────────────────────────────"

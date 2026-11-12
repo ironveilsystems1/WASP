@@ -9,8 +9,10 @@
 # with curl and podman stubbed.
 #
 # The WPVulnerability fixtures follow the maintainer's client code and test
-# fixture. No live response was available when this was written, so the response
-# shape here is a reading of that code, and the first real run should confirm it.
+# fixture. The applicability rules were re-checked in 10.11 against that client
+# (wpvulnerability_is_vulnerability_applicable and _get_vulnerabilities): no
+# live response was reachable from the build environment, so the response shape
+# is still a reading of that code, and `wp-plugins.sh vulns` on a VM confirms it.
 # =============================================================================
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,9 +29,9 @@ mkdir -p "$T/bin" "$T/cache" "$T/etc" "$T/api" "$T/usr"
 
 cat > "$T/bin/curl" <<STUB
 #!/usr/bin/env bash
-url=""; out=/dev/null
+url=""; out=/dev/null; hdr=/dev/null
 while [ \$# -gt 0 ]; do
-  case "\$1" in -o) out="\$2"; shift ;; -w|-H|-D|--max-time) shift ;; http*) url="\$1" ;; esac
+  case "\$1" in -o) out="\$2"; shift ;; -D) hdr="\$2"; shift ;; -w|-H|--max-time) shift ;; http*) url="\$1" ;; esac
   shift
 done
 echo "\$url" >> "$T/requests"
@@ -39,6 +41,13 @@ case "\$url" in
     cp "$T/wf.json" "\$out"; printf 200; exit 0 ;;
 esac
 key=\$(printf '%s' "\$url" | sed 's|.*wpvulnerability.net/||; s|/\$||; s|/|-|')
+# A sequence of answers, one per attempt: lets a test say "429, then 200".
+if [ -s "$T/api/\$key.seq" ]; then
+  c=\$(head -1 "$T/api/\$key.seq"); sed -i '1d' "$T/api/\$key.seq"
+  [ -f "$T/api/\$key.hdr" ] && cp "$T/api/\$key.hdr" "\$hdr"
+  if [ "\$c" = 200 ]; then cp "$T/api/\$key.json" "\$out"; fi
+  printf '%s' "\$c"; exit 0
+fi
 if [ -f "$T/api/\$key.code" ]; then printf '%s' "\$(cat "$T/api/\$key.code")"; exit 0; fi
 if [ -f "$T/api/\$key.json" ]; then cp "$T/api/\$key.json" "\$out"; printf 200; exit 0; fi
 printf 404
@@ -54,6 +63,10 @@ case "\$*" in
   *'mariadb --version'*) echo 'mariadb from 11.4.8-MariaDB' ;;
 esac
 exit 0
+STUB
+cat > "$T/bin/sleep" <<STUB
+#!/usr/bin/env bash
+echo "\$1" >> "$T/sleeps"
 STUB
 cat > "$T/bin/logger" <<STUB
 #!/usr/bin/env bash
@@ -76,7 +89,7 @@ chmod +x "$T/notify.sh" "$T/wp-plugins.sh"
 
 _scan() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/wp-plugins.sh" vulns "$@" 2>&1; }
 _cron() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/cron.sh" 2>&1; }
-_reset() { rm -rf "$T/cache"/* "$T/cache"/.[a-z]* "$T/wf.json" "$T/api"/*; : > "$T/requests"; : > "$T/notify"; rm -f "$T/syslog" "$T/etc/vuln-sources.conf"; }
+_reset() { rm -rf "$T/cache"/* "$T/cache"/.[a-z]* "$T/wf.json" "$T/api"/*; : > "$T/requests"; : > "$T/notify"; : > "$T/sleeps"; rm -f "$T/syslog" "$T/etc/vuln-sources.conf"; }
 _conf() { printf '%s\n' "$@" > "$T/etc/vuln-sources.conf"; }
 wf() { printf '%s' "$1" > "$T/wf.json"; }
 
@@ -188,8 +201,46 @@ _reset; _conf 'WPVULNERABILITY=1'; printf '{"error":0,"data":{"vulnerability":"s
 o=$(_scan); [ $? = 3 ] && _p "an unexpected response shape is incomplete" || _f "shape" "$o"
 
 _reset; _conf 'WPVULNERABILITY=1'; printf 429 > "$T/api/plugin-elementor.code"
+o=$(_scan); rc=$?
+[ "$(grep -c 'plugin/elementor' "$T/requests")" = 3 ] && _p "a 429 is retried, three tries in all" || _f "429 tries" "$(cat "$T/requests")"
+[ "$(grep -c wpvulnerability "$T/requests")" = 3 ] && _p "and a 429 that survives them stops further requests" || _f "429 stop" "$(cat "$T/requests")"
+[ "$rc" = 3 ] && _p "which is reported INCOMPLETE, not clean" || _f "429 rc" "exit $rc"
+[ "$(tr '\n' ' ' < "$T/sleeps")" = "5 15 " ] && _p "backing off 5s, then 15s" || _f "backoff" "$(cat "$T/sleeps")"
+
+# The field-test fault: one refusal on an unattended run made the whole scan
+# INCOMPLETE. A momentary limit now clears on retry.
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 "$(vuln 'After a retry' ge 1.0.0 lt 3.5.0 0 CVE-2026-7777 8.1 h)"
+printf '429\n200\n' > "$T/api/plugin-elementor.seq"
+printf 'HTTP/2 429\r\nretry-after: 7\r\n\r\n' > "$T/api/plugin-elementor.hdr"
+o=$(_scan); rc=$?
+_has "a 429 then a 200 is an answer" "$o" "CVE-2026-7777"
+[ "$rc" = 0 ] && _p "and the scan is complete" || _f "retry rc" "exit $rc: $o"
+[ "$(head -1 "$T/sleeps")" = 7 ] && _p "a lower-case retry-after header is honoured" || _f "retry-after" "$(cat "$T/sleeps")"
+grep -q 'plugin/contact-form' "$T/requests" && _p "and later components are still asked" || _f "after retry" "$(cat "$T/requests")"
+
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 ""
+printf '503\n200\n' > "$T/api/plugin-elementor.seq"
+o=$(_scan); [ $? = 0 ] && _p "a 503 then a 200 is an answer too" || _f "503 retry" "$o"
+_reset; _conf 'WPVULNERABILITY=1'
+printf '429\n' > "$T/api/plugin-elementor.seq"
+printf 'HTTP/2 429\r\nretry-after: 3600\r\n\r\n' > "$T/api/plugin-elementor.hdr"
 _scan >/dev/null
-[ "$(grep -c wpvulnerability "$T/requests")" = 1 ] && _p "a 429 stops further requests" || _f "429" "$(cat "$T/requests")"
+[ "$(head -1 "$T/sleeps")" = 60 ] && _p "a Retry-After of an hour is capped at 60s" || _f "cap" "$(cat "$T/sleeps")"
+
+echo ""
+echo "── Version ranges, as the provider's client reads them"
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 "$(vuln 'No range given' '' '' '' '' 0 CVE-2026-8001 9.0 c)"
+api plugin-contact-form 0 "$(vuln 'Only a minimum' ge 2.0 '' '' 0 CVE-2026-8002 7.0 h)"
+api core-7.1.4 0 "$(vuln 'Core, per version' '' '' '' '' 0 CVE-2026-8003 7.2 h)"
+api php-8.4.27 0 "$(vuln 'PHP, no range' '' '' '' '' 0 CVE-2026-8004 9.0 c)"
+o=$(_scan)
+_hasnt "a plugin entry with no range does not apply (not every version)" "$o" "CVE-2026-8001"
+_has   "a minimum alone is honoured"                                    "$o" "CVE-2026-8002"
+_has   "every entry on core's per-version endpoint applies"             "$o" "CVE-2026-8003"
+_hasnt "a PHP entry with no range does not apply"                       "$o" "CVE-2026-8004"
 
 _reset; _conf 'WORDFENCE_API_KEY=t' 'WPVULNERABILITY=1'
 wf '{"a":{"title":"Same bug","cve":"CVE-2026-1111","cvss":{"score":7.5},"software":[{"slug":"elementor","affected_versions":{"x":{"from_version":"*","from_inclusive":true,"to_version":"3.5.0","to_inclusive":true}}}]}}'
@@ -207,6 +258,53 @@ _has "a staged plugin is matched" "$o" "[HIGH] elementor 3.0.0"
 grep -qE '\.\./|bad;' "$T/requests" && _f "hostile slug" "reached a URL" || _p "a hostile slug never reaches a URL"
 grep -q 'core/' "$T/requests" && _f "staged core" "live versions queried" || _p "staged scans do not query the live site's versions"
 [ -f "$T/cache/.last-scan" ] && _f "state" "staged scan recorded as the daily scan" || _p "a staged scan is not recorded as the daily scan"
+
+echo ""
+echo "── The weekly report is sent whatever it says"
+_dig() { VULN_STATE="$T/cache/.last-scan" MALWARE_STATE="$T/mal" \
+         PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/cron.sh" --digest "$@" 2>&1; }
+mkdir -p "$T/mal"
+_reset; _conf 'WPVULNERABILITY=1'
+api core-7.1.4 0 ""; api php-8.4.27 0 ""; api mariadb-11.4.8 0 ""
+date -u +%Y-%m-%dT%H:%M:%SZ > "$T/mal/last-scan-time"; : > "$T/mal/last-scan.tsv"
+_scan >/dev/null; : > "$T/notify"
+o=$(_dig)
+head -1 "$T/notify" | grep -q '^Weekly security report: all scans ran, nothing found$' \
+  && _p "a clean week is still reported, and says so" || _f "clean digest" "$(head -3 "$T/notify")"
+grep -q 'WPVulnerability' "$T/notify" && grep -q 'Last run : .*complete' "$T/notify" \
+  && _p "it names the sources and when the daily scan last completed" || _f "digest body" "$(cat "$T/notify")"
+grep -q 'MALWARE AND INTEGRITY' "$T/notify" && grep -q '0 critical, 0 high' "$T/notify" \
+  && _p "and the malware scan's last result" || _f "malware section" "$(cat "$T/notify")"
+: > "$T/notify"; _dig --print >/dev/null
+[ ! -s "$T/notify" ] && _p "--print sends nothing" || _f "--print" "sent"
+
+printf 'at=%s\nresult=complete\nreason=\n' "$(( $(date +%s) - 72*3600 ))" > "$T/cache/.last-scan"
+: > "$T/notify"; _dig >/dev/null
+head -1 "$T/notify" | grep -q 'ATTENTION.*vulnerability scan has not run for 7[0-9]h' \
+  && _p "a daily scan that stopped running is called out in the subject" || _f "stale" "$(head -1 "$T/notify")"
+
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 "$(vuln 'Weekly bug' ge 1.0.0 lt 3.5.0 0 CVE-2026-9001 9.8 c)"
+api core-7.1.4 0 ""; api php-8.4.27 0 ""; api mariadb-11.4.8 0 ""
+printf 'CRITICAL\tObfuscated PHP: /x/y.php\tdetail\n' > "$T/mal/last-scan.tsv"
+_scan >/dev/null; : > "$T/notify"
+_dig >/dev/null
+grep -q 'CVE-2026-9001' "$T/notify" && _p "findings are listed in the report" || _f "findings" "$(cat "$T/notify")"
+head -1 "$T/notify" | grep -q 'ATTENTION.*1 CRITICAL malware finding' && _p "a CRITICAL malware finding puts it in the subject" || _f "malware subject" "$(head -1 "$T/notify")"
+grep -q 'Obfuscated PHP: /x/y.php' "$T/notify" && _p "and the finding is in the body" || _f "malware body" ""
+rm -f "$T/cache/.last-scan"; : > "$T/notify"; _dig >/dev/null
+head -1 "$T/notify" | grep -q 'no daily vulnerability scan has been recorded' \
+  && _p "the report's own scan does not stand in for a daily run that never happened" || _f "own scan" "$(head -1 "$T/notify")"
+rm -rf "$T/mal"; : > "$T/notify"; _dig >/dev/null
+head -1 "$T/notify" | grep -q 'no malware scan has been recorded' && _p "no malware scan ever recorded is called out" || _f "no malware" "$(head -1 "$T/notify")"
+
+grep -q '^15 7 \* \* 1 /usr/local/bin/wp-vuln-cron.sh --digest' "$REPO/payload/cron/wordpress-vm.cron" \
+  && _p "the report is scheduled weekly (Monday 07:15 UTC)" || _f "digest cron" ""
+grep -q '^30 6 \* \* \* /usr/local/bin/wp-vuln-cron.sh$' "$REPO/payload/cron/wordpress-vm.cron" \
+  && _p "the vulnerability scan is scheduled daily (06:30 UTC)" || _f "daily cron" ""
+grep -q '^30 3 \* \* \* /usr/local/bin/wp-malware-scan.sh quick' "$REPO/payload/cron/wordpress-vm.cron" \
+  && grep -q '^45 3 \* \* 0 /usr/local/bin/wp-malware-scan.sh yara' "$REPO/payload/cron/wordpress-vm.cron" \
+  && _p "the malware scans are scheduled daily and weekly" || _f "malware cron" ""
 
 echo ""
 printf '  passed %d   failed %d\n' "$PASS" "$FAIL"

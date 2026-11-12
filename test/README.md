@@ -16,9 +16,32 @@ which does what:
   `test-wpress-import.sh`), `test/test-mfa-enforcement.php`, the harness for the
   MFA decision and the wall (scope, enrollment, grace maths, sessions), and
   `test/test-login-guard.php`, which drives the lockout through a filter chain
-  shaped like core's. It finishes with `test/test-busybox-run.sh`, which runs
-  the import and scan tools with BusyBox applets in place of GNU tools, as they
-  run on the VM. That run is required: without BusyBox the suite fails, because
+  shaped like core's. `test/test-import-findings.sh` builds archives shaped
+  like a real cPanel export and like the true positives (a Duplicator package,
+  a webshell in uploads, a webshell named `index.php`) and asserts what
+  `inspect`, `extract` and `scan` say about each, and that `apply` keeps the
+  named files out. `test/test-threats.sh` drives the detection helper, the
+  scanner's new checks and `remediate` end to end — plan, refusal without
+  `--apply`, quarantine with paths kept, plugin reinstall with the original put
+  back on failure, and account locking limited to privileged accounts and
+  never a batch. `test/test-egress-temporary.sh` proves nothing temporary on
+  the egress allowlist outlives an hour, with no one running a command.
+  `test/test-notify.sh` runs the real `--passwordeval` command against a real
+  `smtp.ini`, so it checks the password the relay would actually receive.
+  `test/test-hive.py` tests the WASP Hive server: TOTP, sessions, throttling,
+  ingest limits, the compliance engine, a stalled TLS handshake, and the Wazuh
+  connector against a stand-in manager. `test/test-hive-report.sh` runs the
+  real VM reporter against the real server over pinned TLS: a re-keyed Hive,
+  a rotated token, and one VM posing as another. It needs `python3`,
+  `openssl`, `curl` and `jq`. `test/test-appsec.sh` runs the real AppSec
+  forwarder (PHP's built-in server) against a stand-in AppSec listener, and
+  drives `wasp-fw-rule.sh` and the `wasp-appsec.sh` watchdog and rollback
+  with stubs; it needs `php` with the curl extension. `test/test-hive-role.sh`
+  exercises install.sh's WASP Hive role on the host side.
+  `test/test-updraft-import.sh` takes a realistic multi-part UpdraftPlus set
+  through `restore` and checks the clean-up afterwards. The suite finishes with
+  `test/test-busybox-run.sh`, which runs the import and scan tools with BusyBox
+  applets in place of GNU tools, as they run on the VM. That run is required: without BusyBox the suite fails, because
   a skipped run is how two critical import bugs passed every test here. Install
   busybox-static or set `BUSYBOX=/path/to/busybox`. Run this on every change; it
   is fast and catches the class of bug that has repeatedly bitten this project.
