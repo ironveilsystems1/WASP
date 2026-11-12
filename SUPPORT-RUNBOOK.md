@@ -121,11 +121,12 @@ If SSH itself does not connect, go straight to **[the console](#when-nothing-res
 | **403 on the admin area** | `wp-hardening.sh proxy-check` | Your IP is not allowed, or the proxy is not passing it. See *The 403 tree* below |
 | **"Two-factor authentication is required" at login** | — | The grace window ended before they enrolled. Nothing is broken. See *An admin hit the two-factor wall* |
 | **Admin login rejects a good password** | — | Ordinary reset. Not an outage. `wp-rotate-secrets.sh` is **not** for this — that rotates system creds, not user passwords |
-| **A plugin or update fails silently** | `wasp-egress status` | If egress filtering is on, the plugin may be calling a blocked destination. `wasp-egress discovery` shows what was denied — check *before* blaming the plugin |
+| **A plugin or update fails silently** | `wasp-egress status` | If egress filtering is on, the plugin may be calling a blocked destination. A file host (Dropbox, Drive…) opens for an hour at most with `wasp-egress fileshare open <name>`; anything else with `wasp-egress allow <domain>` (an hour) or, for a theme vendor, `--permanent`. `wasp-egress discovery` shows what was denied — check *before* blaming the plugin |
 | **Contact form / site email not arriving** | `wp-mail.sh status` | `wp-mail.sh test you@example.com`. A wrong SMTP password fails silently — that is the usual cause |
 | **"I'm locked out by SSH too"** | — | CrowdSec may have banned the address. See *Un-banning* below |
 | **Alert: disk at 8x%** | `wp-hardening.sh disk` | Shows what is using it and what is safe to reclaim. Usually old images: `podman image prune -f --filter dangling=true` |
 | **Alert: backup failed** | `wasp-offsite-backup.sh status` | Is the off-site destination reachable? Run `wp-db-backup.sh` by hand and watch it. If it fails the same way, → Tier 2 |
+| **Imported site: users have no roles** | `wp-forensics.sh admins` | Shows who actually holds a role. The `apply` warning *"key(s) still carry the source prefix"* is exact from 10.11 on; on 10.10 it also counted correctly renamed keys, so a number there proved nothing. A site applied twice on 10.10 can have keys renamed twice (`<prefix><tail of prefix>capabilities`) → Tier 2 |
 | **Alert: malware / CRITICAL** | **stop** | Do not clean anything yet. Go to *Suspected compromise* and follow it in order |
 
 ### The 403 tree

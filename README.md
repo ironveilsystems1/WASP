@@ -62,7 +62,9 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Before you use this](#before-you-use-this)
 - [What This Is](#what-this-is)
 - [Planning the network before you build](#planning-the-network-before-you-build)
+- [Managing a fleet, and WASP Hive](#managing-a-fleet)
 - [Stack design: WASP + NPMplus + OPNsense](docs/STACK-DESIGN.md)
+- [Request inspection: CrowdSec AppSec (optional)](#request-inspection-crowdsec-appsec-optional)
 - [Egress control (Squid)](#egress-control-squid)
 - [Checking the whole VM](#checking-the-whole-vm-at-once)
 - [Alerts](#alerts)
@@ -140,7 +142,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.10` — and both exist only because the codebase
+same value — currently `10.14` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -209,6 +211,49 @@ Everything is logged to `/var/log/wp-install.log` on the guest, viewable in real
 
 ## Importing an existing site
 
+**The short version.** Put the backup in the inbox, then run one command:
+
+```sh
+scp -O backup_* admin@your-vm:/var/lib/wasp-import/incoming/   # e.g. every file of an UpdraftPlus backup
+doas wp-import.sh restore                                       # or: menu → Import → 6
+```
+
+`restore` runs every step below in order: inspect, extract, scan, import,
+then clean up. It stops only where a person has to decide: findings, and the
+`IMPORT` confirmation. With nothing named, it takes the one backup in the
+inbox. An UpdraftPlus set counts as one backup however many files it has. With
+two or more backups there, it lists them and asks which. Once the site is
+live, the archives and the staging copy are deleted (see *Cleaning up*). The
+sections below are the same pipeline one step at a time.
+
+### UpdraftPlus backups
+
+UpdraftPlus splits a backup into several files that share a name:
+
+- `backup_<date>_<site>_<id>-db.gz`, the database;
+- `-plugins.zip`, `-themes.zip`, `-uploads.zip` (large sites add
+  `-uploads2.zip` and so on) and `-others.zip`.
+
+Each zip holds the folders that live *inside* `wp-content`, so none of them is
+a site on its own. WASP treats them as one:
+
+- **Any part names the whole set.** `inspect`, `extract` and `restore` accept
+  any one of the files, or the shared prefix, and take every part together into
+  one staging set. `list` and `inspect` show which parts are present.
+- **Checked as a set, before anything is unpacked.** Every zip gets the same
+  hostile-member checks as any archive, and one bad part refuses the whole set.
+  A set without its `-db.gz` is refused, and the message names the missing
+  file. So is an encrypted database (`-db.gz.crypt`), with how to decrypt it
+  in UpdraftPlus.
+- **Imported like any other site.** Plugins, themes and uploads are imported,
+  with all uploads parts merged, and the database is imported with the old
+  address rewritten. `-others` and `-mu-plugins` are scanned and not
+  imported, as for any archive. `-wpcore` and `-more` are not part of
+  `wp-content` and are skipped.
+
+Before 10.14 this meant unpacking the zips and re-packing them by hand, outside
+every check this tool runs.
+
 ### Getting the backup onto the VM
 
 ```sh
@@ -255,9 +300,11 @@ wp-import.sh inspect backup.zip
 It reports:
 
 - **Path traversal, absolute paths, symlinks** → refused outright, no override. Nothing legitimate needs them.
-- **Executable PHP in uploads** → the strongest single indicator the source site was compromised
-- **Duplicator's `installer.php`** → flagged; it's a documented takeover vector and is never executed
-- **mu-plugins** → active on arrival, with no activation step to withhold
+- **Executable PHP in uploads** → the strongest single indicator the source site was compromised, listed by name. WordPress's directory-index guards (`uploads/<dir>/index.php` holding `<?php // Silence is golden.`) are counted apart: `inspect` sees only names, so it leaves their verdict to `scan`, which reads them
+- **PHP renamed so it no longer runs** → `.php.bak`, `.old`, `.orig`, `.disabled`, `.suspected`, `.quarantine`, `.txt`, `~` and similar, listed by name. This is what someone does to a file they found and were afraid of; no build tool or plugin produces it. Renamed copies of `wp-config.php` are counted apart — they hold the old host's database password
+- **A Duplicator package** → an exact `installer.php` beside its `*archive.zip` (or `.daf`), or a `dup-installer/` directory. It's a documented takeover vector and is never executed. Composer's `…/Installers/Installer.php` and a plugin's own `installer.php` are not Duplicator and are not flagged
+- **mu-plugins** → top-level `*.php` loads on arrival, with no activation step to withhold. Anything else in the directory (a `.php.bak`, a subdirectory) is counted separately, because WordPress does not load it
+- **A cPanel account export** → named as one (it used to be "unknown"); only `public_html/` is imported. Its shell history is pointed out, because on the first field test `.bash_history` dated the previous clean-up to the minute and named the file that cleaner had renamed
 - **Expansion ratio and disk headroom** → checked before anything writes, because running out mid-import leaves a broken site *and* no import
 
 Safe to run on a backup you don't trust — which is rather the point.
@@ -272,7 +319,11 @@ wp-import.sh staged                    # what's currently staged
 
 Links are refused. A backup needs files and directories, nothing else, so a symlink, hard link or device in an archive stops it at `inspect` and again at `extract`, and whatever actually landed in staging is checked before anything touches it. Zips need Info-ZIP to be listed, and the installer adds it. A zip that cannot be listed is refused rather than extracted unchecked.
 
-Extraction is bounded rather than trusting: hostile members are re-checked (a check that only runs when someone remembers `inspect` isn't a control), ownership and permission bits from the archive are never honoured, disk headroom is verified *before* writing, and **everything extracted has its execute bit removed**. Duplicator's installer is deleted at extraction, not at import — there's no stage where keeping it is useful.
+Extraction is bounded rather than trusting: hostile members are re-checked (a check that only runs when someone remembers `inspect` isn't a control), ownership and permission bits from the archive are never honoured, disk headroom is verified *before* writing, and **everything extracted has its execute bit removed**. Duplicator's installer is deleted at extraction, not at import — there's no stage where keeping it is useful. That removal covers `installer.php`, `installer-backup.php` and `dup-installer/` **outside `wp-content`** only: Duplicator never writes inside it, and a plugin's own `includes/installer.php` deleted by name is a broken plugin nobody is told about.
+
+**`scan` checks the site, wherever it sits in the archive.** A cPanel account export puts WordPress at `<account>/public_html/`. `scan` finds the site root the same way `apply` does (the shallowest `wp-content` beside `wp-includes` or `wp-config.php`), says which one it used, and points the file scanner there. If there is no site root it says so: a structural check pointed at a directory without `wp-content` has nothing to look at, and must not print `[ok]`.
+
+**Shell history is surfaced at extract.** If the archive holds a `.bash_history`, `extract` prints the lines that touched WordPress — a plugin deactivated, a file renamed, a security plugin switched off — and keeps a root-only copy with the staging set. Nothing in it is run. It is printed filtered rather than whole because a command line can hold a password.
 
 **The dump is scanned as a file, before it is ever loaded.** That's the point of the exercise: loading it and then querying is the same mistake as extracting into the docroot — by the time you look, the thing you were checking for has already happened.
 
@@ -282,14 +333,16 @@ It looks for three things most import tooling ignores:
 |---|---|
 | **Code in autoloaded options** | Runs on every page load, invisible in the filesystem, survives any file-level clean |
 | **Suspicious scheduled tasks** | Re-creates files after you clean them — this is why malware appears to "come back" |
-| **Administrator rows** | Persistence that outlives deleting the file that created the account |
+| **Accounts, by name** | Every administrator is listed with login, e-mail and registration date, and any account with two or more signs of having been planted is named as a finding (below). Persistence that outlives deleting the file that created it |
 
 Patterns are quote-agnostic: `mysqldump` emits single quotes, phpMyAdmin and several backup plugins emit double. A pattern matching one style silently passes dumps produced by the other.
+
+**What a planted account looks like.** The backdoor on the first field test was `wpadmin<random>`, registered at exactly `00:00:00`, dated *before* the owner's own account although its ID came after (IDs only go up, so a registration date that runs backwards against the ID was written by hand), and stripped to `a:0:{}` instead of deleted. Each of those has an innocent explanation on its own; an account showing **two or more** is reported as planted. A customer import with every date at midnight shows one signal per account and is not flagged.
 
 ### Importing
 
 ```sh
-wp-import.sh apply [id] [--accept-findings] [--force]
+wp-import.sh apply [id] [--accept-findings] [--force] [--no-remediate] [--keep-files]
 ```
 
 Gated on the scan. Never scanned → refuses. CRITICAL → refuses without `--force`. HIGH → refuses without `--accept-findings`. Every override is recorded with who made it.
@@ -306,13 +359,42 @@ Refusing outright would be wrong — people import compromised sites *deliberate
 | `wp-config.php` | Old credentials, old salts, often security-weakening defines |
 | `.htaccess` | Handler injection lives here |
 | mu-plugins | **Active on arrival** — no activation step to withhold |
-| Executable files in uploads | Quarantined as evidence, not deleted |
+| Executable files in uploads | Quarantined as evidence, not deleted, with their paths kept (two webshells with the same name stay two pieces of evidence) |
+
+**Then it cleans up what the scan found — automatically** (skip with `--no-remediate`):
+
+| What | Done |
+|---|---|
+| PHP renamed so it does not run (`.php.bak`, `.php.suspected`, …) | Kept out of the import, set aside with its path |
+| Escape-obfuscated PHP outside plugins and themes | Kept out of the import, set aside with its path |
+| A wordpress.org plugin whose files differ from its published copy | Reinstalled at the same version from wordpress.org; the modified copy quarantined. An added backdoor file cannot survive, because the plugin is replaced, not overwritten |
+| An administrator or role-stripped account with two or more planted-account signals | **Locked, not deleted**: every role removed, the password replaced with one nobody knows, every session ended, and the e-mail changed so a reset link goes nowhere (the attacker controls the real address). What it was is recorded on the account |
+| Commercial plugins, themes, a suspicious subscriber, more than five suspect accounts at once | Reported for a human. There is no published copy to restore a commercial plugin from, and a batch of look-alike accounts is a data import, not a backdoor |
+
+This is `wp-malware-scan.sh remediate --apply` (see [Malware & Integrity Scanning](#malware--integrity-scanning)), run without asking because an import of a site to be cleaned is the case it exists for.
 
 **Then it re-hardens**, because an import undoes hardening: `home`/`siteurl` rewritten for this deployment, salts regenerated (invalidating every session the source site had), scheduled tasks cleared, and administrators listed for review — any you don't recognise is a backdoor that survives deleting the file that created it.
 
 **One trap handled explicitly.** This VM uses a randomised table prefix, so an imported dump needs rewriting. Rewriting *table names alone* is the classic "changed the prefix and lost admin access" — `wp_capabilities`, `wp_user_level` and `wp_user_roles` are stored as meta **values** and carry the prefix too. Miss them and every user imports with no capabilities, presented as a successful import. The rewrite is also quote-agnostic, because `mysqldump` emits single quotes and phpMyAdmin emits double.
 
+After loading, any option or user-meta **key** still carrying the source prefix is renamed and then counted. Both compare the first bytes exactly — `LEFT(key, n) = 0x…` — and never with `LIKE`, where `_` matches any character: the pattern `wp_%` also matches this VM's own `wp5c1e9a_…`, so the count reported correctly renamed keys as stranded, and a second `apply` renamed them again to `wp5c1e9a_c1e9a_capabilities`. With an exact comparison, running `apply` again changes nothing.
+
 **Design and remaining stages: [docs/IMPORT-DESIGN.md](docs/IMPORT-DESIGN.md).** The central rule, and why the design came before the code: nothing from the archive is reachable by the web server, or executed by anything, until it has been scanned. The obvious implementation — extract into the document root, then scan — leaves a webshell live and serving for as long as the scan takes, on a site you're importing *because* you suspect it's compromised.
+
+
+### Cleaning up
+
+An import leaves a full copy of a client's site and database twice: the archives in the inbox, and the unpacked staging set. Neither is needed once the site is live, and both are what nobody should find on the disk later.
+
+- **After a successful import**, `apply` (and so `restore`) deletes:
+  - the staging copy;
+  - **the archives it was made from**, every part of an UpdraftPlus set included.
+
+  It keeps the small part that is evidence: `quarantined/` (files withheld from the import) and `meta/` (what was staged, shell-history copies, the source list). `--keep-files` keeps everything.
+- **`wp-import.sh clean <id>`** does the same later. A set that was extracted and never imported is removed whole, with its archives.
+- **`wp-import.sh clean --all`** clears every staging set and the inbox. It asks first; `--yes` skips the question.
+- **A daily job** runs `clean --stale 30 --yes`. Anything left in the inbox or in staging for 30 days is removed and logged to syslog as `wp-import`.
+- **Only the inbox is touched.** Only files the set recorded as its sources are deleted, and only if they are inside the inbox. A source list pointing anywhere else is ignored.
 
 ## Planning the network before you build
 
@@ -364,7 +446,7 @@ it writes one.
 
 ## Managing a fleet
 
-You do not need to build a fleet manager, and **[docs/FLEET.md](docs/FLEET.md)** explains why — it is three separate problems solved by three existing tools, not one thing to build.
+**[docs/FLEET.md](docs/FLEET.md)** splits fleet management into three separate problems: is the VM alive, is WASP healthy inside it, and is WordPress maintained. Existing tools answer the first and third. For the second, WASP now ships its own console, **WASP Hive** (below), and the per-VM signals still work with any monitor you already run.
 
 The short version: **[Pulse](https://github.com/rcourtman/Pulse)** on the Proxmox host gives you a single visual dashboard of every WASP VM — CPU, RAM, disk, up/down, links to each console — deployed as one LXC that auto-discovers guests via the Proxmox API. That answers "is the VM alive" for the whole fleet, free, with nothing installed on the VMs themselves.
 
@@ -376,7 +458,59 @@ validate-wordpress.sh --check --prom   # Prometheus text, for Grafana at scale
 wp-notify.sh --heartbeat               # absence = the VM is gone
 ```
 
-Feed those to a hosted checker (healthchecks.io, Uptime Kuma) with one check per VM and you have complete fleet monitoring today, with no central server to run or secure. A small read-only aggregator VM makes sense later *if* that gets noisy — but only then, and it should hold status, never the fleet's credentials.
+Feed those to a hosted checker (healthchecks.io, Uptime Kuma) with one check per VM and you have fleet-wide up/down monitoring with no central server to run.
+
+### WASP Hive — one page for the whole fleet
+
+![WASP Hive fleet view](docs/hive-fleet.png)
+
+When a red/green per VM is not enough, **WASP Hive** shows what is behind it, for every VM on one page:
+
+- health;
+- known vulnerabilities, with CVEs;
+- malware findings;
+- file integrity, for WASP's own tooling and for core and plugins;
+- CrowdSec bans, alerts and top scenarios;
+- backups;
+- what egress is open right now;
+- which controls are on.
+
+Trends cover 30 days. A compliance view maps that evidence onto **CIS Controls v8, PCI DSS 4.0, the HIPAA Security Rule, SOC 2 and NIST CSF 2.0**. It states, beside each control, what a WASP VM cannot show (the MSP's processes) and what does not apply to one (physical security, stored card data under the supported payment scope), with the reason. It is evidence mapping, not certification, and the page says so. If you run **Wazuh**, the Hive also shows each VM's agent status, file-integrity events and SCA benchmark results, read from the manager.
+
+It is built to hold status and never the keys:
+
+- **No connection to the VMs.** Each VM *pushes* a report every 15 minutes over TLS pinned to the Hive's own key. The Hive never connects to a VM and holds no credential that could.
+- **One token, one power.** Each VM's token can only replace that VM's own report.
+- **Read-only dashboard.** It needs a password and an authenticator code. Every change (enrolling a VM, adding a user) is made with `hive-admin` on the Hive's console.
+- **No dependencies.** The server is Python's standard library only.
+
+**Build the Hive with this same installer.** Run `install.sh` on the Proxmox host and choose **2) A WASP Hive** at the first question, or preset `WASP_ROLE=hive`. It asks:
+
+- the VM, network and SSH-key questions;
+- who may open the dashboard;
+- which networks the WASP VMs are on;
+- the certificate name.
+
+It builds a 1 vCPU / 1 GB / 8 GB Alpine VM, and on first boot it verifies and installs the Hive. On an existing Alpine VM, `hive/install-hive.sh` does the same by hand.
+
+```sh
+# on the Proxmox host
+WASP_ROLE=hive ./install.sh
+# then on the Hive
+doas hive-admin user-add alice                          # password + authenticator
+doas hive-admin enroll wp-acme-www --client "Acme"      # prints a line to run on that VM
+```
+
+**Join at install.** When building a WASP VM, the installer asks for that line. It can also be preset as `WASP_HIVE_ENROLL` for a scripted rollout. The VM joins the Hive as the last step of its install, and the line, which holds the token, is then removed from `vars.sh`.
+
+**The path from a VM to its Hive** is set in the egress part of the menu (Security → 25), or with `wasp-egress.sh hive set <address>`:
+
+- **Who sends.** The report goes from the VM itself, not from WordPress, so Squid is not involved.
+- **What is opened.** A Hive on 443 needs nothing opened. On another port, with egress restricted, exactly one rule is added, to that address and port.
+- **Names.** A name is resolved once and that address is used. A DNS change cannot redirect the report.
+- **Checking it.** `wasp-egress.sh hive test` shows the key the Hive presents next to the pin the VM trusts.
+
+Setup, the security model, what each VM reports, the Wazuh connector and the full compliance mapping with every exemption: **[docs/HIVE.md](docs/HIVE.md)**. On a VM, `wasp-hive-report.sh` does the reporting (`status`, `show`, `enroll`, `leave`; menu → Security → 23 and 24). It runs from cron only once the VM is enrolled.
 
 **The one caution:** WordPress-agency tools like MainWP centralise plugin updates and client reports, but they work by holding a key that controls every connected site — a single point of compromise for the whole portfolio, in direct tension with WASP's design. If you adopt one, protect its dashboard harder than any single client site. The monitoring layers above avoid this entirely because they observe rather than control, and that is the principle to keep: **monitor with tools that watch, not tools that hold the keys.**
 
@@ -435,17 +569,116 @@ So this is **deliberately not wired into ban notifications.** A WordPress site b
 
 CTI describes what an address does **globally**. For what it did to *your* site, `wp-forensics.sh timeline` is the tool.
 
+## Request inspection: CrowdSec AppSec (optional)
+
+By default CrowdSec on WASP reads **logs**. It sees an exploit attempt after Apache has served it, and bans the address so the *next* request is dropped. **AppSec** moves the check in front of the application: every PHP request, body included, is shown to CrowdSec's AppSec component *before WordPress runs*. If a rule matches, the request gets a 403. The difference is banning the scanner after its exploit attempt versus refusing the attempt itself.
+
+It is **off by default** and offered at install (or later with `wasp-appsec.sh on`, menu → Security → 28), because it costs memory and CPU.
+
+**Light ruleset only.** WASP loads in-band rules only:
+
+- CrowdSec's virtual patches (`crowdsecurity/appsec-virtual-patching`), one targeted rule per known plugin or core CVE;
+- the generic rules (`crowdsecurity/appsec-generic-rules`).
+
+The **OWASP Core Rule Set is not loaded**, in band or out of band. The configuration is `payload/crowdsec/appsec/wasp-appsec-light.yaml`.
+
+> **Memory: read this before switching it on.** CrowdSec 1.8.x has an **open report of AppSec memory growing without bound under load**: [crowdsecurity/crowdsec#4797](https://github.com/crowdsecurity/crowdsec/issues/4797). The cause is the coraza transformation cache. The reporter saw ~2.5 GB with the CRS out of band; the fix is milestoned for 1.8.3. The light ruleset runs far fewer transformations, but the same code is in the path. So:
+>
+> - **The cap.** The CrowdSec container stays capped at **512 MB**, as it always has been.
+> - **The watchdog.** It runs every 5 minutes and restarts CrowdSec at **448 MB**, before the kernel kills it. Each restart is logged with the reason and counted on the WASP Hive.
+> - **During a restart (~15 s):** requests pass **uninspected** (fail-open, the default) and log detection pauses.
+> - **Recommended:** **2 GB RAM and 2 vCPU** for a VM running AppSec. The installer says so if the VM is smaller.
+>
+> **CPU:** one extra local HTTP round trip per PHP request, typically 1–5 ms, never more than the 200 ms timeout. Under a flood that is CPU the site does not get.
+
+**What is inspected, and what is not:**
+
+- **PHP requests only.** Static files never reach PHP. On a WordPress site, every endpoint an attacker can exploit is PHP.
+- **Bodies up to 128 KiB** (`--max-body`, at most 1 MiB). A larger request is still checked by URI, arguments and headers, but its body is not forwarded. This is logged.
+- **Multipart uploads.** The form fields are forwarded; the uploaded files are not. PHP never runs from uploads on WASP, and that is the control that covers an uploaded file.
+- **Rule results.** A match on a rule that asks for a captcha or challenge gets a plain 403: there is no captcha page on this path.
+
+**How it is wired:**
+
+1. **The forwarder.** `payload/php-conf/wasp-appsec.php` is mounted into the WordPress container and loaded with `auto_prepend_file`, before any WordPress or plugin code. It follows CrowdSec's AppSec protocol: the original method, URI, host, user agent and HTTP version in `X-Crowdsec-Appsec-*` headers, the client address as mod_remoteip resolved it, the original headers and the body. A client cannot choose the address AppSec judges, because any `X-Crowdsec-Appsec-*` header it sends is dropped. The forwarder never uses the container's egress proxy settings.
+2. **The listener.** It runs inside the CrowdSec container on port 7422. The only client allowed to reach it is the WordPress container (10.89.10.3 → 10.89.10.1), by one firewall rule (`wasp:appsec`, managed by `wasp-fw-rule.sh`). Every request must also carry a bouncer API key.
+3. **The API key.** On a VM with a local LAPI, `wasp-appsec.sh on` makes the key itself. On a VM that reports to a **central LAPI** (upstream mode, the usual setup behind a reverse proxy), AppSec checks the key against that LAPI, so the key is made there:
+
+   ```sh
+   cscli bouncers add <vm>-appsec                    # on the LAPI host
+   doas wasp-appsec.sh on --key-file /root/appsec.key   # on the VM
+   ```
+
+   At install, the same key can be pasted when AppSec is chosen. The key sits in the secrets directory WordPress can read, because PHP has to send it. A bouncer key reads the decision list and changes nothing, so a compromised site that takes it learns which addresses are banned and nothing more.
+4. **It checks itself, and rolls itself back.** If the listener does not come up, or refuses the key, everything is undone: the listener config, the firewall rule and the forwarder. CrowdSec is then restarted as it was. Once it is on, `wasp-appsec.sh test` proves three things:
+   - the engine allows a clean request;
+   - the engine blocks CrowdSec's own test URI;
+   - the same test request **through the site** gets a 403, which is the end-to-end check.
+
+**If AppSec cannot be reached** (CrowdSec restarting or stopped), requests pass uninspected by default and the failure is logged once a minute. `--fail-closed` refuses them with a 503 instead. Choose fail-closed only if the site would rather be down than uninspected.
+
+**One conflict to know about.** A plugin firewall that sets its own `auto_prepend_file` (Wordfence's "extended protection", for example, through `.htaccess` or `.user.ini`) replaces this forwarder for the site's requests. `wasp-appsec.sh status` detects it. Keep one of the two.
+
+```sh
+doas wasp-appsec.sh status          # on/off, listener, memory vs threshold, restarts
+doas wasp-appsec.sh on              # local LAPI;  add --key-file F on an upstream VM
+doas wasp-appsec.sh test            # engine allows clean, blocks test; site blocks test
+doas wasp-appsec.sh off
+```
+
+**The firewall rule it adds is managed by `wasp-fw-rule.sh`.** The same
+tool holds the one rule `wasp-egress.sh hive set` may add for a WASP Hive on
+a port other than 443. Each rule is named (`wasp:appsec`, `wasp:hive`),
+applied to the running ruleset, and persisted in
+`/etc/wp-install/wasp-rules.nft`, which `/etc/nftables.nft` includes. It is
+checked with `nft -c` before it is kept, so a rule that does not load is
+never left for the next boot. `wasp-fw-rule.sh list` shows both, live and on
+disk. Output rules are inserted above the restricted egress list's final
+drop, so `wasp-fw-rule.sh` refuses Proxmox management and mail ports outright.
+
+> **Before 10.13 AppSec was claimed and not running.** Every WASP VM installed the `crowdsecurity/appsec-wordpress` collection. Nothing had ever configured an AppSec listener, or anything to send requests to one, so those rules inspected nothing. The install banner nevertheless listed "appsec-wp" among the active layers. The banner and this README now say what runs. The compliance view (WASP Hive) scores application-layer filtering as **partial** without AppSec and **pass** with it.
+
 ## Egress control (Squid)
 
 This is the **destination** boundary for WordPress's web traffic — the fine-grained layer. There is also a coarser VM-wide [outbound firewall](#outbound-firewall-optional-host-service-layer) that restricts *ports* for the host's own services; the two are complementary layers, not alternatives. This section is the one that matters most, because 443 is open at the port level either way, and 443 is where exfiltration goes — so filtering by destination is what actually contains a compromised WordPress.
 
 ```sh
-wasp-egress status        # mode, allowlist, recent denials
-wasp-egress test          # PROVE the boundary holds
-wasp-egress discovery     # what got blocked, for classification
-wasp-egress allow <domain>
-wasp-egress maintenance enable --duration 90 --reason "..." --host api.example.com
+wasp-egress status                      # mode, allowlist, what is open temporarily, recent denials
+wasp-egress test                        # PROVE the boundary holds
+wasp-egress discovery                   # what got blocked, for classification
+wasp-egress allow <domain>              # open for 60 minutes, then closed automatically
+wasp-egress allow <domain> --for 15     # …for 15
+wasp-egress allow <domain> --permanent  # theme and builder vendors only
+wasp-egress fileshare open dropbox      # a file-sharing service, 60 minutes at most
+wasp-egress temporary                   # everything open temporarily, and for how long
+wasp-egress close <domain> | --all      # close temporary entries now
+wasp-egress maintenance enable --duration 45 --reason "..." --host api.example.com
 ```
+
+**Nothing reaches the outside permanently unless you said `--permanent`.** The permanent list should hold WordPress.org, what WASP itself needs (Wordfence, CrowdSec, MaxMind, Alpine), and the theme or builder vendors the site updates from — nothing else. Every other entry is temporary: an `allow` without `--permanent`, a file-sharing service, a maintenance window, the host of an import download. Each closes by itself after **60 minutes at most**, and that does not depend on anyone running a command: cron runs `wasp-egress expire` every minute. (Before 10.11 a window's expiry was only checked when `wasp-egress` was next run, so a window nobody looked at again stayed open in Squid.) The CrowdSec LAPI is not on this list at all: the agent reaches it from the host, through the [outbound firewall](#outbound-firewall-optional-host-service-layer).
+
+### File-sharing services
+
+| Service | Hosts opened together |
+|---|---|
+| `dropbox` | `.dropbox.com`, `.dropboxusercontent.com` |
+| `gdrive` | `.drive.google.com`, `.usercontent.google.com` |
+| `onedrive` | `onedrive.live.com`, `1drv.ms`, `.1drv.com`, `api.onedrive.com`, `.microsoftpersonalcontent.com`, `.sharepoint.com` |
+| `wetransfer` | `.wetransfer.com`, `.wetransfer.net`, `we.tl` |
+| `box` | `.box.com`, `.box.net`, `.boxcloud.com`, `.boxcdn.net` |
+| `syncedtool` | `activeit.syncedtool.com` |
+
+A service opens as the whole set because a share link redirects: Dropbox hands the file over from `*.dropboxusercontent.com`, Drive from `drive.usercontent.google.com`. Opening only the host in the link fails at the redirect. MEGA is not offered: its files are decrypted in the browser, so no command-line download can fetch one.
+
+```sh
+doas wasp-egress.sh fileshare list
+doas wasp-egress.sh fileshare open dropbox gdrive --for 30
+doas wasp-egress.sh fileshare close
+```
+
+**`wp-import.sh fetch url` needs none of this.** Given a link on any of these services it opens that service for its own download, under its own tag, and closes it when the download ends or fails — without touching anything an operator opened for the same host. A file host that is not on the list can be named once with `wasp-egress import-source add <host>`; it is then opened the same way, one download at a time.
+
+The installer used to ask whether to allow `activeit.syncedtool.com`. It no longer asks: SyncedTool is one of the services above, opened when it is needed and closed after.
 
 ### Two controls, and both are load-bearing
 
@@ -478,7 +711,7 @@ Denied destinations are **never promoted automatically**. Classify each as REQUI
 
 ### Maintenance windows, not an open mode
 
-There is no permanent "allow everything". A window takes a reason of at least ten characters, is capped at 120 minutes, records who opened it, emails the fact, and **closes itself**. Expiry is checked on every command, so it can't outlive its duration because nobody ran a timer.
+There is no permanent "allow everything". A window takes a reason of at least ten characters, is capped at **60 minutes** (it was 120), records who opened it, emails the fact, and **closes itself** — every minute from cron, and on every command. A window opened on 10.10 is carried over on upgrade and capped the same way.
 
 ### Keeping it current
 
@@ -1198,10 +1431,13 @@ fixes. The installer asks which builder you use and allows only that one through
 the egress proxy. To add another later:
 
 ```sh
-doas wasp-egress.sh allow .elegantthemes.com    # Divi
-doas wasp-egress.sh allow .elementor.com        # Elementor
-doas wasp-egress.sh discovery                   # what the site actually reaches
+doas wasp-egress.sh allow .elegantthemes.com --permanent    # Divi
+doas wasp-egress.sh allow .elementor.com --permanent        # Elementor
+doas wasp-egress.sh discovery                               # what the site actually reaches
 ```
+
+Without `--permanent` an `allow` closes again within the hour, which is right
+for a one-off and wrong for a vendor the site updates from.
 
 Nothing is allowed that you did not ask for. Every entry is a destination a
 compromised WordPress may reach, so a builder you do not run is pure surface.
@@ -1490,6 +1726,12 @@ and skips that step. Either way this is what actually gets used:
 │   ├── templates/                # the 2 files needing install-time values, as __TOKEN__ templates
 │   ├── init.d/, cron/, apache-conf/, php-conf/, mariadb-conf/,
 │   │   apache-mods/, mu-plugins/, crowdsec/, etc/    # static config files, copied verbatim
+├── hive/                       # WASP Hive, the fleet console — its own Alpine VM (docs/HIVE.md)
+│   ├── hive_server.py           #   the service (Python standard library only)
+│   ├── hive_admin.py            #   hive-admin: enroll, rotate, revoke, users, audit
+│   ├── compliance.json          #   evidence checks and framework mappings
+│   ├── static/                  #   the dashboard: one page, one script, one stylesheet
+│   └── install-hive.sh, hive.initd
 ├── test/
 │   ├── test-wordpress-vm.sh     # integration test harness (see test/README.md)
 │   └── README.md
@@ -1572,7 +1814,7 @@ The other standing design decision is **rootful, not rootless, Podman** (see [Kn
 - Apache-level IP restriction on `/wp-admin` and `wp-login.php`, independent of the network firewall and reverse-proxy-aware via `mod_remoteip`.
 - Optional custom `/wp-admin` slug — and it's a real boundary, not a cosmetic one: the default `/wp-login.php` returns `403` unless the request actually came through the slug's rewrite, and a must-use plugin keeps WordPress's own generated login/logout/redirect URLs pointed at the slug so the feature can't lock you out of your own site.
 - The [8G Firewall](https://perishablepress.com/8g-firewall/) v1.4 `.htaccess` ruleset (query-string, request-URI, user-agent, method, and referrer filtering), placed ahead of WordPress's own rewrite block.
-- [CrowdSec](https://www.crowdsec.net/) with the `apache2`, `wordpress`, `linux`, `sshd`, `http-cve`, and `appsec-wordpress` collections, enforced via a native nftables bouncer.
+- [CrowdSec](https://www.crowdsec.net/) with the `apache2`, `wordpress`, `linux`, `sshd` and `http-cve` collections reading the logs, enforced via a native nftables bouncer or upstream at the proxy. Optional **AppSec request inspection** (light ruleset; see [Request inspection](#request-inspection-crowdsec-appsec-optional)). The `appsec-wordpress` rules are installed on every VM, but they inspect requests only when AppSec is on.
 - Optional MaxMind GeoLite2 country allow/block-listing at the Apache module level, before PHP ever runs. Credentials are protected via a `--netrc-file`, never on a command line (see [GeoIP Country Filtering](#geoip-country-filtering)).
 - A dedicated non-root SSH admin account (`wheel` + `doas`); root SSH login is disabled unconditionally in the normal path.
 - Kernel hardening sysctls (`kptr_restrict`, `dmesg_restrict`, `yama.ptrace_scope`, `unprivileged_bpf_disabled`, the `fs.protected_*` family, and more).
@@ -1774,8 +2016,18 @@ wp-plugins.sh install two-factor --activate   # what the installer runs for you
 
 Without a token, `wp-plugins.sh status` (update availability) still works — you lose vulnerability matching only.
 
+**Both run together.** With a token, every scan matches the installed plugins and themes against the Wordfence feed *and* asks WPVulnerability about each one; WPVulnerability alone covers WordPress core, PHP and MariaDB. A vulnerability reported by both, with the same CVE, is printed once. Either source on its own still makes a complete scan, so a VM without a token is scanned rather than unscanned.
+
+**How WPVulnerability answers are read.** The rules are the ones the provider's own client applies (checked against its source):
+
+- A plugin, theme, PHP or MariaDB entry applies when the installed version is inside its stated bounds — both, or whichever one is given. An entry with **no** bounds does not apply. Earlier builds treated "no bounds" as "every version" and reported entries the provider itself would not.
+- Core's endpoint is per version, so everything it returns applies.
+- **No record** (a 404 or an error flag) is normal for commercial and bespoke plugins: reported as not checked by that source, not as a failure.
+- **No answer** makes the scan **INCOMPLETE**, which is never shown as clean. A rate limit (429), a timeout or a 5xx is retried twice — after `Retry-After` when the server sends one, otherwise after 5 and then 15 seconds, capped at 60 — before it counts. Only a 429 that survives every try stops the run asking. This used to give up after one refusal, so a momentary limit on the unattended daily run made the whole site INCOMPLETE.
+- Answers are cached for 12 hours: one request per component per day.
+
 ```sh
-wp-plugins.sh vulns                          # scan (Wordfence)
+wp-plugins.sh vulns                          # scan (Wordfence + WPVulnerability)
 wp-plugins.sh vuln-sources                   # what's enabled and why
 wp-plugins.sh vuln-source wpvulnerability off # stop sending component names
 wp-plugins.sh vuln-refresh                   # force a feed refresh
@@ -1808,11 +2060,15 @@ wp-notify.sh --test       # send a test alert now
 
 | Job | Emails on |
 |---|---|
-| Vulnerability scan | any CRITICAL/HIGH/MEDIUM finding |
+| Vulnerability scan | any CRITICAL/HIGH/MEDIUM finding, **and any run that did not complete** |
 | Malware scan | **CRITICAL only** |
 | Database backup | **any failure** — no cooldown |
+| **Weekly security report** | **always** — Monday, whether or not anything was found |
+| Automated remediation | whenever it runs |
 
-**Sent host-side via `msmtp`, not through WordPress.** Reusing `wp_mail()` would be the tidier reuse, but these alerts fire when something is wrong — and "WordPress or MariaDB is down" is both the moment an alert matters most and the moment `wp_mail()` cannot run. Credentials come from the same `smtp.php` the mu-plugin uses; no second config is written, and the password reaches msmtp via `--passwordeval` rather than the argument list where `ps` would expose it.
+**Sent host-side via `msmtp`, not through WordPress.** Reusing `wp_mail()` would be the tidier reuse, but these alerts fire when something is wrong — and "WordPress or MariaDB is down" is both the moment an alert matters most and the moment `wp_mail()` cannot run. Credentials come from the same `smtp.ini` the mu-plugin uses; no second config is written, and the password reaches msmtp via `--passwordeval` rather than the argument list where `ps` would expose it.
+
+> **Before 10.11 these emails were not being sent.** `wp-notify.sh` handed msmtp a password command written for the old `smtp.php` format while the settings lived in `smtp.ini`, so msmtp authenticated with an empty password and every alert — scan findings, backup failures — failed. The failure was logged as `SEND FAILED` in syslog and nowhere else, because the jobs that send exit 0 either way. A VM still on `smtp.php` was treated as not configured and sent nothing at all. Both are fixed, and `test/test-notify.sh` runs the real password command against a real `smtp.ini`. **On an existing VM, update `wp-notify.sh` and run `doas wp-notify.sh --test`.**
 
 **Alerts are deduplicated by content**, once per 24h by default. A daily scan that emails the same unpatched plugin every morning becomes a filter rule within a week — and then the finding that matters arrives unread. Change the findings and you get a new alert immediately; repeat the same ones and you don't.
 
@@ -1827,8 +2083,12 @@ Not configured? Everything still logs to syslog — `doas grep -E 'wp-vulns|wp-m
 
 | When | Job | Reports |
 |---|---|---|
-| Daily 06:30 | Vulnerability scan (Wordfence feed) | syslog `wp-vulns`, only on findings |
-| Daily 03:30 | Malware scan — structural + core + DB | syslog `wp-malware`, only on findings |
+| Daily 06:30 | Vulnerability scan (Wordfence feed + WPVulnerability) | syslog `wp-vulns` and email, on findings or an incomplete run |
+| Monday 07:15 | **Weekly security report** | **email, always** |
+| Every minute | Close expired temporary egress (`wasp-egress expire`) | syslog `wasp-egress`, when something closes |
+| Every 15 min | Report to a WASP Hive (`wasp-hive-report.sh send`), **only once enrolled** | syslog `wasp-hive` on failure; a pin mismatch is named |
+| Every 5 min | AppSec memory watchdog (`wasp-appsec.sh watchdog`), **only when AppSec is on** | syslog `wasp-appsec` on a restart, with the reason |
+| Daily 03:30 | Malware scan — structural + core + DB | syslog `wp-malware`; email on CRITICAL |
 | Sunday 03:45 | YARA signature scan | syslog `wp-malware`, only on findings |
 | Monday 07:00 | Plugin/theme update availability | syslog `wp-plugins`, only when updates pending |
 | Daily 02:00 | Verified database backup | — |
@@ -1836,7 +2096,14 @@ Not configured? Everything still logs to syslog — `doas grep -E 'wp-vulns|wp-m
 
 Daily rather than weekly for vulnerabilities is deliberate: Wordfence adds dozens of records per week, and disclosure-to-exploitation for WordPress plugins is frequently measured in hours. A weekly scan can leave a known-exploited plugin live for six days.
 
-Every job is **silent when there is nothing to report**. A daily "nothing found" trains you to ignore it, and an ignored alert is worse than none because it manufactures the feeling of monitoring.
+Every daily job is **silent when there is nothing to report**. A daily "nothing found" trains you to ignore it, and an ignored alert is worse than none because it manufactures the feeling of monitoring.
+
+**The weekly report is the exception, on purpose.** Silence on a clean day also looks exactly like a VM whose scans stopped running or whose mail stopped going out. So every Monday at 07:15 UTC each VM sends one report, whatever it says: a fresh vulnerability check with the sources used, when the daily vulnerability scan last ran and whether it completed, the last malware scan's result, and what egress is open temporarily. The subject line says **ATTENTION** when a daily scan has not run for 48 hours, a scan is incomplete, or there is a CRITICAL malware finding. With a dozen VMs, the Monday inbox is the fleet check: **a VM whose report did not arrive is the one to look at.**
+
+```sh
+doas wp-vuln-cron.sh --digest           # send it now (also menu: Security → 22)
+doas wp-vuln-cron.sh --digest --print   # just print it
+```
 
 ```sh
 doas grep wp-vulns /var/log/messages       # what the scan found
@@ -1845,7 +2112,7 @@ doas wp-plugins.sh vulns                   # run it now
 
 Clean output means *no disclosed vulnerability in that feed* — not that the site is safe. Around 46% of plugin vulnerabilities have no patch when disclosed, and a plugin nobody has audited has no CVEs by definition.
 
-*Vulnerability data from Wordfence Intelligence; records sourced from MITRE remain © MITRE Corporation.*
+*Vulnerability data from Wordfence Intelligence; records sourced from MITRE remain © MITRE Corporation. Vulnerability data from WPVulnerability.*
 
 ---
 
@@ -2007,7 +2274,10 @@ job, or a later sitting — so this works during the install or afterwards.
 ```sh
 # On the LAPI host. If it runs in a container, as it does on NPMplus,
 # prefix with: podman exec crowdsec
-cscli machines add wp01 --password 'generated-password'
+# -f /dev/null matters: without it cscli also writes the new login into the
+# LAPI host's own credentials file, and refuses because that file exists.
+# Never --force -- that overwrites the LAPI host's own login.
+cscli machines add wp01 --password 'generated-password' -f /dev/null
 
 # On the WASP VM
 doas wp-hardening.sh cs-lapi http://10.20.10.10:8080/ wp01 'generated-password'
@@ -2015,6 +2285,10 @@ doas wp-hardening.sh cs-lapi http://10.20.10.10:8080/ wp01 'generated-password'
 
 That re-creates the agent against the new LAPI, confirms it authenticated,
 stops the local bouncer, removes its nftables table, and records the topology.
+With [restricted egress](#outbound-firewall-optional-host-service-layer), it
+first checks that this VM may reach the LAPI's port at all; if not it changes
+nothing and names the `egress-allow` command. The installer allows the LAPI by
+itself; this check is for a LAPI added or moved later.
 If it cannot authenticate it says so and changes nothing permanent — the
 credentials are the easy part to get wrong and the easy part to retry.
 
@@ -2346,11 +2620,26 @@ Generate it filled in with your own values:
 wp-hardening.sh nginx-snippet
 ```
 
+**Generated by 10.10 or earlier? Generate it again.** Those builds printed `\$host`, `\$remote_addr` and `\"…\"` with a backslash in front. nginx takes `\$host` as literal text, so the VM received a `Host` header with a backslash in it, and stock nginx refuses the `add_header` lines outright. Search the Advanced tab of each proxy host for a backslash before `$` or `"`. The output from 10.11 on passes `nginx -t` as printed.
+
 What follows is the reference version. **Apply section A first, restart NPM, confirm the site still loads, then do section B.** A server block naming a `limit_req` zone that doesn't exist yet fails to load, and NPM answers **503 for the entire host** — the whole site, not just the admin path.
 
-#### A. NPM host → `/data/nginx/custom/http_top.conf`
+#### A. NPM host → `http_top.conf`
 
-Create the file if it isn't there, then restart the NPM container.
+The path depends on which NPM you run:
+
+| | File |
+|---|---|
+| **NPMplus** | `/opt/npmplus/custom_nginx/http_top.conf` on the host (`/data/custom_nginx/` inside the container) |
+| **Nginx Proxy Manager** | `/data/nginx/custom/http_top.conf` inside the container |
+
+NPMplus migrates `/data/nginx/custom/` once and then deletes it, so a file created there afterwards is never read and nothing says so. Create the file if it isn't there, restart the container, then confirm it was loaded:
+
+```sh
+nginx -T 2>/dev/null | grep 'zone=wplogin'   # inside the NPM container
+```
+
+It must print the `limit_req_zone` line. If it prints nothing, section B will not load.
 
 ```nginx
 # POST only. An empty key is not rate limited, so every GET — the CSS, JS
@@ -2824,11 +3113,15 @@ wp-malware-scan.sh quarantine <file>
 
 | Layer | What it catches | Noise |
 |---|---|---|
-| **Structural** | `.php` in `wp-content/uploads`, PHP hidden in `.jpg`, world-writable files, stray PHP | Near zero — nothing legitimate does these |
+| **Structural** | `.php` in `wp-content/uploads`, PHP hidden in `.jpg`, world-writable files, stray PHP | Near zero — nothing legitimate does these, apart from WordPress's directory-index guards, which are recognised by content |
 | **Core integrity** | Any modified or missing WordPress core file | Zero — compared against `/usr/src/wordpress` in the **pinned** image |
 | **YARA** | Webshells, obfuscation, request-data execution | Low; tiered critical/high/suspicious |
 | **Database** | Code in autoloaded options, rogue admins, injected post content | Low, and unique — file-only scanners miss all of it |
 | **ClamAV** | Broad signatures, uploaded binaries | Optional, not installed by default |
+
+**Directory-index guards are the one legitimate PHP in uploads.** Plugins write `uploads/<dir>/index.php` holding nothing but `<?php // Silence is golden.` so the web server cannot list the directory. The structural check recognises one by *content* — at most 256 bytes, and nothing in it but the opening tag and that comment — and counts it instead of reporting it. The name buys nothing: an `index.php` with anything more in it is CRITICAL like any other PHP in uploads.
+
+**Pointed at a tree with no `wp-content`, it says so.** Every structural check is relative to `<path>/wp-content`, so pointed one directory too high they would all pass having looked at nothing. `--path` must be the WordPress root; `wp-import.sh scan` finds that root itself.
 
 **Core integrity is the strongest check here**, and it's a side effect of digest pinning: the pinned image contains pristine WordPress core, is read-only, and was already Trivy-scanned. Most scanners have to fetch a checksum list over the network and trust it.
 
@@ -2845,6 +3138,48 @@ Answer yes and it's installed with signatures fetched and a weekly scan (Sunday 
 **On Linux Malware Detect (maldet/LMD):** deliberately not included. It installs by piping an unsigned shell script from a third-party host — the same supply-chain pattern this project refuses for the Trivy installer — and its signatures overlap ClamAV heavily. Real trust cost, marginal added coverage.
 
 **It reports; it does not delete.** Auto-removal breaks working sites on a false positive, and on a real compromise it destroys the evidence of how they got in — which is the part that stops it recurring. `quarantine` moves a file aside reversibly and records its original path.
+
+### What the first real infection taught the structural layer
+
+The first compromised site imported with WASP carried a hex-obfuscated SEO-spam injector as `mu-plugins/<name>.php.bak` — found and disarmed by renaming by a previous cleaner, still present — and a planted administrator. The scanner reported nothing about either: its structural checks looked at uploads, and YARA had no literal `eval`, `base64_decode` or `curl_exec` to match because every function name was a `\xNN` escape behind a dispatcher. Three checks now cover that shape, shared through `wasp-threats.sh` so the importer, the daily scan and the clean-up cannot disagree:
+
+| Check | Severity |
+|---|---|
+| PHP renamed so it does not run | HIGH, by name. Nothing builds or ships these; a cleaner made them out of a file they were afraid of |
+| Escape-obfuscated PHP — at least 64 escapes, in runs, making up at least 20% of the file | CRITICAL outside plugins and themes, HIGH inside them |
+| A top-level mu-plugin WASP did not install | SUSPECT. It runs on every request; fine if you put it there |
+| An account with two or more planted-account signals (live database) | HIGH, by name |
+
+**The obfuscation threshold is measured, not guessed.** Across WordPress core, WooCommerce, Yoast SEO, Elementor, Jetpack, PhpSpreadsheet, TCPDF, phpseclib and wp-cli (about 21,000 PHP files) the densest legitimate file — phpseclib's DES S-box table — is 14%. Only escapes next to another escape count: WordPress core's HTML5 entity table is a quarter isolated `\x00` separators, which is how real code writes a byte, while hiding a name means escaping every letter in a row. A stand-in built like the field-test injector measures 48%. YARA carries the same rule (`wpvm_escape_density`) for the weekly signature scan.
+
+**`wasp-threats.sh`** is where those patterns live: read-only, usable on its own against any tree or dump, and the one copy the importer, the scanner and the clean-up all call.
+
+```sh
+wasp-threats.sh renamed    /path/to/wp-content     # PHP renamed so it does not run
+wasp-threats.sh obfuscated /path/to/wp-content     # percent, escapes, file
+wasp-threats.sh foreign-mu /path/to/wp-content/mu-plugins
+gzip -dc backup.sql.gz | wasp-threats.sh dump-users wp_   # accounts from a dump, never loaded
+```
+
+`suspect-users` takes `id, login, email, registered, capabilities` as tab-separated lines and prints the accounts that look planted, with the signals each shows. Reach for it directly when a backup arrives from somewhere you do not want to import yet, or to check a dump a client sent before you quote the work.
+
+### Automated remediation
+
+```sh
+doas wp-malware-scan.sh remediate                # the plan; changes nothing
+doas wp-malware-scan.sh remediate --apply        # carry it out (asks you to type REMEDIATE)
+doas wp-malware-scan.sh remediate --apply --yes  # unattended
+```
+
+One pass over what the checks above find:
+
+- **Files** — PHP in uploads that is not a directory-index guard, renamed PHP, escape-obfuscated PHP outside plugins and themes, handler overrides in uploads, and renamed copies of `wp-config.php` (a database password the web server may serve as plain text) are **quarantined with their paths kept**, under `/var/lib/wp-quarantine/remediate-<time>/`, with a timeline captured first and every move in `manifest.tsv`.
+- **Plugins** — `wp-plugins.sh repair-modified`: every wordpress.org plugin whose files differ from what wordpress.org published for that version is moved aside and reinstalled clean. If no clean copy can be fetched, the original goes back and the failure is reported; a broken site is not a cleaner one.
+- **Accounts** — `wp-plugins.sh lock-user`: no role, unknown password, sessions ended, unreachable e-mail. Undo with `wp-plugins.sh unlock-user <id> <role> <email>`. Only administrators and role-stripped accounts are locked automatically, and never more than five at once.
+
+It does not touch themes or commercial plugins (no published copy to restore from), options in the database (`db` reports code in an option; deleting one blind breaks sites), or anything outside the WordPress tree — those are listed "for a human". And it removes what was found, not how it got in: `wp-forensics.sh entry-class` is the next step, or the site is reinfected within days.
+
+On a live site it stays a decision — a false positive here moves a working file — so nothing changes without `--apply`, and the daily scan only reports. `wp-import.sh apply` runs it with `--apply --yes`.
 
 Nothing here detects a backdoor written specifically for your site. Clean output is evidence, not proof.
 
@@ -2887,6 +3222,8 @@ wp-hardening.sh egress-deny  8443            # close it again
 ```
 
 Added ports live in nftables named sets, so a change takes effect immediately with no ruleset reload, and persists via `/etc/wp-install/egress-extra.nft`.
+
+**An upstream CrowdSec LAPI is allowed for you.** A LAPI almost always listens on 8080, which is not on the list above. With a central LAPI configured at install, the ruleset allows tcp to that LAPI's address and port only, and `egress-list` shows it. If the LAPI URL names a host rather than an IP address, nftables cannot hold it, so its port is added to `egress-extra.nft` exactly as `egress-allow` would, and the installer says it could not be narrowed. `wp-hardening.sh cs-lapi`, run later, checks this filter *before* it changes anything and names the `egress-allow` command if the port is closed — otherwise the agent fails looking exactly like a wrong password.
 
 If you answer **no** at the prompt, behaviour is unchanged from before: outbound is open apart from the hypervisor management plane.
 
@@ -3261,7 +3598,7 @@ This project has been through several rounds of independent security review and 
 - Alpine base-image and container-digest verification fail **open** (warn, don't abort) under the default `standard` deployment profile. Switch to `production` at the install prompt if you need a hard abort instead — see [Deployment Profiles](#deployment-profiles).
 
 **Not yet addressed**
-- The host's outbound (egress) firewall policy is fully open (`policy accept` on the nftables output chain) — there's no restriction on what the VM itself can initiate outbound, beyond `wp-db`'s `--internal` boundary for the containers on it.
+- The host's outbound (egress) policy is open **by default** — restriction is an install-time opt-in (`RESTRICT_EGRESS=1`, see [Outbound Firewall](#outbound-firewall-optional-host-service-layer)). Unrestricted, only the hypervisor management plane and `wp-db`'s `--internal` boundary limit what the VM itself can initiate outbound. Restricted, 443 must stay open, so it removes the easy channels rather than containing a determined attacker.
 - The CrowdSec Console enrolment key is passed as a `podman exec` argument for the one-time enrolment call, visible in `argv`/`ps` output for the duration of that command — the same exposure MaxMind's credentials used to have before that was fixed. It isn't currently established whether `cscli` has an equivalent file-based credential input.
 - **"Verified" backups mean structurally verified unless you run the drill.** `wp-db-backup.sh`'s checks (dump exit status, completion marker, `gzip -t`) confirm the archive is a complete, uncorrupted `mariadb-dump` output — they do not, on their own, prove it restores. Two things now do: `wasp-selftest.sh restore-test` restores the *local* backup into a disposable MariaDB, and `wasp-offsite-backup.sh remote-restore-drill` pulls the real *remote* encrypted object, decrypts it with the recovery key, restores it, and records the RTO. Neither runs automatically — recovery is proven only when you run the drill, and the drill is the difference between believing the backups work and knowing it.
 - No mandatory gate requires a recent, verified off-VM backup before `update.sh db` performs a major MariaDB upgrade. The local pre-update backup and filesystem snapshot (see above) protect against a bad upgrade; they don't protect against losing the VM itself mid-upgrade.
@@ -3278,6 +3615,16 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.14 | **UpdraftPlus sets import as one site.** Name any part, or nothing. The set is checked as a whole: a missing or encrypted database or one hostile zip refuses it. **`wp-import.sh restore`** runs extract → scan → apply in one command. **Clean-up:** the archives and the staging copy are deleted after a successful import, `clean` handles abandoned ones, and a daily job removes anything 30 days old |
+| 10.13 | **Optional CrowdSec AppSec** request inspection, light ruleset only (no CRS), with the open 1.8.x memory-growth report stated up front and a watchdog that restarts CrowdSec below its cap. It was found that the `appsec-wordpress` rules every VM installed had never inspected anything. **install.sh builds a WASP Hive** (role choice), and **joins a VM to one** at install. **Egress to the Hive** from the menu: one rule to one address, a name resolved once and pinned |
+| 10.12 | **WASP Hive**, a read-only fleet console. VMs push a report every 15 minutes over TLS pinned to the Hive's own key, and the Hive holds no credential for any VM. One page per fleet and per VM: vulnerabilities, malware, integrity, CrowdSec, backups, open egress, controls, 30-day trends. Optional Wazuh (agent, file-integrity events, SCA). Compliance evidence mapped to CIS v8, PCI DSS 4.0, HIPAA, SOC 2 and NIST CSF 2.0, with WASP's exemptions and deviations stated per control |
+| 10.11 | **The first real import.** On a real compromised site, two findings were false alarms at full confidence, the prefix repair could rename every role key twice, and `scan` checked a directory with no `wp-content` and called it clean — while the one real piece of malware, disarmed by renaming it `.php.bak`, was reported by nothing. All fixed, with fixtures that fail on 10.10. Then **automated remediation** of that shape (planted files quarantined, modified plugins reinstalled, planted accounts locked), **egress that closes within the hour** for anything but theme vendors, file-sharing services opened only for a download, **alert e-mail that actually sends** (it authenticated with an empty password) and a **weekly security report** from every VM, WPVulnerability retries and range rules as the provider applies them, an upstream LAPI reachable under restricted egress, and an `nginx-snippet` that loads in stock nginx |
+| 10.10 | **The code review.** Hostile archives (tar hard links, unchecked zips), a login lockout that did not stop a login, MFA past the grace window made a hard wall, a malware scanner that reported clean after finding things, PHP running from uploads via `AddType`, and the database root password removed from the WordPress container |
+| 10.9 | WPVulnerability on by default, so a VM without a Wordfence token is scanned rather than unscanned |
+| 10.8 | A vulnerability scan that could not run now reports failure instead of silence; staged plugins checked before import; time-boxed import sources |
+| 10.7 | Native `.wpress` import, parsed in a locked-down container rather than on the host |
+| 10.6 | The `remoteip.conf` mask that the GeoIP rebuild undid; one version number; CrowdSec v1.8.1 |
+| 10.5 | PHP php2shell RCEs (CVE-2026-109618/109619), and the image pin that held VMs on a vulnerable PHP |
 | 10.4 | **A control that was present, correct, and inert.** Behind a reverse proxy, CrowdSec bans the real client address at a firewall no packet from that address passes through — and the production gate *required* that bouncer, so it certified detection-only as enforcing. Enforcement is now chosen (`upstream` / `detect-only` / `local`), TRUST-COUNT is asserted at every write site, split-horizon loopback is handled, and the proxy settings are presettable for a fleet. [Full notes](docs/RELEASE-10.4.md) |
 | 10.3 | Username enumeration closed; a long-window counter for slow-drip attacks the 20-minute limit cannot see; a contact handler that removes the need for a plugin; one version number instead of a release plus a build stamp that had been wrong for weeks. [Full notes](docs/RELEASE-10.3.md) |
 | Unreleased | Forensic audit fixes (root-SSH fallback removed, CrowdSec bouncer + CSP + IPv6 config hardening, `uploads-php` auto-expiry, a VM-side error-handling bug) and a `git`-free single-command install via a self-fetching `install.sh` — see below and TODO.md |

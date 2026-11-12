@@ -345,7 +345,9 @@ the research changed:
   set has to be validated before anything is extracted.
 - **Duplicator ships an `installer.php`** which is a documented site-takeover
   vector. It is deleted on sight and never executed — a tool that runs one as
-  part of "restore" is doing the attacker's work.
+  part of "restore" is doing the attacker's work. (10.11: recognised by the
+  installer *with* its archive, and deleted only outside `wp-content`; the
+  name alone matched Composer and broke plugins.)
 
 The design's central rule: nothing from the archive is reachable by the web
 server, or executed by anything, until it has been scanned. Extract to staging
@@ -371,6 +373,42 @@ Design notes already recorded above. The primitives exist: `--path` scanning,
 missing is the staging area, dump-file scanning before load, and a gate
 policy. This is the highest user-facing win and a session of its own.
 
+## Import pipeline — open after the first real import
+
+The first import of a real compromised site (10.11) fixed what it found: two
+false alarms, a prefix repair that could rename keys twice, a `scan` that
+checked nothing on a nested archive, and no check for renamed PHP. Later in
+10.11 all five items below were closed as well, together with automated
+remediation (`wp-malware-scan.sh remediate`, run by `wp-import.sh apply`).
+
+- **CLOSED (10.11) — `scan` does not look at mu-plugins.** `inspect` lists them and catches the
+  renamed case, and `apply` withholds them, but a live obfuscated
+  `mu-plugins/<name>.php` passes every structural check. mu-plugins needs its
+  own structural check: any top-level PHP there that is not WASP's own is a
+  finding. Now: SUSPECT for any foreign mu-plugin, CRITICAL if obfuscated.
+- **CLOSED (10.11) — no YARA rule for escape density.** `wpvm_escape_density`
+  and `wasp-threats.sh obfuscated`, calibrated on ~21,000 real PHP files. The real injector had no literal
+  `eval`, `base64_decode` or `curl_exec` — every name was `\xNN`-escaped and
+  dispatched through a wrapper. A PHP file that is mostly `\xNN`/`\NNN`
+  sequences is not ordinary code, and that generalises better than matching
+  names the author has already hidden.
+- **CLOSED (10.11) — rogue administrators are counted, not named.** Named from
+  the dump at `scan`, and from the live database by `wp-malware-scan.sh db`. The dump scan says
+  "N row(s) mention administrator". Printing login, email and registration
+  time would have shown the backdoor account — a foreign address, a
+  `wpadmin`+random-suffix login, registered at exactly midnight and backdated
+  before the owner's own account — in the first minute, not the fortieth.
+- **CLOSED (10.11) — cPanel account exports are not identified.** Named at
+  `inspect`; `.bash_history` surfaced at `extract`. The archive is reported as
+  `Type: unknown`, and `.bash_history`, `.trash` and the panel's state are not
+  surfaced. On the field test `.bash_history` was the most informative file
+  in the archive: it dated the previous cleanup to the minute.
+- **CLOSED (10.11) — WPVulnerability gives up after one refusal** and marks every remaining
+  component failed. On an unattended `wp-vuln-cron.sh` run a transient rate
+  limit becomes an INCOMPLETE verdict. One short backoff and a retry would
+  close it. Now three tries, honouring Retry-After (capped at 60s), for 429,
+  timeouts and 5xx alike.
+
 
 ---
 
@@ -394,6 +432,47 @@ From a systematic pass over the project rather than a summary of it.
   that runs out of space leaves you with neither the space nor the backup.
 
 ## Open — real, not yet addressed
+
+### CrowdSec AppSec (10.13): not yet run against a real engine
+
+- **Rule names and the light config.** The light configuration names its
+  rules by the hub's patterns (`crowdsecurity/base-config`,
+  `crowdsecurity/vpatch-*`, `crowdsecurity/generic-*`). If a pattern does not
+  load, `wasp-appsec.sh on` rolls back and prints CrowdSec's log; it cannot
+  leave a broken engine. Run `wasp-appsec.sh on` and `test` on the first
+  real VM, and record the AppSec memory over a week (`status`, and the
+  Hive's sparkline).
+- **The upstream-LAPI key path.** AppSec on an agent-only VM, checking the
+  key against the central LAPI, has not been run.
+- **Remove the watchdog margin when 1.8.3 ships** with the coraza fix for
+  crowdsecurity/crowdsec#4797, and memory over a week shows it holds.
+  Re-measure first.
+- **Captcha and challenge.** A rule asking for either gets a plain 403 on
+  this path. That is acceptable for the light set, which is ban-only.
+
+### WASP Hive: parts not yet run against the real thing (10.12, 10.13)
+
+- **install.sh's Hive role has not run on a real Proxmox host.** lib/03, lib/06
+  and lib/07 are exercised by `test/test-hive-role.sh`; lib/01's prompts are
+  syntax-checked only.
+
+- **`install-hive.sh` has not run on a real Alpine VM.** Its parts were each
+  checked:
+  - the nftables ruleset with `nft -c`;
+  - the self-signed certificate and its SAN;
+  - extraction of the release key from `install.sh`;
+  - a BusyBox parse of the whole script.
+
+  The server it installs ran for real throughout. First real install: confirm
+  `apk add minisign` and `qrencode` resolve from the community repository,
+  that `supervise-daemon` restarts the service, and that the 443 redirect
+  answers from another host.
+- **The Wazuh connector has not met a real manager.** It is written to the
+  documented 4.x API and tested against a stand-in. The dashboard shows its
+  last error verbatim, so the first real run will say what differs.
+- **`/var/log/wasp-hive.log` is not rotated.** It is one line per request,
+  about 1,200 lines a day for 12 VMs plus the dashboard. That is small, but
+  unbounded. Add a weekly truncate or a busybox `logrotate` stanza.
 
 ### Boot ordering says "started", not "ready"
 
