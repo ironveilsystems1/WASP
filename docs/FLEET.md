@@ -1,9 +1,11 @@
 # Fleet management for WASP
 
 You do not need to build a fleet manager, and you should not. What you need is
-already three separate problems solved by three existing tools, plus one small
-piece of glue that WASP is uniquely placed to provide. This document says which
-tool answers which question, where the seams are, and what the one warning is.
+three separate problems solved by three tools, plus one small piece of glue
+that WASP is uniquely placed to provide. Since 10.12 that glue ships with WASP
+as **[WASP Hive](HIVE.md)**, a read-only console for problem 2 below. This
+document says which tool answers which question, where the seams are, and what
+the one warning is.
 
 ## The mistake to avoid first
 
@@ -80,7 +82,14 @@ entry send on a non-zero exit.
 WASP guarantee stops holding" — without a central server to run, secure and
 patch. For most MSP portfolios it is the whole answer.
 
-### Option B — a central aggregator VM (only if you outgrow A)
+### Option B — a central aggregator VM: WASP Hive
+
+> **This now exists: [WASP Hive](HIVE.md)** (10.12). It took the shape below
+> with one change: VMs *push* their reports to it rather than being polled.
+> A poller needs a credential for every VM. With push, the Hive holds none,
+> and each VM holds a token that can only replace its own report. The
+> original reasoning is kept below. Since 10.13 `install.sh` builds the Hive
+> VM itself (role "WASP Hive").
 
 If you reach the point where per-VM checks are too many to eyeball and you want
 one WASP-specific pane, then a small aggregator makes sense. Note what it is and
@@ -152,8 +161,9 @@ a single thing that owns everything. So:
 1. **Now, zero build:** Pulse on the Proxmox host for VM-level visibility, plus
    the existing heartbeat and `--check` per VM through a hosted checker. This is
    a complete fleet-monitoring solution and costs nothing but an afternoon.
-2. **When Option A gets noisy:** build the small read-only aggregator (Option B),
-   possibly as a WASP `--role aggregator`. Status only, never credentials.
+2. **When Option A gets noisy:** add [WASP Hive](HIVE.md) (Option B). It is a
+   small Alpine VM that holds status only, never credentials, and it also
+   gives you per-VM vulnerability, malware and compliance views.
 3. **If you want central WordPress maintenance and client reports:** add MainWP,
    self-hosted, and protect its dashboard harder than anything else you run.
 4. **Only at dozens of VMs with a need for history:** Prometheus + Grafana.

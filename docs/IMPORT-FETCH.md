@@ -42,6 +42,10 @@ tcp 53, 80, 443          tcp 25, 465, 587          udp 53, 67, 68, 123
 tcp/udp @egress_extra_*  icmp echo-request
 ```
 
+plus, on a VM reporting to an upstream CrowdSec LAPI, tcp to that LAPI's
+address and port (shown by `wp-hardening.sh egress-list`). That rule is for the
+LAPI only and opens nothing for a fetch.
+
 Which means:
 
 - **Object storage and URL fetches work** — both are HTTPS on 443.
@@ -134,7 +138,16 @@ Dropbox, Drive, WeTransfer, a signed S3 link.
 doas wp-import.sh fetch url 'https://designer.example.com/backup.zip'
 ```
 
-**A file host you use repeatedly.** Name it as an import source once:
+**Dropbox, Google Drive, OneDrive, WeTransfer, Box and SyncedTool open by
+themselves.** `fetch url` recognises a link on any of them, opens that service
+— every host its downloads redirect through, not just the one in the link —
+for the download, and closes it after, even if the download fails. Nothing is
+left open, and nothing an operator opened for the same host is closed. The
+list, and the hosts each service opens: `doas wasp-egress.sh fileshare list`.
+To open one by hand, for a plugin rather than an import, for an hour at most:
+`doas wasp-egress.sh fileshare open dropbox`.
+
+**Any other file host you use repeatedly.** Name it as an import source once:
 
 ```sh
 doas wasp-egress.sh import-source add files.example.net
@@ -263,7 +276,9 @@ If they cannot run `mysqldump`, the realistic options are:
   `.sql` or `.sql.gz`, not a zip of separate table files.
 - **A backup plugin** — UpdraftPlus or Duplicator produces files and database
   together, and `wp-import.sh inspect` understands both layouts. This is
-  usually the least painful route for a non-technical sender.
+  usually the least painful route for a non-technical sender. An UpdraftPlus
+  backup is several files: put them all in the inbox, and
+  `wp-import.sh restore` takes them as one site.
 
 A files-only transfer is not an importable site. Establish that before you
 start, not after.
@@ -344,7 +359,7 @@ copy to compare against.
 | 403 on a link that works in a browser | an unquoted URL truncated at `&`, or a token that has expired. |
 | `rclone: command not found` | installed only with the s3 backup method. `apk add rclone`. |
 | Fetch refuses before starting | under 2 GB free. Deliberate — see the space section. |
-| Archive extracts, site half-works | an incomplete multi-part set. UpdraftPlus splits into `-db.gz` plus `-plugins`, `-themes`, `-uploads`, `-others`; every part must be present. |
+| Archive extracts, site half-works | an incomplete multi-part set. UpdraftPlus splits into `-db.gz` plus `-plugins`, `-themes`, `-uploads`, `-others`; `wp-import.sh list` names any part that is missing. Copy them all into the inbox and run `wp-import.sh restore`. |
 | Files transferred, no database | SFTP moved files only. The database is a separate ask. |
 
 A useful first question when a fetch fails: **was it 443 or was it 22?** The

@@ -74,6 +74,16 @@ check was written after a specific defect reached hardware:
 - `check-doas-prefix.py` — after printed commands failed on paste
 - `check-stale-branding.py` — after a superseded org name survived a rename in 15 files
 - `test-fail-closed.sh` — after four separate controls were found present and inert
+- `check-printf-escapes.py` — after a generated nginx config shipped `\$host` and failed `nginx -t`
+- `test-import-findings.sh` — after the first real compromised import cried wolf twice and missed the malware
+- `test-threats.sh` — after that malware turned out to be detectable by shape, and the clean-up worth automating
+- `test-egress-temporary.sh` — after an egress window was found to close only when someone next ran the tool
+- `test-notify.sh` — after every alert e-mail was found to authenticate with an empty password
+- `test-hive-report.sh` — written with WASP Hive; its BusyBox run caught every severity arriving as `[HIGH]` on Alpine
+- `test-hive.py` — written with WASP Hive; caught refused POSTs reaching the client as a connection reset instead of a 401
+- `test-appsec.sh` — written with the AppSec option, which itself followed the finding that the `appsec-wordpress` rules installed on every VM had never inspected a request
+- `test-hive-role.sh` — written with install.sh's Hive role
+- `test-updraft-import.sh` — written when an UpdraftPlus import still meant re-packing five files by hand, outside every import check
 
 Several caught their own class again within days of being written, including
 two mistakes made while writing the fix for the original.

@@ -76,7 +76,7 @@ once.
 
 ```sh
 # On the LAPI host — prefix with `podman exec crowdsec` if it runs in a container
-cscli machines add wp01 --password 'generated'
+cscli machines add wp01 --password 'generated' -f /dev/null
 
 # On the WASP VM
 doas wp-hardening.sh cs-lapi http://10.20.10.10:8080/ wp01 'generated'

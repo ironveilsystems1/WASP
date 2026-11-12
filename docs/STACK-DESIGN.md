@@ -367,8 +367,8 @@ be sequencing between three things that do not.
 - **`tools/` is outside the signed manifest.** `MANIFEST.sha256` covers
   `install.sh`, `lib/` and `payload/` — the files that execute during an
   install or land on the VM — and `check-manifest-coverage.py` enforces exactly
-  that set. `wasp-topology.sh` and `wasp-sign-release.sh` run as root on the
-  Proxmox host and are not signed. The topology tool reads only and changes
+  that set. `wasp-topology.sh` runs as root on the Proxmox host and is not
+  signed. (`wasp-sign-release.sh` no longer ships: it lives with the key.) The topology tool reads only and changes
   nothing, which lowers the stakes without removing them: an attacker who can
   edit it can make a plan propose an address they control.
 

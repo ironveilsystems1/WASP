@@ -41,13 +41,22 @@ all. This is the layer where a tool that "just untars it" has already lost.
 ### File level
 
 - **Webshells in uploads** — the classic. Near-zero false positives to detect,
-  because nothing legitimate puts executable PHP there.
+  because nothing legitimate puts executable PHP there — with one exception
+  that must be decided by content, not name: the `index.php` directory-index
+  guard (`<?php // Silence is golden.`) that plugins drop into each upload
+  subdirectory. Reported as compromise, it was the loudest finding on the
+  first real import, and it was a protection.
+- **Disarmed but still present** — PHP renamed so it no longer runs
+  (`<name>.php.bak`, `.disabled`, `.suspected`). It is what a previous cleaner
+  does to a file they were afraid of, and no build tool produces it. On the
+  first real import this was the malware itself, and nothing reported it.
 - **Backdoored plugins and themes** — the hard case. A modified legitimate
   plugin looks entirely normal, and there is no pristine copy to compare a
   *nulled* plugin against.
 - **mu-plugins** — worse than plugins, because they are **active on arrival**.
   There is no "activate" step to withhold. A malicious mu-plugin runs the
-  first time WordPress loads.
+  first time WordPress loads. Only top-level `*.php` loads; the rest of the
+  directory is inert, and saying otherwise about it is a false alarm.
 - **Modified core** — detectable, and the one case where a good answer exists:
   discard the imported core entirely and use the pinned image's.
 - **`.htaccess` handler injection** — `AddType application/x-httpd-php .jpg`
@@ -76,10 +85,32 @@ all. This is the layer where a tool that "just untars it" has already lost.
 
 - **Duplicator's `installer.php`** must be deleted, never executed. A
   left-behind Duplicator installer is a documented site-takeover vector; a
-  tool that runs one as part of "restore" is doing the attacker's work.
+  tool that runs one as part of "restore" is doing the attacker's work. It is
+  recognised by the whole package — `installer.php` beside its
+  `*archive.zip`/`.daf`, or `dup-installer/` — and deleted only outside
+  `wp-content`. Matching the file name alone hit Composer's `Installer.php`
+  and deleted plugins' own `installer.php`.
+- **cPanel account exports** put the site at `<account>/public_html/`. Every
+  stage that looks at "the site" must look there, not at the archive root:
+  a structural check pointed one level too high finds no `wp-content` and,
+  unless it says so, passes.
 - **UpdraftPlus** splits into several archives (`-db.gz`, `-plugins.zip`,
-  `-themes.zip`, `-uploads.zip`, `-others.zip`). Every part must be present;
-  a missing `-plugins.zip` yields a site that half-works in confusing ways.
+  `-themes.zip`, `-uploads.zip` and `-uploads2.zip`…, `-others.zip`, and
+  optionally `-mu-plugins`, `-wpcore`, `-more`). They share the prefix
+  `backup_<date>-<hhmm>_<site>_<12-hex nonce>`. Each zip holds the folders
+  *inside* `wp-content`, so the set is one site only once every part is
+  unpacked into one `wp-content`.
+  - **Since 10.14, extract and restore do that.** Any one part (or the
+    prefix) names the set.
+  - **Checked first.** Every zip passes the hostile-member checks before any
+    is unpacked, and the set is refused without its `-db.gz` or with an
+    encrypted `.crypt` one.
+  - **Unpacking.** Parts are unpacked with `unzip -n`, so two parts cannot
+    overwrite each other.
+  - **Skipped parts.** `-wpcore` and `-more` are not part of `wp-content` and
+    are skipped.
+  - **A missing part.** A missing `-plugins.zip` still yields a site that
+    half-works, so `list` and `inspect` name every missing part.
 - **`.wpress`** (All-in-One WP Migration) is a *custom* format, not an
   archive. Header per file: 255-byte name, 14-byte size, 12-byte mtime,
   4088-byte path, 8-byte CRC32 (the last two were one 4096-byte path before
@@ -96,8 +127,8 @@ all. This is the layer where a tool that "just untars it" has already lost.
 
 | Format | Detect by | Notes |
 |---|---|---|
-| **UpdraftPlus** | `backup_*-db.gz` + siblings | Multi-file; verify the set is complete first |
-| **Duplicator** | `archive.zip` + `installer.php` | Installer deleted on sight |
+| **UpdraftPlus** | `backup_<date>_<site>_<nonce>-<part>` | Implemented (10.14). Any part names the set; checked whole, staged as one site |
+| **Duplicator** | `*archive.zip` (or `.daf`) + `installer.php` beside it, or `dup-installer/` | Installer deleted on sight, outside `wp-content` |
 | **All-in-One WP Migration** | `.wpress` | Implemented. Encrypted and gzip read; bzip2 and multisite refused |
 | **BackWPup / generic** | `.tar.gz` / `.zip` + `.sql` | Best effort |
 | **Manual** | a directory + a `.sql` file | The simplest and most predictable path |
@@ -112,7 +143,7 @@ reader.
 ```
  1. INSPECT     identify format, list contents, refuse hostile members
  2. EXTRACT     to /var/lib/wasp-import/<id>/ — outside the docroot, noexec
- 3. SCAN FILES  wp-malware-scan.sh --path <staging> --json
+ 3. SCAN FILES  wp-malware-scan.sh --path <site root inside staging>
  4. SCAN DB     the dump file, before it is ever loaded
  5. REPORT      findings, with a class per finding
  6. GATE        operator decides, with the findings in front of them
@@ -122,7 +153,11 @@ reader.
 10. VERIFY      re-scan the live site; validate-wordpress.sh
 ```
 
-Steps 3 and 4 already exist. Steps 1, 2, 4's dump-scanning and 7 are the work.
+All ten steps are implemented in `wp-import.sh` (`inspect`, `extract`,
+`scan`, `apply`). Step 3 runs at the **site root**, found the same way `apply`
+finds it — the shallowest `wp-content` with `wp-includes` or `wp-config.php`
+beside it — not at the top of staging, where a nested archive has no
+`wp-content` and every structural check would pass on nothing.
 
 ### Step 2 — extraction is a security boundary
 
@@ -154,7 +189,7 @@ Discard rather than inspect, wherever a good replacement exists:
 | **`wp-config.php`** | **Discard.** Keep the receiving VM's | Contains the old site's credentials and salts, and often security-weakening defines |
 | **`.htaccess`** | **Discard.** Regenerate | Handler injection lives here; the VM's own rules are known-good |
 | **mu-plugins** | **Quarantine all, re-add ours** | Active on arrival, no activation step to withhold |
-| **`wp-content/uploads`** | Import, minus anything executable | Media is the point of the import |
+| **`wp-content/uploads`** | Import, minus anything executable (set aside with its path kept, as evidence) | Media is the point of the import |
 | **Plugins / themes** | Import, then scan for known vulnerabilities | The genuinely hard case — see below |
 | **Database** | Import after scanning, then re-harden | Content is the point |
 
@@ -260,6 +295,10 @@ Stated so the tool does not imply otherwise:
   live sites is a different, much harder problem.
 - **It does not fix the database's serialisation.** URL search-and-replace is
   delegated to `wp search-replace`, which handles serialised data correctly.
+- **It does not yet look inside mu-plugins at `scan` time.** They are withheld
+  at `apply`, and `inspect` lists them and any renamed PHP among them, but a
+  live obfuscated mu-plugin passes the structural checks. See
+  [TODO.md](../TODO.md#import-pipeline--open-after-the-first-real-import).
 
 ---
 
@@ -295,12 +334,14 @@ Stated so the tool does not imply otherwise:
 6. Re-hardening.
 7. `.wpress`. Done.
 
-Steps 1–3 alone are worth shipping: *"tell me what is in this backup before I
+All seven are done. Steps 1–3 alone were worth shipping: *"tell me what is in this backup before I
 touch it"* is a real need on its own, and it is the part with no destructive
 failure mode.
 
 ---
 
-*Plan. Nothing here is implemented yet.*
+*Written as the plan; implemented through 10.7 (`.wpress`) and corrected by
+the first real import in 10.11. How it behaves now: [README — Importing an
+existing site](../README.md) and [ARCHITECTURE.md §7](../ARCHITECTURE.md).*
 
 — **IronVeil Systems DevOps**
