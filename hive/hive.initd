@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# WASP Hive — OpenRC service. Installed as /etc/init.d/wasp-hive.
+
+name="WASP Hive"
+description="Read-only fleet console for WASP VMs"
+supervisor=supervise-daemon
+command=/usr/bin/python3
+command_args="/opt/wasp-hive/hive_server.py --config /etc/wasp-hive/hive.conf"
+command_user="hive:hive"
+output_log=/var/log/wasp-hive.log
+error_log=/var/log/wasp-hive.log
+respawn_delay=5
+respawn_max=0
+umask=077
+
+depend() {
+	need net
+	after firewall nftables
+}
+
+start_pre() {
+	checkpath -d -m 0700 -o hive:hive /var/lib/wasp-hive
+	checkpath -f -m 0640 -o hive:hive /var/log/wasp-hive.log
+}

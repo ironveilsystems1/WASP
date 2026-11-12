@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>WASP Hive</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">
+    <svg viewBox="0 0 32 32" class="logo" aria-hidden="true"><path d="M16 2 28 9v14L16 30 4 23V9z" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M16 9l6 3.5v7L16 23l-6-3.5v-7z" fill="currentColor"/></svg>
+    <span>WASP Hive</span>
+  </a>
+  <nav id="nav" hidden>
+    <a href="#/" data-nav="fleet">Fleet</a>
+    <a href="#/compliance" data-nav="compliance">Compliance</a>
+  </nav>
+  <div class="top-right" id="topright" hidden>
+    <span id="wazuh-chip" class="chip"></span>
+    <span id="refreshed" class="muted"></span>
+    <span id="who" class="muted"></span>
+    <button id="logout" class="btn ghost" type="button">Sign out</button>
+  </div>
+</header>
+
+<main id="app" aria-live="polite"></main>
+
+<template id="login-tpl">
+  <section class="login">
+    <form id="login-form" class="panel login-panel" autocomplete="on">
+      <h1>Sign in</h1>
+      <p class="muted">Read-only fleet console. Every sign-in needs a password and an authenticator code.</p>
+      <label>User<input name="user" autocomplete="username" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <label>Authenticator code<input name="totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+      <button class="btn" type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+</template>
+
+<footer class="foot muted">
+  Reports are what each VM says about itself; a compromised VM can lie. Wazuh data comes from the manager, not the VM.
+  Compliance views are evidence mapping, not certification.
+</footer>
+</body>
+</html>
