@@ -508,6 +508,12 @@ install -d -m 0755 /home/wpuser/wp/apache-conf
 chmod 0644 /home/wpuser/wp/apache-conf/remoteip-masked.conf
 WP_EXTRA_VOLS="${WP_EXTRA_VOLS} -v /home/wpuser/wp/apache-conf/remoteip-masked.conf:/etc/apache2/conf-enabled/remoteip.conf:ro"
 
+# The CrowdSec AppSec forwarder (wasp-appsec.sh). In WP_EXTRA_VOLS for the
+# same reason as the mask above: every path that recreates this container
+# reads it. Mounted whether or not AppSec is on; the .ini is what switches it.
+WP_EXTRA_VOLS="${WP_EXTRA_VOLS} -v /home/wpuser/wp/php-conf/wasp-appsec.php:/usr/local/lib/wasp/wasp-appsec.php:ro"
+WP_EXTRA_VOLS="${WP_EXTRA_VOLS} -v /home/wpuser/wp/php-conf/wasp-appsec.ini:/usr/local/etc/php/conf.d/zz-wasp-appsec.ini:ro"
+
 WP_VOL_ARGS="${WP_VOL_ARGS} ${WP_EXTRA_VOLS}"
 
 # REGRESSION FIX (found in a real deployment): wp-geoip-setup.sh rebuilds

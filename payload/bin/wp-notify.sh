@@ -101,7 +101,9 @@ _recipient() {
   _cfg user
 }
 
-_configured() { [ -r "$SMTP_FILE" ] && [ -n "$(_cfg host)" ] && [ -n "$(_recipient)" ]; }
+# Either file. This demanded smtp.ini, so a VM still on the legacy smtp.php --
+# which _cfg reads -- was "not configured" and sent nothing at all.
+_configured() { { [ -r "$SMTP_FILE" ] || [ -r "$SMTP_FILE_LEGACY" ]; } && [ -n "$(_cfg host)" ] && [ -n "$(_recipient)" ]; }
 
 send_mail() {
   _tag="$1"; _subject="$2"; _bodyfile="${3:-}"
@@ -119,21 +121,36 @@ send_mail() {
   # --passwordeval keeps the secret out of the argument list. Passing it as
   # --password would expose it in `ps` output to every local account for the
   # lifetime of the process.
-  _pwcmd="sed -n \"s/^[[:space:]]*'pass'[[:space:]]*=>[[:space:]]*'\\(.*\\)',.*/\\1/p\" ${SMTP_FILE} | head -1"
+  # BUG FIX: this read `'pass' => '...'`, the format of the old smtp.php. The
+  # relay settings moved to smtp.ini with the password base64-encoded as
+  # pass_b64, and this command went on looking for the PHP line in the INI file
+  # -- so it printed nothing, msmtp authenticated with an empty password, and
+  # every alert failed: scan findings, backup failures, all of it. The error
+  # went to a file nobody reads, and the cron jobs that call this exit 0
+  # regardless. Read whichever file _cfg reads, the same way.
+  if [ -r "$SMTP_FILE" ]; then
+    _pwcmd="sed -n 's/^[[:space:]]*pass_b64[[:space:]]*=[[:space:]]*//p' '${SMTP_FILE}' | head -1 | tr -d '[:space:]' | base64 -d"
+  else
+    _pwcmd="sed -n \"s/^[[:space:]]*'pass'[[:space:]]*=>[[:space:]]*'\\(.*\\)',.*/\\1/p\" '${SMTP_FILE_LEGACY}' | head -1"
+  fi
 
   case "$_enc" in
     ssl) _tlsargs="--tls=on --tls-starttls=off" ;;
     *)   _tlsargs="--tls=on --tls-starttls=on" ;;
   esac
 
+  # BusyBox ash sets HOSTNAME itself, but not every shell does (dash does not),
+  # and a subject of "[wordpress-vm]" is useless with a dozen VMs reporting to
+  # one inbox. Ask the system when the shell did not say.
+  _hn="${HOSTNAME:-$(hostname 2>/dev/null || echo wordpress-vm)}"
   {
     printf 'From: %s\n' "$_from"
     printf 'To: %s\n' "$_to"
-    printf 'Subject: [%s] %s\n' "${HOSTNAME:-wordpress-vm}" "$_subject"
+    printf 'Subject: [%s] %s\n' "$_hn" "$_subject"
     printf 'X-WPVM-Tag: %s\n' "$_tag"
     printf 'Content-Type: text/plain; charset=UTF-8\n'
     printf '\n'
-    printf 'Host    : %s\n' "${HOSTNAME:-unknown}"
+    printf 'Host    : %s\n' "$_hn"
     printf 'Time    : %s UTC\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
     printf 'Source  : %s\n\n' "$_tag"
     if [ -n "$_bodyfile" ] && [ -r "$_bodyfile" ]; then
@@ -141,7 +158,7 @@ send_mail() {
     else
       printf '(no detail supplied)\n'
     fi
-    printf '\n--\nSent by wp-notify.sh on %s\n' "${HOSTNAME:-this VM}"
+    printf '\n--\nSent by wp-notify.sh on %s\n' "$_hn"
     printf 'Silence this class of alert: NOTIFY_COOLDOWN_HOURS in /etc/wp-install/vars.sh\n'
   } | msmtp --host="$_host" --port="${_port:-587}" --auth=on $_tlsargs \
             --user="$_user" --from="$_from" \

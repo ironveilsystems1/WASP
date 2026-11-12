@@ -208,6 +208,11 @@ chmod 644 /home/wpuser/wp/apache-conf/wp-security.conf
 # PHP security configuration
 install -m 0644 "${PAYLOAD_DIR}/php-conf/security.ini" /home/wpuser/wp/php-conf/security.ini
 chmod 644 /home/wpuser/wp/php-conf/security.ini
+# CrowdSec AppSec forwarder: mounted into every WordPress container from the
+# start, switched by wasp-appsec.sh. The .ini ships OFF (a comment only), so
+# nothing is prepended until AppSec is switched on.
+install -m 0644 "${PAYLOAD_DIR}/php-conf/wasp-appsec.php" /home/wpuser/wp/php-conf/wasp-appsec.php
+install -m 0644 "${PAYLOAD_DIR}/php-conf/wasp-appsec.ini" /home/wpuser/wp/php-conf/wasp-appsec.ini
 
 ok "Volume directories and config files ready:"
 ok "  /home/wpuser/wp/html     WordPress files   (UID 33:www-data)"

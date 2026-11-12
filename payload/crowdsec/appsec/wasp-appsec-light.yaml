@@ -1,0 +1,24 @@
+# WASP light AppSec configuration — installed by `wasp-appsec.sh on` into
+# /etc/crowdsec/appsec-configs/.
+#
+# IN-BAND ONLY, AND NO CRS. In-band rules decide the request (block or allow)
+# and are the targeted ones: virtual patches for specific CVEs, and a small set
+# of generic WordPress rules. The OWASP Core Rule Set is NOT loaded, in band or
+# out of band. That is the "light" in the name, and it is deliberate:
+#   - CRS evaluates hundreds of transformation chains per argument. The open
+#     CrowdSec report of unbounded AppSec memory growth on 1.8.x (issue #4797,
+#     coraza transformation cache) was CRS out of band, growing to ~2.5 GB.
+#     A WASP VM's CrowdSec container is capped at 512 MB.
+#   - CRS false positives on WordPress admin traffic need per-site tuning.
+#
+# The body limit keeps what one request can make the engine hold. The PHP
+# forwarder does not send bodies above its own max_body (128 KiB by default)
+# at all; this is the engine's side of the same bound.
+name: wasp/appsec-light
+default_remediation: ban
+inband_rules:
+  - crowdsecurity/base-config
+  - crowdsecurity/vpatch-*
+  - crowdsecurity/generic-*
+inband_options:
+  request_body_in_memory_limit: 131072

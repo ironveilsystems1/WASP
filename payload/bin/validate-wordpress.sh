@@ -838,6 +838,18 @@ case "${CS_ENFORCEMENT:-local}" in
     fi ;;
 esac
 
+# AppSec is optional; when it is on, a listener that is not answering means
+# every request passes uninspected (fail-open), which must not look healthy.
+if grep -q '^enabled = 1' /home/wpuser/wp/secrets/appsec.ini 2>/dev/null; then
+  _as_code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:7422/ 2>/dev/null)
+  case "$_as_code" in
+    ''|000) warn "CrowdSec AppSec is on but its listener is not answering" \
+                 "Requests pass to WordPress uninspected (fail-open) until it is back." \
+                 "wasp-appsec.sh status ; podman logs --tail 30 crowdsec" ;;
+    *) pass "CrowdSec AppSec on: requests are inspected before WordPress runs" ;;
+  esac
+fi
+
 if [ "${GEOIP_ENABLED:-0}" = "1" ]; then
   if podman exec wordpress apachectl -M 2>/dev/null | grep -q maxminddb; then
     pass "GeoIP: mod_maxminddb loaded in Apache"

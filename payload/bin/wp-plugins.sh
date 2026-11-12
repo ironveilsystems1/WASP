@@ -406,7 +406,7 @@ _sev_label() {  # score letter
   case "$2" in
     c|C) echo CRITICAL ;;
     h|H) echo HIGH ;;
-    l|L) echo LOW ;;
+    l|L|n|N) echo LOW ;;
     *)   echo MEDIUM ;;
   esac
   return 0
@@ -462,21 +462,48 @@ _wpv_get() {  # kind key -> 0 answered, 2 unknown, 1 failed
     _wa=$(( ( $(date +%s) - $(stat -c %Y "$_wc" 2>/dev/null || echo 0) ) / 3600 ))
     [ "$_wa" -lt "$WPV_CACHE_HOURS" ] && return 0
   fi
-  # Refused once this run: stop asking. The rest are failed, and said to be.
+  # Refused repeatedly this run: stop asking. The rest are failed, and said to be.
   [ -f "$VULN_CACHE/.wpv-stop.$$" ] && return 1
-  _code=$(curl -sS --max-time 20 -w '%{http_code}' -o "${_wc}.tmp" \
-            "${WPV_BASE}/${1}/${2}/" 2>/dev/null) || _code=000
-  case "$_code" in
-    200)
-      if jq -e 'type == "object"' "${_wc}.tmp" >/dev/null 2>&1; then
-        mv "${_wc}.tmp" "$_wc"
-        return 0
-      fi
-      rm -f "${_wc}.tmp"; return 1 ;;
-    404) rm -f "${_wc}.tmp"; return 2 ;;
-    429) rm -f "${_wc}.tmp"; : > "$VULN_CACHE/.wpv-stop.$$"; return 1 ;;
-    *)   rm -f "${_wc}.tmp"; return 1 ;;
-  esac
+  # Three tries, with a pause between. This gave up after one refusal and
+  # marked every remaining component failed, so on the unattended daily run a
+  # momentary rate limit turned into an INCOMPLETE verdict for the whole site.
+  # A 429 waits for Retry-After when the server states it (header names are
+  # case-insensitive, and HTTP/2 sends them lower-case), otherwise 5 then 15
+  # seconds, capped at 60. A timeout or a 5xx is retried the same way. Only a
+  # 429 that survives every try stops the run asking -- politeness to a free
+  # API -- and that is reported, never read as "no vulnerabilities".
+  _try=1
+  while :; do
+    _code=$(curl -sS --max-time 20 -w '%{http_code}' -D "${_wc}.hdr" -o "${_wc}.tmp" \
+              "${WPV_BASE}/${1}/${2}/" 2>/dev/null) || true
+    case "$_code" in [0-9][0-9][0-9]) : ;; *) _code=000 ;; esac
+    case "$_code" in
+      200)
+        rm -f "${_wc}.hdr"
+        if jq -e 'type == "object"' "${_wc}.tmp" >/dev/null 2>&1; then
+          mv "${_wc}.tmp" "$_wc"
+          return 0
+        fi
+        rm -f "${_wc}.tmp"; return 1 ;;
+      404) rm -f "${_wc}.tmp" "${_wc}.hdr"; return 2 ;;
+      429|000|5[0-9][0-9])
+        rm -f "${_wc}.tmp"
+        if [ "$_try" -ge 3 ]; then
+          rm -f "${_wc}.hdr"
+          [ "$_code" = 429 ] && : > "$VULN_CACHE/.wpv-stop.$$"
+          return 1
+        fi
+        _wait=""
+        [ "$_code" = 429 ] && _wait=$(tr -d '\r' < "${_wc}.hdr" 2>/dev/null \
+            | awk -F: 'tolower($1)=="retry-after" {gsub(/[^0-9]/, "", $2); print $2; exit}')
+        case "$_wait" in ''|*[!0-9]*) [ "$_try" = 1 ] && _wait=5 || _wait=15 ;; esac
+        [ "$_wait" -gt 60 ] && _wait=60
+        rm -f "${_wc}.hdr"
+        sleep "$_wait"
+        _try=$((_try + 1)) ;;
+      *) rm -f "${_wc}.tmp" "${_wc}.hdr"; return 1 ;;
+    esac
+  done
 }
 
 _op_true() {  # have op want. An operator this does not know reports, not hides.
@@ -491,7 +518,18 @@ _op_true() {  # have op want. An operator this does not know reports, not hides.
   esac
 }
 
-_wpv_in_range() {  # version min_op min_ver max_op max_ver
+_wpv_in_range() {  # kind version min_op min_ver max_op max_ver
+  # The rules the provider's own client applies (wpvulnerability_is_vulnerability_applicable
+  # and wpvulnerability_get_vulnerabilities): both bounds, then whichever one is
+  # given; an entry with NO bounds does not apply. Core is the exception -- its
+  # endpoint is per version, so everything it returns is for that version.
+  # This used to treat "no bounds" as "every version", which reported plugin,
+  # theme, PHP and MariaDB entries the provider itself would not.
+  _k="$1"; shift
+  if [ -z "$2$3$4$5" ]; then
+    [ "$_k" = core ] && return 0
+    return 1
+  fi
   if [ -n "$2" ] && [ -n "$3" ]; then _op_true "$1" "$2" "$3" || return 1; fi
   if [ -n "$4" ] && [ -n "$5" ]; then _op_true "$1" "$4" "$5" || return 1; fi
   return 0
@@ -529,7 +567,7 @@ _wpv_check() {  # kind key label version fix
   ' "$_wj" 2>/dev/null) || { echo "$3" >> "$VULN_CACHE/.wpv-failed.$$"; return 0; }
   [ -n "$_wrows" ] || return 0
   printf '%s\n' "$_wrows" | while IFS="$_VD" read -r _mo _mv _xo _xv _un _title _cve _score _lt; do
-    _wpv_in_range "$4" "$_mo" "$_mv" "$_xo" "$_xv" || continue
+    _wpv_in_range "$1" "$4" "$_mo" "$_mv" "$_xo" "$_xv" || continue
     _finding "$3" "$4" "$_title" "$_cve" "$_score" "$_lt" "${_un:-0}" "$5"
   done
   return 0
@@ -839,6 +877,13 @@ do_verify() {
     logger -t wasp-integrity -p auth.notice "wasp_integrity result=SKIP component=plugins reason=no_published_checksum count=${_skip}" 2>/dev/null || true
   fi
 
+  # Recorded for wasp-hive-report.sh: when this last ran and what it found.
+  mkdir -p "$VULN_CACHE" 2>/dev/null || true
+  {
+    printf 'at=%s\n' "$(date +%s)"
+    [ "$_findings" -gt 0 ] && printf 'result=fail\n' || printf 'result=pass\n'
+    printf 'modified=%s\nskipped=%s\nverified=%s\ntotal=%s\n' "${_mismatch:-0}" "${_skip:-0}" "${_ver:-0}" "${_tot:-0}"
+  } > "$VULN_CACHE/.last-verify" 2>/dev/null || true
   echo ""
   if [ "$_findings" -gt 0 ]; then
     echo "  RESULT: ${_findings} integrity finding(s). This is worth acting on."
@@ -1110,7 +1155,7 @@ do_install_file() {
   echo "  Licence + updates: enter the vendor API key in wp-admin so the theme"
   echo "  receives security fixes. Without it, it is frozen at this version."
   echo "  Its licence domain must also be reachable through the egress proxy:"
-  echo "    doas wasp-egress.sh allow .elegantthemes.com     # Divi, for example"
+  echo "    doas wasp-egress.sh allow .elegantthemes.com --permanent   # Divi, for example"
 }
 
 # ── Install a plugin from the WordPress.org directory ────────────────────────
@@ -1268,6 +1313,141 @@ do_install() {
     >> /etc/wp-install/installed-plugins.log 2>/dev/null || true
 }
 
+# ── Automated remediation: modified plugins and planted accounts ─────────────
+# Called by `wp-malware-scan.sh remediate` (the live site) and by
+# `wp-import.sh apply` (straight after an import). Kept here because this is
+# the tool that owns the wp-cli container and its egress settings.
+QUARANTINE="${QUARANTINE:-/var/lib/wp-quarantine}"
+
+# Every plugin whose files do not match what wordpress.org published for its
+# installed version: a changed file, or one that was added. One slug per line.
+# Commercial and bespoke plugins have no published checksums and never appear
+# here; they are skipped by wp-cli, not passed.
+_modified_plugins() {
+  _wp plugin verify-checksums --all --format=csv --skip-plugins --skip-themes 2>/dev/null \
+    | awk -F, 'NR>1 && $1!="" && $1!="plugin_name" {print $1}' | tr -d '"' | sort -u
+}
+
+# Reinstall each modified wordpress.org plugin at the version it claims to be,
+# from wordpress.org. The modified copy is MOVED to quarantine first -- not
+# overwritten -- so an added backdoor file cannot survive the reinstall, and so
+# the evidence is kept. If the clean copy cannot be fetched, the original goes
+# back: a broken site is not a cleaner one, and the finding still stands.
+#   repair-modified --plan          list what would be repaired, change nothing
+#   repair-modified --yes [slug…]   repair (all modified, or the slugs given)
+do_repair_modified() {
+  _plan=0; _yes=0; _only=""
+  for _a in "$@"; do
+    case "$_a" in
+      --plan) _plan=1 ;;
+      --yes)  _yes=1 ;;
+      -*)     echo "Usage: wp-plugins.sh repair-modified --plan | --yes [slug…]" >&2; return 2 ;;
+      *)      _only="${_only} ${_a}" ;;
+    esac
+  done
+  [ "$_plan" = 1 ] || [ "$_yes" = 1 ] || {
+    echo "Usage: wp-plugins.sh repair-modified --plan | --yes [slug…]" >&2; return 2; }
+
+  _mods=$(_modified_plugins)
+  if [ -n "$_only" ]; then
+    _sel=""
+    for _s in $_only; do printf '%s\n' "$_mods" | grep -qxF "$_s" && _sel="${_sel}${_s}
+"; done
+    _mods=$(printf '%s' "$_sel" | grep . || true)
+  fi
+  if [ -z "$_mods" ]; then
+    echo "  ✔ No wordpress.org plugin differs from its published copy."
+    return 0
+  fi
+  _vers=$(_wp plugin list --fields=name,version --format=csv --skip-plugins --skip-themes 2>/dev/null)
+  if [ "$_plan" = 1 ]; then
+    printf '%s\n' "$_mods" | while IFS= read -r _s; do
+      _v=$(printf '%s\n' "$_vers" | awk -F, -v s="$_s" '$1==s {print $2}' | tr -d '"')
+      printf '  REINSTALL  %s %s   (files differ from wordpress.org)\n' "$_s" "${_v:-?}"
+    done
+    return 0
+  fi
+
+  _stamp=$(date -u +%Y%m%d-%H%M%S)
+  _qd="${QUARANTINE}/plugins-${_stamp}"
+  mkdir -p "$_qd"; chmod 700 "$QUARANTINE" "$_qd" 2>/dev/null || true
+  _fail=0
+  for _s in $_mods; do
+    case "$_s" in ''|*[!A-Za-z0-9._-]*|.*) echo "  ✗ Skipping unexpected slug '${_s}'"; continue ;; esac
+    _v=$(printf '%s\n' "$_vers" | awk -F, -v s="$_s" '$1==s {print $2}' | tr -d '"')
+    _dir="${WP_HTML_DIR}/wp-content/plugins/${_s}"
+    if [ ! -d "$_dir" ]; then
+      echo "  ✗ ${_s}: not a plugin directory (single-file plugin) — repair by hand"; _fail=$((_fail+1)); continue
+    fi
+    case "$_v" in ''|*[!A-Za-z0-9.+_-]*) echo "  ✗ ${_s}: version '${_v}' is not usable — repair by hand"; _fail=$((_fail+1)); continue ;; esac
+    mv "$_dir" "${_qd}/${_s}" || { echo "  ✗ ${_s}: could not move it aside"; _fail=$((_fail+1)); continue; }
+    printf '%s\t%s\tplugin %s %s\n' "${_qd}/${_s}" "$_dir" "$_s" "$_v" >> "${QUARANTINE}/manifest.tsv"
+    if _wp plugin install "$_s" --version="$_v" --skip-plugins --skip-themes >/dev/null 2>&1 \
+       && [ -d "$_dir" ] \
+       && _wp plugin verify-checksums "$_s" --skip-plugins --skip-themes >/dev/null 2>&1; then
+      echo "  ✔ ${_s} ${_v}: reinstalled from wordpress.org; the modified copy is in ${_qd}/${_s}"
+      logger -t wasp-remediate "plugin ${_s} ${_v} reinstalled clean; modified copy ${_qd}/${_s}" 2>/dev/null || true
+    else
+      rm -rf "$_dir" 2>/dev/null
+      mv "${_qd}/${_s}" "$_dir"
+      echo "  ✗ ${_s} ${_v}: no clean copy could be installed — the ORIGINAL is back in place."
+      echo "      Is ${_v} still on wordpress.org, and is .wordpress.org reachable? (wasp-egress test)"
+      _fail=$((_fail+1))
+    fi
+  done
+  chown -R 33:33 "${WP_HTML_DIR}/wp-content/plugins" 2>/dev/null || true
+  [ "$_fail" -eq 0 ]
+}
+
+# Lock an account without deleting it. Deleting loses the evidence and, unless
+# its posts are reassigned, the content; locking keeps both and makes the
+# account useless: every role removed, the password replaced with one nobody
+# knows, every session ended, and the e-mail address changed to one that cannot
+# receive a reset link -- the attacker controls the real one. What it was is
+# recorded on the account itself (wasp_locked) and in the quarantine manifest.
+#   lock-user <id> [reason]
+#   unlock-user <id> <role> <email>
+do_lock_user() {
+  _id="${1:-}"; _why="${2:-planted-account signals}"
+  case "$_id" in ''|*[!0-9]*) echo "Usage: wp-plugins.sh lock-user <user-id> [reason]" >&2; return 2 ;; esac
+  _login=$(_wp user get "$_id" --field=user_login --skip-plugins --skip-themes 2>/dev/null) \
+    || { echo "  ✗ No user ${_id}" >&2; return 1; }
+  _mail=$(_wp user get "$_id" --field=user_email --skip-plugins --skip-themes 2>/dev/null)
+  _roles=$(_wp user get "$_id" --field=roles --skip-plugins --skip-themes 2>/dev/null)
+  _pw=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)
+  _rec="$(date -u +%Y-%m-%dT%H:%M:%SZ) roles=${_roles:-none} email=${_mail} reason=${_why}"
+  _lok=1
+  _wp user meta update "$_id" wasp_locked "$_rec" --skip-plugins --skip-themes >/dev/null 2>&1 || _lok=0
+  _wp user remove-role "$_id" --skip-plugins --skip-themes >/dev/null 2>&1 || _lok=0
+  _wp user update "$_id" --user_pass="$_pw" --user_email="locked-${_id}@wasp.invalid" \
+      --skip-email --skip-plugins --skip-themes >/dev/null 2>&1 || _lok=0
+  _wp user session destroy "$_id" --all --skip-plugins --skip-themes >/dev/null 2>&1 || true
+  mkdir -p "$QUARANTINE"; chmod 700 "$QUARANTINE" 2>/dev/null || true
+  printf 'user:%s\t%s\tlocked %s\n' "$_id" "$_login" "$_rec" >> "${QUARANTINE}/manifest.tsv"
+  if [ "$_lok" = 1 ]; then
+    echo "  ✔ Locked ${_login} (id ${_id}): no role, unknown password, sessions ended, reset mail goes nowhere"
+    echo "      Was: roles=${_roles:-none} email=${_mail}"
+    echo "      Delete once reviewed:  wp user delete ${_id} --reassign=<your id>   (via the wp-cli container)"
+    echo "      Undo if it is genuine: wp-plugins.sh unlock-user ${_id} <role> <email>"
+    logger -t wasp-remediate "locked user ${_id} ${_login}: ${_why}" 2>/dev/null || true
+  else
+    echo "  ✗ Could not fully lock ${_login} (id ${_id}). Check it by hand: wp-forensics.sh admins"
+    return 1
+  fi
+}
+
+do_unlock_user() {
+  _id="${1:-}"; _role="${2:-}"; _mail="${3:-}"
+  case "$_id" in ''|*[!0-9]*) echo "Usage: wp-plugins.sh unlock-user <user-id> <role> <email>" >&2; return 2 ;; esac
+  [ -n "$_role" ] && [ -n "$_mail" ] || { echo "Usage: wp-plugins.sh unlock-user <user-id> <role> <email>" >&2; return 2; }
+  _wp user set-role "$_id" "$_role" --skip-plugins --skip-themes >/dev/null \
+    && _wp user update "$_id" --user_email="$_mail" --skip-email --skip-plugins --skip-themes >/dev/null \
+    && _wp user meta delete "$_id" wasp_locked --skip-plugins --skip-themes >/dev/null 2>&1
+  echo "  ✔ User ${_id} restored as ${_role} <${_mail}>. The password is still unknown:"
+  echo "      they reset it from the login page, which now mails ${_mail}."
+}
+
+
 case "${1:-status}" in
   status) show_status ;;
   # ── MFA state, as a question that can actually be answered ─────────────────
@@ -1322,6 +1502,9 @@ case "${1:-status}" in
   install|add) shift; do_install "$@" ;;
   install-file|add-file) shift; do_install_file "$@" ;;
   verify|verify-checksums|checksums) shift; do_verify "$@" ;;
+  repair-modified) shift; do_repair_modified "$@" ;;
+  lock-user)       shift; do_lock_user "$@" ;;
+  unlock-user)     shift; do_unlock_user "$@" ;;
   # Cheap yes/no used by the deferred MFA installer: has the WordPress setup
   # wizard actually been completed? Silent by design -- it is called from cron
   # every 10 minutes and must not fill a log with noise while waiting.
@@ -1467,6 +1650,12 @@ case "${1:-status}" in
     echo "       wp-plugins.sh vuln-refresh          force a feed re-download"
     echo "       wp-plugins.sh set-key wordfence <token>"
     echo "       wp-plugins.sh vuln-source wpvulnerability on|off"
+    echo ""
+    echo "  Clean-up (wp-malware-scan.sh remediate runs these for you):"
+    echo "       wp-plugins.sh repair-modified --plan | --yes [slug ...]"
+    echo "                                           reinstall plugins whose files differ from wordpress.org"
+    echo "       wp-plugins.sh lock-user <id> [reason]   no role, unknown password, sessions ended"
+    echo "       wp-plugins.sh unlock-user <id> <role> <email>"
     echo ""
     echo "Why this exists: ~91% of WordPress vulnerabilities are in plugins and"
     echo "themes, which live in the mounted volume — not in the container image"

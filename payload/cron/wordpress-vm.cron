@@ -19,6 +19,12 @@
 # wp-hardening.sh's UPLOADS_PHP_MARKER / check-expiry). Silent no-op unless
 # it's actually open past the limit, so this doesn't add routine noise.
 */15 * * * * /usr/local/bin/wp-hardening.sh check-expiry >/dev/null 2>&1
+# Close temporary egress (wasp-egress allow, fileshare, maintenance, import
+# downloads) the minute it expires. Before 10.11 nothing ran on a schedule: a
+# window closed only when someone next ran wasp-egress, so one nobody looked
+# at again stayed open in Squid while its own message said it had closed.
+# A no-op that touches nothing when no entry has expired.
+* * * * * /usr/local/bin/wasp-egress.sh expire >/dev/null 2>&1
 # WordPress plugin/theme/core update check (Monday 07:00 UTC). Reports via
 # syslog only when something is actually pending, so it doesn't become noise
 # the operator learns to ignore. Never auto-updates -- see wp-plugins.sh for
@@ -41,6 +47,22 @@
 # Silent unless something matches a disclosed vulnerability or the scan could
 # not complete.
 30 6 * * * /usr/local/bin/wp-vuln-cron.sh
+# Weekly security report (Monday 07:15 UTC), sent whether or not anything was
+# found: when each scan last ran, whether it completed, what it found, and what
+# egress is open. The daily jobs are silent on a clean day, which makes a VM
+# whose scans or mail stopped look exactly like a healthy one; this does not.
+15 7 * * 1 /usr/local/bin/wp-vuln-cron.sh --digest >/dev/null 2>&1
+# Import leftovers (daily 05:10 UTC): archives and staging copies older than
+# 30 days hold a full copy of a client's site and database. Imported sets
+# keep their quarantine and record. Logged to syslog as wp-import.
+10 5 * * * /usr/local/bin/wp-import.sh clean --stale 30 --yes >/dev/null 2>&1
+# CrowdSec AppSec memory watchdog (every 5 min). Does nothing unless AppSec is
+# on. Restarts CrowdSec at 448 MB, below its 512 MB cap, because AppSec memory
+# can grow without bound on 1.8.x (crowdsecurity/crowdsec#4797).
+*/5 * * * * /usr/local/bin/wasp-appsec.sh watchdog >/dev/null 2>&1
+# Report to a WASP Hive, if this VM has been enrolled in one (every 15 min).
+# Push only: the Hive holds no way in to this VM. See docs/HIVE.md.
+*/15 * * * * [ -r /etc/wp-install/hive.conf ] && /usr/local/bin/wasp-hive-report.sh send >/dev/null 2>&1
 # Weekly self-test (Sunday 05:30 UTC): restore the newest backup into a
 # throwaway database and verify the data is really there, and prove the
 # read-only candidate account genuinely refuses writes. Weekly rather than

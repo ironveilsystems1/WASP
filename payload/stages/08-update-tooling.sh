@@ -153,6 +153,10 @@ install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/was
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-offsite-backup.sh" /usr/local/bin/wasp-offsite-backup.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-forensics.sh" /usr/local/bin/wp-forensics.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-import.sh" /usr/local/bin/wp-import.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-threats.sh" /usr/local/bin/wasp-threats.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-hive-report.sh" /usr/local/bin/wasp-hive-report.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-appsec.sh" /usr/local/bin/wasp-appsec.sh
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-fw-rule.sh" /usr/local/bin/wasp-fw-rule.sh
 # Not executable and not on PATH: wp-import.sh mounts it read-only into a
 # throwaway container. It never runs on this VM.
 mkdir -p /usr/local/lib/wasp

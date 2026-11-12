@@ -1,0 +1,19 @@
+# CrowdSec AppSec listener for WASP — installed by `wasp-appsec.sh on`
+# into /etc/crowdsec/acquis.d/, removed by `wasp-appsec.sh off`.
+#
+# Listens on all addresses because the only client is the WordPress container
+# (10.89.10.3), which reaches the host at its wp-front gateway, 10.89.10.1.
+# nftables admits exactly that: rule "wasp:appsec" in the input chain, from
+# 10.89.10.3 to 10.89.10.1 tcp/7422. Every other source hits the input chain's
+# drop policy, and a request still needs a valid bouncer API key.
+#
+# One routine: the light ruleset is a few hundred cheap virtual-patching
+# rules, and one goroutine bounds the CPU this can take on a 2-vCPU VM.
+source: appsec
+name: wasp-appsec
+listen_addr: 0.0.0.0:7422
+appsec_configs:
+  - wasp/appsec-light
+routines: 1
+labels:
+  type: appsec

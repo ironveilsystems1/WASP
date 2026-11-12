@@ -86,7 +86,11 @@ if command -v logrotate >/dev/null 2>&1; then
   # not validate".
   _lr_probe=$(mktemp)
   printf 'include /etc/logrotate.d/wordpress-vm\n' > "$_lr_probe"
-  _lr_err=$(logrotate --debug "$_lr_probe" 2>&1 >/dev/null)
+  # --debug narrates everything it reads on stderr ("reading config file",
+  # "Handling 1 logs", ...), so treating any stderr as failure warned on every
+  # install, against a config that was fine. Only "error:" lines are errors;
+  # the exit status is 0 either way (an unknown option is "ignoring line").
+  _lr_err=$(logrotate --debug "$_lr_probe" 2>&1 >/dev/null | grep -i 'error') || _lr_err=""
   if [ -z "$_lr_err" ]; then
     ok "Log rotation active (daily + 50M cap, 14 days retained, copytruncate)"
   else

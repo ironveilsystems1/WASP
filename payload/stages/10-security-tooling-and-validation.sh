@@ -512,6 +512,44 @@ ok "  Full run     : validate-wordpress.sh"
 ok "  One area     : validate-wordpress.sh --section security"
 ok "  Every failure prints a copy-paste remediation command"
 
+# ── CrowdSec AppSec, if chosen at install ─────────────────────────────────────
+# Last, after validation: it restarts CrowdSec and WordPress, and its own test
+# needs both healthy. A failure here rolls itself back and leaves the VM as it
+# would be without AppSec; it does not fail the install.
+if [ "${APPSEC_MODE:-off}" = "light" ]; then
+  ts "Switching on CrowdSec AppSec (light ruleset)"
+  _ak=""
+  if [ -n "${APPSEC_KEY:-}" ]; then
+    _ak=$(mktemp); chmod 600 "$_ak"; printf '%s\n' "$APPSEC_KEY" > "$_ak"
+  fi
+  if /usr/local/bin/wasp-appsec.sh on --yes ${_ak:+--key-file "$_ak"}; then
+    ok "AppSec on — PHP requests are inspected before WordPress runs"
+  else
+    warn "AppSec could not be switched on and was rolled back. See: wasp-appsec.sh status"
+  fi
+  [ -n "$_ak" ] && rm -f "$_ak"
+  sed -i "s/^APPSEC_KEY=.*/APPSEC_KEY=''/" /etc/wp-install/vars.sh 2>/dev/null || true
+fi
+
+# ── WASP Hive, if a line was given at install ─────────────────────────────────
+# The enroll line carries this VM's token. It is used once and then removed
+# from vars.sh; the token lives on only in /etc/wp-install/hive.token (0600).
+if [ -n "${HIVE_ENROLL:-}" ]; then
+  ts "Joining the WASP Hive"
+  read -r _hu _hn _ht _hp <<HIVEENROLL
+$HIVE_ENROLL
+HIVEENROLL
+  /usr/local/bin/wasp-egress.sh hive set "$_hu" >/dev/null 2>&1 || true
+  if /usr/local/bin/wasp-hive-report.sh enroll "$_hu" "$_hn" "$_ht" "$_hp"; then
+    ok "Reporting to the WASP Hive at ${_hu} as ${_hn}"
+  else
+    warn "Could not reach the WASP Hive at ${_hu}. Enrollment is saved; cron retries every 15 minutes."
+    warn "  Check the path: doas wasp-egress.sh hive test"
+  fi
+  unset _hu _hn _ht _hp
+  sed -i "s/^HIVE_ENROLL=.*/HIVE_ENROLL=''/" /etc/wp-install/vars.sh 2>/dev/null || true
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 touch /var/log/wp-install.done
 # Retry IP detection — filter out Podman bridges (10.89.x.x) and loopback.
@@ -569,7 +607,11 @@ echo "╠═══════════════════════�
 echo "║  Security layers active:                                  ║"
 echo "║   L1  nftables       default-deny + wp-front/wp-db rules ║"
 echo "║   L2  Apache         ADMIN_CIDR + custom slug + 8G WAF   ║"
-echo "║   L3  CrowdSec       apache2 + wordpress + appsec-wp     ║"
+if [ "${APPSEC_MODE:-off}" = "light" ]; then
+echo "║   L3  CrowdSec       logs + AppSec request inspection    ║"
+else
+echo "║   L3  CrowdSec       logs: apache2 + wordpress (no WAF)  ║"
+fi
 echo "║   L4  Podman         cap-drop ALL, static IPs, DB=internal║"
 echo "║   L5  Kernel         rp_filter=2, syncookies, ip_forward ║"
 if [ "${ADMIN_USER_CREATED:-0}" = "1" ]; then

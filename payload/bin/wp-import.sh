@@ -10,7 +10,14 @@
 #   wp-import.sh extract <file>        unpack to staging, outside the docroot
 #   wp-import.sh scan [id]             scan staged files AND the dump
 #   wp-import.sh staged                what is currently staged
-#   wp-import.sh apply [id]            normalise, import, re-harden
+#   wp-import.sh apply [id]            normalise, import, re-harden, remediate
+#                [--accept-findings] [--force] [--no-remediate] [--keep-files]
+#   wp-import.sh restore [file|set]    extract, scan and apply in one go; cleans up
+#   wp-import.sh clean <id> | --all | --stale <days>
+#                                      remove leftover copies of imported sites
+#
+# UpdraftPlus: give extract or restore ANY part of the set (or nothing, if it
+# is the only thing in the inbox) and every part is taken together.
 #
 # Reads zip, tar.gz, gzip dumps and All-in-One WP Migration .wpress archives.
 #
@@ -40,6 +47,7 @@ STAGING=/var/lib/wasp-import/staging
 WP_ROOT=/home/wpuser/wp/html
 RCLONE_CONF=/etc/wp-install/rclone.conf
 WPRESS_READER=/usr/local/lib/wasp/wasp-wpress-reader.php
+THREATS=/usr/local/bin/wasp-threats.sh
 # Only the WORDPRESS_* values. The root password stays out of containers that
 # run site code. A VM built before 10.10 has just the one file.
 WP_ENV_FILE=/etc/wordpress/wp.env
@@ -73,7 +81,147 @@ _tar_special() { tar -tzvf "$1" 2>/dev/null | grep -cE '^[^-d]| -> | link to '; 
 # refuse when these return nothing for a file that is a zip.
 _zip_members() { unzip -Z1 "$1" 2>/dev/null; }
 _zip_special() { unzip -Z "$1" 2>/dev/null | grep -c '^l'; }
+
+# The WordPress root inside a staged tree: the shallowest directory holding
+# wp-content alongside wp-includes or wp-config.php. Prints nothing if none.
+# Used by apply AND scan. scan used to be pointed at the top of the staging
+# tree, so for a nested archive (a cPanel account puts the site at
+# <account>/public_html/) every structural check looked at a wp-content that
+# did not exist and printed [ok]. "No PHP files in wp-content/uploads" on the
+# first field test meant "no wp-content/uploads here", not "none found".
+_site_root() {
+  if [ -d "$1/wp-content" ]; then printf '%s\n' "$1"; return; fi
+  _sr=$(find "$1" -maxdepth 6 -type d -name wp-content 2>/dev/null \
+        | while IFS= read -r _c; do
+            _p=$(dirname "$_c")
+            if [ -d "${_p}/wp-includes" ] || [ -f "${_p}/wp-config.php" ]; then
+              printf '%s\t%s\n' "$(printf '%s' "$_c" | tr -cd / | wc -c)" "$_c"
+            fi
+          done | sort -n | head -1 | cut -f2)
+  [ -n "$_sr" ] && dirname "$_sr"
+}
 _zip_bytes()   { unzip -l "$1" 2>/dev/null | tail -1 | awk '{print $1+0}'; }
+
+# ── UpdraftPlus sets ─────────────────────────────────────────────────────────
+# UpdraftPlus splits ONE backup into several files sharing a prefix:
+#   backup_2026-11-01-0300_Site_Name_0a1b2c3d4e5f-db.gz
+#   …-plugins.zip  …-themes.zip  …-uploads.zip (…-uploads2.zip …)  …-others.zip
+# and optionally -mu-plugins, -wpcore and -more. Each zip holds the folders
+# that live INSIDE wp-content (plugins/, themes/, uploads/, and for -others,
+# whatever else was there), so the parts only make a site once they are
+# unpacked into one wp-content. Naming any one part names the whole set.
+#
+# This used to mean unpacking and re-packing by hand -- outside the checks
+# this tool exists for. extract and restore now take the set as one import.
+_UPD_RE='^(backup_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}_.+_[0-9a-f]{12})-(db|plugins|themes|uploads|others|mu-plugins|wpcore|more)([0-9]*)\.(zip|gz|gz\.crypt)$'
+_updraft_prefix() { basename "$1" | sed -nE "s/${_UPD_RE}/\1/p"; }
+_updraft_entity() { basename "$1" | sed -nE "s/${_UPD_RE}/\2/p"; }
+# Every part of one set in a directory, by exact prefix.
+_updraft_parts() {
+  for _up in "$1"/backup_*; do
+    [ -f "$_up" ] || continue
+    [ "$(_updraft_prefix "$_up")" = "$2" ] && printf '%s\n' "$_up"
+  done | LC_ALL=C sort
+}
+# The distinct sets in a directory.
+_updraft_sets() {
+  for _up in "$1"/backup_*; do
+    [ -f "$_up" ] && _updraft_prefix "$_up"
+  done | LC_ALL=C sort -u
+}
+# What the set holds and lacks. Returns 1 when it cannot be imported.
+_updraft_report() {   # <dir> <prefix>
+  _ur=0
+  printf '  UpdraftPlus set: %s\n' "$2"
+  _uparts=$(_updraft_parts "$1" "$2")
+  for _ue in db plugins themes uploads others mu-plugins wpcore more; do
+    _un=$(printf '%s\n' "$_uparts" | while IFS= read -r _p; do
+            [ -n "$_p" ] && [ "$(_updraft_entity "$_p")" = "$_ue" ] && echo x; done | grep -c x) || _un=0
+    case "$_ue" in
+      db)
+        if printf '%s\n' "$_uparts" | grep -q -- '-db[0-9]*\.gz\.crypt$'; then
+          _bad "database   encrypted (-db.gz.crypt). Decrypt it in UpdraftPlus first:"
+          _note "             Existing backups → the backup → Database → Decrypt, then download."
+          _ur=1
+        elif [ "$_un" -gt 0 ]; then printf '    %-10s %s\n' database "present"
+        else
+          _bad "database   MISSING — the -db.gz file. Without it there are no posts, pages or settings."
+          _ur=1
+        fi ;;
+      plugins|themes|uploads)
+        if [ "$_un" -gt 0 ]; then printf '    %-10s %s\n' "$_ue" "present$([ "$_un" -gt 1 ] && echo " (${_un} parts)")"
+        else _warn "$(printf '%-10s' "$_ue") missing — the site's ${_ue} will not be imported"; fi ;;
+      others)
+        [ "$_un" -gt 0 ] && printf '    %-10s %s\n' others "present (scanned; only plugins, themes and uploads are imported)" ;;
+      mu-plugins)
+        [ "$_un" -gt 0 ] && printf '    %-10s %s\n' mu-plugins "present (scanned; withheld at import, as always)" ;;
+      wpcore|more)
+        [ "$_un" -gt 0 ] && printf '    %-10s %s\n' "$_ue" "present — not part of wp-content, not used" ;;
+    esac
+  done
+  return $_ur
+}
+# Hostile-member checks for one zip, before anything is written.
+_zip_hostile() {
+  _zl=$(_zip_members "$1")
+  if [ -z "$_zl" ]; then
+    _bad "$(basename "$1"): a zip whose member list could not be read, so it cannot be checked"
+    _note "  Reading it needs Info-ZIP:  doas apk add unzip"
+    return 2
+  fi
+  _zh=0
+  printf '%s\n' "$_zl" | grep -q '\.\./' && { _bad "$(basename "$1"): path traversal in member names"; _zh=1; }
+  printf '%s\n' "$_zl" | grep -q '^/' && { _bad "$(basename "$1"): absolute paths in member names"; _zh=1; }
+  _zs=$(_zip_special "$1") || _zs=0
+  [ "${_zs:-0}" -gt 0 ] && { _bad "$(basename "$1"): ${_zs} link or special member(s)"; _zh=1; }
+  [ "$_zh" = 0 ] || return 2
+  return 0
+}
+_abs() { printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; }
+
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+# What an import leaves behind is a full copy of a client's site and database,
+# twice: the archives in the inbox and the unpacked staging set. Neither is
+# needed once the site is live, and both are exactly what nobody should find on
+# a disk later. Removed:
+#   - the staging copy (files/ and db/)
+#   - the source archives it was made from, as recorded at extract -- and only
+#     those, and only inside the inbox: nothing outside it is ever deleted
+# Kept, because they are evidence and they are small:
+#   - quarantined/  files withheld from the import (renamed, obfuscated, mu-plugins)
+#   - meta/         what was staged, shell history copies, the source list
+# A set that was never applied has nothing to keep and is removed whole.
+_cleanup_set() {   # <id>
+  _cs="${STAGING}/$1"
+  [ -d "$_cs" ] || return 1
+  _ck=$(du -sk "$_cs" 2>/dev/null | cut -f1)
+  _cn=0
+  if [ -r "$_cs/meta/sources.txt" ]; then
+    while IFS= read -r _s; do
+      case "$_s" in "${INBOX}"/*) : ;; *) continue ;; esac
+      case "$_s" in */../*|*/./*) continue ;; esac
+      [ -f "$_s" ] || continue
+      _ck=$(( _ck + $(du -sk "$_s" 2>/dev/null | cut -f1) ))
+      rm -f "$_s" && _cn=$(( _cn + 1 ))
+    done < "$_cs/meta/sources.txt"
+  fi
+  if grep -q "id=$1 " "${STAGING}/import-log.txt" 2>/dev/null; then
+    rm -rf "$_cs/files" "$_cs/db"
+    [ -n "$(ls -A "$_cs/quarantined" 2>/dev/null)" ] || rm -rf "$_cs/quarantined"
+    _kept=$(du -sk "$_cs" 2>/dev/null | cut -f1)
+    _ok "Cleaned up $1: $(( (_ck - _kept) / 1024 )) MB freed, ${_cn} source archive(s) removed"
+    if [ -d "$_cs/quarantined" ]; then
+      _note "Kept as evidence: ${_cs}/quarantined and meta/ (${_kept} KB)"
+    else
+      _note "Kept: ${_cs}/meta (${_kept} KB) — what was imported, for the record"
+    fi
+  else
+    rm -rf "$_cs"
+    _ok "Removed staging set $1 (never imported): $(( _ck / 1024 )) MB freed, ${_cn} source archive(s) removed"
+  fi
+  [ "$(cat "${STAGING}/.latest" 2>/dev/null)" = "$1" ] && [ ! -d "$_cs/files" ] && rm -f "${STAGING}/.latest"
+  return 0
+}
 
 # Links and special files in a tree that has already been written. This is the
 # check that does not depend on any listing. It prints a count, and returns
@@ -217,8 +365,13 @@ Getting a backup onto this VM
        scp -O /path/to/backup.zip root@${VM_STATIC_IP:-vm-ip}:${INBOX}/
 
   ── Then ──────────────────────────────────────────────────────────
+       wp-import.sh restore          the whole import, one command
+     or step by step:
        wp-import.sh list
        wp-import.sh inspect <file>
+
+  UpdraftPlus: copy EVERY file of the backup here (backup_*-db.gz and
+  all the backup_*.zip). They are imported together as one site.
 
   Inspect only reads. It will not extract or install anything, so it is
   safe to run on a backup you do not trust — which is the point.
@@ -301,34 +454,50 @@ fetch)
       if [ "${EGRESS_PROXY:-0}" = "1" ] || podman container exists squid 2>/dev/null; then
         _imp_proxy="${WASP_PROXY_URL:-http://10.89.10.2:3128}"
         _note "Fetching through the egress proxy (${_imp_proxy})."
-        _note "  If this is refused, allow the host first:"
-        _note "    doas wasp-egress.sh allow $(printf '%s' "$_src" | sed 's|^[a-z]*://||; s|/.*||')"
+        _note "  Dropbox, Drive, OneDrive, WeTransfer, Box and SyncedTool open by"
+        _note "  themselves for this download. Any other host, if refused:"
+        _note "    doas wasp-egress.sh import-source add $(printf '%s' "$_src" | sed 's|^[a-z]*://||; s|[/:?#].*||')"
       fi
-      # A named import source opens for this download and closes after it.
-      # See import-source in wasp-egress.sh for why it is not on the allowlist.
+      # A file-sharing service, or a named import source, opens for this
+      # download and closes after it -- under its own tag, so closing it never
+      # closes something an operator opened for the same host. A share link
+      # redirects (Dropbox to dropboxusercontent.com, Drive to
+      # usercontent.google.com), so a service opens as the whole set of hosts
+      # its downloads use. See `fileshare` in wasp-egress.sh.
       _imp_win=0
+      _imp_tag="import-$$"
       _imp_close() {
         [ "$_imp_win" = 1 ] || return 0
         _imp_win=0
-        /usr/local/bin/wasp-egress.sh maintenance disable >/dev/null 2>&1 \
-          || _warn "Could not close the egress window now. It expires by itself."
+        /usr/local/bin/wasp-egress.sh close --tag "$_imp_tag" >/dev/null 2>&1 \
+          || _warn "Could not close the download's egress now. It expires by itself within the hour."
       }
       _imp_host=$(printf '%s' "$_src" | sed 's|^[a-zA-Z]*://||; s|[/:?#].*||' | tr 'A-Z' 'a-z')
-      if [ -n "$_imp_proxy" ] \
-         && /usr/local/bin/wasp-egress.sh import-source has "$_imp_host" 2>/dev/null; then
-        if /usr/local/bin/wasp-egress.sh maintenance status 2>/dev/null | grep -q 'window OPEN'; then
-          _warn "An egress window is already open, so it is left as it is."
-          _note "If ${_imp_host} is not in it, the proxy will refuse this download."
-        elif /usr/local/bin/wasp-egress.sh maintenance enable --duration 120 \
-               --reason "import download from ${_imp_host}" --host "$_imp_host" >/dev/null; then
-          _imp_win=1
-          trap '_imp_close' EXIT
-          trap 'exit 130' INT TERM
-          _note "Opened ${_imp_host} for this download only."
-          sleep 2   # squid -k reconfigure returns before the new list is live
+      if [ -n "$_imp_proxy" ]; then
+        _imp_fs=$(/usr/local/bin/wasp-egress.sh fileshare match "$_imp_host" 2>/dev/null) || _imp_fs=""
+        _imp_ok=1
+        if [ -n "$_imp_fs" ]; then
+          /usr/local/bin/wasp-egress.sh fileshare open "$_imp_fs" --for 60 --tag "$_imp_tag" \
+            --reason "import download from ${_imp_host}" >/dev/null || _imp_ok=0
+          _imp_what="${_imp_fs}"
+        elif /usr/local/bin/wasp-egress.sh import-source has "$_imp_host" 2>/dev/null; then
+          /usr/local/bin/wasp-egress.sh allow "$_imp_host" --for 60 --tag "$_imp_tag" \
+            --reason "import download from ${_imp_host}" >/dev/null || _imp_ok=0
+          _imp_what="${_imp_host}"
         else
-          _bad "Could not open the egress window for ${_imp_host}."
-          exit 1
+          _imp_what=""
+        fi
+        if [ -n "$_imp_what" ]; then
+          if [ "$_imp_ok" = 1 ]; then
+            _imp_win=1
+            trap '_imp_close' EXIT
+            trap 'exit 130' INT TERM
+            _note "Opened ${_imp_what} for this download only (60 minutes at most)."
+            sleep 2   # squid -k reconfigure returns before the new list is live
+          else
+            _bad "Could not open egress for ${_imp_what}."
+            exit 1
+          fi
         fi
       fi
       _note "Downloading to ${INBOX}/${_name} …"
@@ -376,8 +545,18 @@ list)
     exit 0
   fi
   ls -lh "$INBOX" | tail -n +2 | awk '{printf "  %-46s %8s  %s %s\n", $9, $5, $6, $7}'
+  _sets=$(_updraft_sets "$INBOX")
+  if [ -n "$_sets" ]; then
+    echo ""
+    printf '%s\n' "$_sets" | while IFS= read -r _px; do
+      _updraft_report "$INBOX" "$_px" || true
+    done
+    echo ""
+    echo "  An UpdraftPlus set imports as one:  wp-import.sh restore"
+  fi
   echo ""
   echo "  Inspect one:  wp-import.sh inspect <name>"
+  echo "  All in one :  wp-import.sh restore [name]   (extract, scan, import, clean up)"
   df -h / | awk 'NR==2{printf "  Disk: %s free of %s\n", $4, $2}'
   ;;
 
@@ -424,6 +603,12 @@ inspect)
     backup_*-db.gz|backup_*.gz) _fmt="UpdraftPlus (database part)" ;;
     backup_*.zip)               _fmt="UpdraftPlus (files part)" ;;
   esac
+  _upx=$(_updraft_prefix "$_f")
+  if [ -n "$_upx" ]; then
+    _updraft_report "$(dirname "$_f")" "$_upx" || true
+    _note "This is one part of a set. extract or restore takes every part together."
+    echo ""
+  fi
 
   _is_zip=0
   if tar -tzf "$_f" >/dev/null 2>&1; then
@@ -442,7 +627,29 @@ inspect)
   elif gzip -t "$_f" >/dev/null 2>&1; then
     [ "$_fmt" = "unknown" ] && _fmt="gzip (probably a SQL dump)"
   fi
+  # A cPanel account export: the site at <account>/public_html/, beside the
+  # panel's own state. Probably the commonest shape a migrating site arrives
+  # in, and it used to be reported as "unknown". Its .bash_history is worth
+  # more than any scanner: on the first field test it dated the previous
+  # clean-up to the minute and named the file that cleaner had renamed.
+  _cpanel=0
+  if [ -n "$_listing" ] && printf '%s\n' "$_listing" | grep -qE '(^|/)public_html/wp-(content|includes|config\.php)' \
+     && printf '%s\n' "$_listing" | grep -qE '(^|/)(\.cpanel|\.trash|\.cagefs|\.softaculous|\.bash_history|mail|etc|ssl|tmp|logs|public_ftp)(/|$)'; then
+    _cpanel=1
+    [ "$_fmt" = tar.gz ] || [ "$_fmt" = zip ] && _fmt="${_fmt}, cPanel account export"
+  fi
   printf '  Format : %s\n' "$_fmt"
+  if [ "$_cpanel" = 1 ]; then
+    _note "The site is under public_html/. Only that is imported; the rest is"
+    _note "the panel's own state, kept in staging as evidence."
+    _bh=$(printf '%s\n' "$_listing" | grep -E '(^|/)\.(bash|zsh|mysql|sh)_history$' | head -5)
+    if [ -n "$_bh" ]; then
+      _warn "Shell history is included — read it before anything else:"
+      printf '%s\n' "$_bh" | sed 's/^/       /'
+      _note "  It shows what the last person with a shell did. extract prints the"
+      _note "  WordPress-related commands from it."
+    fi
+  fi
 
   # ── Hostile members — checked BEFORE anything is extracted ────────────────
   # This is the reason inspect exists as a separate step. Every item here is
@@ -472,19 +679,87 @@ inspect)
 
     # ── Content the operator should know about ──────────────────────────────
     echo ""
-    _dup=$(printf '%s\n' "$_listing" | grep -c 'installer\.php$') || _dup=0
-    [ "${_dup:-0}" -gt 0 ] && { _bad "Contains Duplicator's installer.php"
+    # Duplicator needs both halves. This was a suffix match on installer.php,
+    # which also hit Composer's .../Installers/*Installer.php and around a
+    # hundred similar ordinary files, while the same report said "Type:
+    # unknown". A package is an exact installer.php beside an *archive.zip
+    # (or .daf), or the dup-installer/ directory that archive unpacks.
+    # Duplicator never puts its installer inside wp-content, and a plugin's own
+    # installer.php is not a finding.
+    _dupi=$(printf '%s\n' "$_listing" | grep -E '(^|/)installer\.php$' | grep -v 'wp-content/') || _dupi=""
+    _dupa=0
+    if [ -n "$_dupi" ]; then
+      while IFS= read -r _di; do
+        case "$_di" in
+          */*) _dd="${_di%/*}/" ;;
+          *)   _dd="" ;;
+        esac
+        printf '%s\n' "$_listing" | while IFS= read -r _m; do
+          case "$_m" in "${_dd}"*) _r="${_m#"$_dd"}"; case "$_r" in */*) ;; *archive.zip|*archive.daf) echo y ;; esac ;; esac
+        done | grep -q y && _dupa=1
+      done <<DUPEOF
+$_dupi
+DUPEOF
+    fi
+    printf '%s\n' "$_listing" | grep -qE '(^|/)dup-installer/|(^|/)installer-backup\.php$' && _dupa=1
+    if [ "$_dupa" = 1 ]; then
+      _bad "Contains a Duplicator package (installer with its archive)"
       _note "This is a documented site-takeover vector. It will be deleted,"
-      _note "never executed — do not run it yourself either."; }
+      _note "never executed — do not run it yourself either."
+    elif [ -n "$_dupi" ]; then
+      _note "installer.php outside wp-content, with no Duplicator archive beside it."
+      _note "  Removed at extract all the same: nothing in a site root needs one."
+    fi
 
-    _php=$(printf '%s\n' "$_listing" | grep -cE 'wp-content/uploads/.*\.(php|phtml|phar)$') || _php=0
-    [ "${_php:-0}" -gt 0 ] && { _bad "${_php} executable PHP file(s) inside uploads"
+    # PHP in uploads, with WordPress's directory-index guards counted apart.
+    # Plugins write uploads/<dir>/index.php holding "<?php // Silence is
+    # golden." to stop directory listing. Six of them were reported as "the
+    # single strongest indicator that the source site was compromised" while
+    # the real malware went unmentioned. Only names are visible here, so the
+    # verdict on index.php waits for `scan`, which reads the content.
+    _upphp=$(printf '%s\n' "$_listing" | grep -E 'wp-content/uploads/.*\.(php[0-9]?|phtml|phar)$') || _upphp=""
+    _guard=$(printf '%s\n' "$_upphp" | grep -c '/index\.php$') || _guard=0
+    _php=$(printf '%s\n' "$_upphp" | grep -v '/index\.php$' | grep -c .) || _php=0
+    if [ "${_php:-0}" -gt 0 ]; then
+      _bad "${_php} executable PHP file(s) inside uploads"
       _note "Nothing legitimate puts PHP there. This is the single strongest"
-      _note "indicator that the source site was compromised."; }
-    [ "${_php:-0}" -eq 0 ] && _ok "No PHP in uploads"
+      _note "indicator that the source site was compromised."
+      printf '%s\n' "$_upphp" | grep -v '/index\.php$' | head -10 | sed 's/^/       /'
+    elif [ "${_guard:-0}" -gt 0 ]; then
+      _ok "No PHP in uploads beyond ${_guard} directory-index guard(s) — content checked at scan"
+    else
+      _ok "No PHP in uploads"
+    fi
 
-    _mu=$(printf '%s\n' "$_listing" | grep -c 'wp-content/mu-plugins/') || _mu=0
-    [ "${_mu:-0}" -gt 0 ] && _warn "${_mu} must-use plugin file(s) — active on arrival, no activation step"
+    # PHP renamed so it no longer runs: _x7Qe2k.php -> _x7Qe2k.php.bak. That
+    # is what someone does to a file they found and were afraid of. No build
+    # process, plugin or backup tool produces names like this, and the one
+    # real piece of malware in the first field test was exactly this shape:
+    # disarmed, still present, reported by nothing.
+    _ren=$(printf '%s\n' "$_listing" | grep -iE '\.(php[0-9]?|phtml|phar)(\.(bak|bk|old|orig|save|sav|back|backup|copy|disabled?|off|suspected|quarantined?|infected|hacked|malware|txt|tmp)|~)$') || _ren=""
+    _renn=$(printf '%s\n' "$_ren" | grep -c .) || _renn=0
+    if [ "${_renn:-0}" -gt 0 ]; then
+      _rcfg=$(printf '%s\n' "$_ren" | grep -c 'wp-config\.php') || _rcfg=0
+      _roth=$(( _renn - _rcfg ))
+      if [ "$_roth" -gt 0 ]; then
+        _warn "${_roth} PHP file(s) renamed so they no longer run — read each one"
+        _note "  Someone disarmed these instead of deleting them, usually because"
+        _note "  they looked malicious."
+        printf '%s\n' "$_ren" | grep -v 'wp-config\.php' | head -10 | sed 's/^/       /'
+      fi
+      [ "$_rcfg" -gt 0 ] && _note "${_rcfg} renamed copy(ies) of wp-config.php (the old host's database password) — discarded"
+    fi
+
+    # Only top-level *.php in mu-plugins autoloads. This counted the bare
+    # directory entry as a file and said "active on arrival" about a .php.bak.
+    _mufiles=$(printf '%s\n' "$_listing" | grep 'wp-content/mu-plugins/.' | grep -v '/$') || _mufiles=""
+    _mu=$(printf '%s\n' "$_mufiles" | grep -c .) || _mu=0
+    _muact=$(printf '%s\n' "$_mufiles" | grep -cE 'wp-content/mu-plugins/[^/]+\.php$') || _muact=0
+    if [ "${_muact:-0}" -gt 0 ]; then
+      _warn "${_muact} must-use plugin(s) would load on arrival, with no activation step"
+      _note "  Withheld at apply. Read them before restoring any."
+    fi
+    [ $(( _mu - _muact )) -gt 0 ] && _note "$(( _mu - _muact )) other file(s) in mu-plugins — WordPress does not load them; withheld at apply"
 
     _cfg=$(printf '%s\n' "$_listing" | grep -c 'wp-config\.php$') || _cfg=0
     [ "${_cfg:-0}" -gt 0 ] && _note "Contains wp-config.php — will be discarded; this VM's own config wins"
@@ -537,7 +812,54 @@ extract)
   _f="${2:-}"
   [ -n "$_f" ] || { echo "Usage: wp-import.sh extract <file>" >&2; exit 1; }
   [ -f "$_f" ] || _f="${INBOX}/${_f}"
+  # An UpdraftPlus set may be named by its prefix alone.
+  if [ ! -f "$_f" ] && [ -n "$(_updraft_parts "$INBOX" "${2:-}")" ]; then
+    _f=$(_updraft_parts "$INBOX" "$2" | head -1)
+  fi
   [ -f "$_f" ] || { _bad "Not found: ${2}"; exit 1; }
+  _f=$(_abs "$_f")
+  _upx=$(_updraft_prefix "$_f")
+  _is_wpress=0
+
+  if [ -n "$_upx" ]; then
+  # ── UpdraftPlus: every part of the set into ONE staging set ──────────────
+  _updir=$(dirname "$_f")
+  echo ""
+  _updraft_report "$_updir" "$_upx" || { _bad "This set cannot be imported as it is."; exit 3; }
+  _upparts=$(_updraft_parts "$_updir" "$_upx")
+  # Every zip is checked before ANY is unpacked: one hostile part refuses the set.
+  _uh=0; _un=0
+  for _p in $(printf '%s\n' "$_upparts" | grep '\.zip$'); do
+    _zip_hostile "$_p" || _uh=1
+    _un=$(( _un + $(_zip_bytes "$_p") ))
+  done
+  [ "$_uh" = 0 ] || { _bad "Refusing the whole set. Nothing legitimate needs these."; exit 2; }
+  _udb=$(printf '%s\n' "$_upparts" | grep -- '-db[0-9]*\.gz$' | head -1)
+  gzip -t "$_udb" 2>/dev/null || { _bad "$(basename "$_udb") is not a readable gzip — re-download it."; exit 2; }
+  _un=$(( _un + $(stat -c %s "$_udb") * 8 ))
+  _needk=$(( _un / 1024 + 524288 ))
+  _freek=$(df -Pk / | awk 'NR==2{print $4}')
+  [ "${_freek:-0}" -lt "$_needk" ] && {
+    _bad "Not enough disk: needs ~$(( _needk / 1048576 ))GB, have $(( _freek / 1048576 ))GB"; exit 1; }
+
+  _id="$(date -u +%Y%m%d-%H%M%S)-updraft-$(printf '%s' "$_upx" | sed -E 's/^backup_([0-9-]+)_.*/\1/' | cut -c1-15)"
+  _st="${STAGING}/${_id}"
+  if [ -e "$_st" ]; then _bad "Staging set ${_id} already exists. Wait a second and retry."; exit 1; fi
+  mkdir -p "${_st}/files/wp-content" "${_st}/db" "${_st}/meta"
+  chmod 700 "$_st"
+  printf '%s\n' "$_upparts" > "${_st}/meta/sources.txt"
+  _note "Extracting the set to ${_st}/files/wp-content …"
+  for _p in $(printf '%s\n' "$_upparts" | grep '\.zip$'); do
+    case "$(_updraft_entity "$_p")" in
+      wpcore|more) _note "  skipped $(basename "$_p") (not wp-content)"; continue ;;
+    esac
+    # -n: never overwrite. Two parts claiming the same file is not a real set.
+    unzip -q -n "$_p" -d "${_st}/files/wp-content" 2>/dev/null \
+      || { _bad "Extraction failed: $(basename "$_p")"; rm -rf "$_st"; exit 1; }
+    printf '     %-12s %s\n' "$(_updraft_entity "$_p")" "$(basename "$_p")"
+  done
+  cp "$_udb" "${_st}/db/"
+  else
 
   # Re-run the hostile-member checks. inspect already did this, but extraction
   # must not depend on the operator having run inspect first -- a security
@@ -581,7 +903,8 @@ extract)
   fi
   mkdir -p "${_st}/files" "${_st}/db" "${_st}/meta"
   chmod 700 "$_st"
-  _is_wpress=0
+  # What this set was made from, so clean-up can remove exactly that.
+  printf '%s\n' "$_f" > "${_st}/meta/sources.txt"
   case "$(basename "$_f")" in *.wpress) _is_wpress=1 ;; esac
 
   # Space check before writing, not after. Running out mid-extract leaves a
@@ -674,7 +997,7 @@ extract)
     [ "${_wm:-0}" = 0 ] || _warn "${_wm} plugin(s) were active on the source but are not in this archive."
   fi
 
-  [ "$_is_wpress" = 1 ] || _note "Extracting to ${_st}/files …"
+  [ "$_is_wpress" = 1 ] || [ -n "$_upx" ] || _note "Extracting to ${_st}/files …"
   # --no-same-owner / --no-same-permissions: never honour ownership or mode
   # bits from an untrusted archive. A setuid binary or a root-owned file
   # inside a client's backup is not something to reproduce faithfully.
@@ -692,6 +1015,7 @@ extract)
   else
     _bad "Unrecognised archive format"; rm -rf "$_st"; exit 1
   fi
+  fi   # end of the single-archive path (the UpdraftPlus path is above)
 
   # What actually landed, checked before anything touches it. This has to come
   # before the chmod below: on a hard link, chmod changes the file it points at.
@@ -715,11 +1039,20 @@ extract)
 
   # Duplicator's installer is removed immediately, not at import. It is a
   # documented takeover vector and there is no stage at which keeping it is
-  # useful.
-  _dupn=$(find "${_st}/files" -name 'installer.php' -o -name 'installer-backup.php' 2>/dev/null | grep -c .) || _dupn=0
+  # useful. Not inside wp-content: Duplicator never writes there, and this
+  # used to delete any plugin's own includes/installer.php by name, breaking
+  # that plugin without a word.
+  _dupn=$(find "${_st}/files" -path '*/wp-content/*' -prune -o -type f \
+            \( -name 'installer.php' -o -name 'installer-backup.php' \) -print 2>/dev/null \
+          | grep -c .) || _dupn=0
   if [ "${_dupn:-0}" -gt 0 ]; then
-    find "${_st}/files" \( -name 'installer.php' -o -name 'installer-backup.php' \) -delete 2>/dev/null
-    _warn "Removed ${_dupn} Duplicator installer file(s) — never executed"
+    find "${_st}/files" -path '*/wp-content/*' -prune -o -type f \
+         \( -name 'installer.php' -o -name 'installer-backup.php' \) -exec rm -f {} + 2>/dev/null
+    _warn "Removed ${_dupn} installer file(s) from outside wp-content — never executed"
+  fi
+  if find "${_st}/files" -path '*/wp-content/*' -prune -o -type d -name dup-installer -print 2>/dev/null | grep -q .; then
+    find "${_st}/files" -path '*/wp-content/*' -prune -o -type d -name dup-installer -exec rm -rf {} + 2>/dev/null
+    _warn "Removed Duplicator's dup-installer/ — never executed"
   fi
 
   # Collect any SQL dumps into db/ so the scan knows where to look.
@@ -763,6 +1096,26 @@ extract)
   _ok "Extracted: ${_nf} file(s), ${_nd} database dump(s)"
   _note "Staging: ${_st}"
   _note "Nothing is executable and nothing is web-reachable."
+
+  # Shell history from the source account. The WordPress-related lines are
+  # printed, and a copy is kept with the staging set's metadata; nothing in it
+  # is run. It can hold a password typed on a command line, so it stays root-
+  # only and is printed filtered, not whole.
+  _bhs=$(find "${_st}/files" -maxdepth 3 -type f \( -name '.bash_history' -o -name '.zsh_history' -o -name '.sh_history' \) 2>/dev/null | head -3)
+  if [ -n "$_bhs" ]; then
+    mkdir -p "${_st}/meta"
+    _hdr "Shell history in the archive"
+    printf '%s\n' "$_bhs" | while IFS= read -r _bhf; do
+      cp "$_bhf" "${_st}/meta/$(basename "$_bhf").$(printf '%s' "$_bhf" | cksum | cut -d' ' -f1)" 2>/dev/null
+      _bhn=$(grep -c . "$_bhf" 2>/dev/null) || _bhn=0
+      printf '  %s (%s lines)\n' "${_bhf#${_st}/files/}" "$_bhn"
+      grep -nE '(^|[ ;/])(wp |wp-cli|mv |rm |cp |chmod |chown |curl |wget |php |unzip |tar |mysql|mariadb|crontab|nano |vi |vim |cat ).*(wp-|\.php|plugins|uploads|mu-plugins|cron|\.sql)' "$_bhf" 2>/dev/null \
+        | tail -25 | cut -c1-160 | sed 's/^/     /'
+    done
+    chmod -R go-rwx "${_st}/meta" 2>/dev/null || true
+    _note "Look for: a plugin deactivated, a file renamed or deleted, a security"
+    _note "plugin switched off. Each names something scan should be asked about."
+  fi
   echo ""
   _note "Next:  wp-import.sh scan ${_id}"
   ;;
@@ -779,11 +1132,22 @@ scan)
   _crit=0; _high=0
 
   # ── Files: reuse the existing scanner against the staged tree ────────────
+  # Pointed at the site root, not the top of the staging tree. See _site_root.
+  _scanroot=$(_site_root "${_st}/files")
+  if [ -z "$_scanroot" ]; then
+    _scanroot="${_st}/files"
+    _warn "No WordPress site root found — structural checks have nothing to check"
+    _note "  Signatures still run over everything staged."
+  elif [ "$_scanroot" != "${_st}/files" ]; then
+    _note "Site root: ${_scanroot#${_st}/}"
+  fi
   if [ -x /usr/local/bin/wp-malware-scan.sh ]; then
     _note "File scan (structural + signatures) …"
     # This said "signatures" for years while running only `structural`.
     for _sc in structural yara; do
-      _so=$(/usr/local/bin/wp-malware-scan.sh --path "${_st}/files" "$_sc" 2>&1)
+      # Both at the site root: it is what apply copies, and the uploads-only
+      # YARA rules look for wp-content/uploads beneath --path.
+      _so=$(/usr/local/bin/wp-malware-scan.sh --path "$_scanroot" "$_sc" 2>&1)
       printf '%s\n' "$_so" | sed 's/^/  /'
       _mc=$(printf '%s\n' "$_so" | grep -c '\[CRITICAL\]') || _mc=0
       _mh=$(printf '%s\n' "$_so" | grep -c '\[HIGH\]') || _mh=0
@@ -833,9 +1197,36 @@ scan)
         _high=$(( _high + 1 ))
       else _ok "Scheduled tasks look ordinary"; fi
 
-      _ad=$(_rd | grep -c "administrator") || _ad=0
-      printf '     %s row(s) mention administrator — review after import:\n' "$_ad"
-      _note "wp-forensics.sh admins"
+      # Accounts, by name. "17 row(s) mention administrator" is what this used
+      # to say, and on the field test the backdoor account took forty minutes
+      # to find by hand. The users table is read as text -- the dump is still
+      # not loaded -- and each account checked for the signs of being planted.
+      _upfx=$(_rd | sed -n 's/^CREATE TABLE [`"]\{0,1\}\([A-Za-z0-9_]*\)usermeta[`"]\{0,1\}.*/\1/p' | head -1)
+      _uu=$(_rd | sh "$THREATS" dump-users "$_upfx" 2>/dev/null)
+      _uc=$(_rd | sh "$THREATS" dump-caps "$_upfx" 2>/dev/null)
+      _ut=$(printf '%s\n' "$_uu" | awk -F '\t' -v caps="$_uc" '
+              BEGIN { n=split(caps, L, "\n"); for (i=1;i<=n;i++) { split(L[i], kv, "\t"); c[kv[1]]=kv[2] } }
+              NF { print $0 "\t" c[$1] }')
+      if [ -z "$_uu" ]; then
+        _note "No user rows could be read from this dump — review after import: wp-forensics.sh admins"
+      else
+        _uadm=$(printf '%s\n' "$_ut" | awk -F '\t' '$5 ~ /administrator/')
+        printf '     %s account(s), %s administrator(s):\n' \
+          "$(printf '%s\n' "$_uu" | grep -c .)" "$(printf '%s\n' "$_uadm" | grep -c .)"
+        printf '%s\n' "$_uadm" | awk -F '\t' 'NF {printf "       id %-5s %-24s %-36s %s\n", $1, $2, $3, $4}'
+        _usus=$(printf '%s\n' "$_ut" | sh "$THREATS" suspect-users 2>/dev/null)
+        if [ -n "$_usus" ]; then
+          printf '%s\n' "$_usus" | while IFS="$(printf '\t')" read -r _uid _ul _ue _ur _sig _role; do
+            _bad "Account looks planted: ${_ul} <${_ue}> id ${_uid}, registered ${_ur}, role ${_role}"
+            _note "  signals: ${_sig}"
+          done
+          _note "Locked automatically at apply (role removed, password and e-mail replaced),"
+          _note "not deleted. Review afterwards: wp-forensics.sh admins"
+          _high=$(( _high + $(printf '%s\n' "$_usus" | grep -c .) ))
+        else
+          _ok "No account shows two or more signs of being planted"
+        fi
+      fi
 
       _sp=$(_rd | grep -ciE "<script[^>]*>(eval|document\.write|atob)") || _sp=0
       [ "${_sp:-0}" -gt 0 ] && { _warn "${_sp} row(s) contain inline script — often injected SEO spam"
@@ -948,7 +1339,7 @@ staged)
   done
   echo ""
   echo "  Scan:   wp-import.sh scan <id>"
-  echo "  Remove: rm -rf ${STAGING}/<id>"
+  echo "  Remove: wp-import.sh clean <id>     (and the archives it came from)"
   [ -s "${STAGING}/scan-log.txt" ] && { echo ""; echo "  Scan history:"; tail -5 "${STAGING}/scan-log.txt" | sed 's/^/    /'; }
   ;;
 
@@ -956,9 +1347,14 @@ staged)
 apply)
   _id="${2:-}"; shift 2 2>/dev/null || shift $# 
   [ -n "$_id" ] || _id=$(cat "${STAGING}/.latest" 2>/dev/null)
-  _force=0; _accept=0
+  _force=0; _accept=0; _remed=1; _keep=0
   for _a in "$@"; do
-    case "$_a" in --force) _force=1 ;; --accept-findings) _accept=1 ;; esac
+    case "$_a" in
+      --force) _force=1 ;;
+      --accept-findings) _accept=1 ;;
+      --no-remediate) _remed=0 ;;
+      --keep-files) _keep=1 ;;
+    esac
   done
   _st="${STAGING}/${_id}"
   [ -d "$_st" ] || { _bad "No staging directory ${_id}"; _note "wp-import.sh staged"; exit 1; }
@@ -1063,15 +1459,9 @@ apply)
   #   2. Prefer the SHALLOWEST match. The real site is always closer to the
   #      archive root than a backup buried inside it.
   if [ ! -d "${_src}/wp-content" ]; then
-    _cand=$(find "$_src" -maxdepth 6 -type d -name wp-content 2>/dev/null \
-            | while IFS= read -r _c; do
-                _p=$(dirname "$_c")
-                if [ -d "${_p}/wp-includes" ] || [ -f "${_p}/wp-config.php" ]; then
-                  printf '%s\t%s\n' "$(printf '%s' "$_c" | tr -cd / | wc -c)" "$_c"
-                fi
-              done | sort -n | head -1 | cut -f2)
+    _cand=$(_site_root "$_src")
     if [ -n "$_cand" ]; then
-      _src=$(dirname "$_cand")
+      _src="$_cand"
       _note "Site root: ${_src#${_st}/}"
     else
       # Say so rather than silently importing nothing. An import that
@@ -1102,10 +1492,38 @@ apply)
   find "${_src}/wp-content/uploads" -type f \
        \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' -o -name '*.php[0-9]' \) \
        2>/dev/null | while IFS= read -r _bf; do
-    mkdir -p "$_q/uploads"; mv "$_bf" "$_q/uploads/" 2>/dev/null
+    # Keep the relative path. Moved flat, six uploads/*/index.php became one
+    # file and two webshells with the same name became one piece of evidence.
+    _rel="${_bf#"${_src}/wp-content/uploads/"}"
+    mkdir -p "$_q/uploads/$(dirname "$_rel")"; mv "$_bf" "$_q/uploads/${_rel}" 2>/dev/null
   done
-  _qp=$(find "$_q/uploads" -type f 2>/dev/null | grep -c .) || _qp=0
+  # Index guards are set aside too -- they are still PHP -- but not reported
+  # as executable files: that wording is for files someone should read.
+  _qp=$(find "$_q/uploads" -type f ! -name index.php 2>/dev/null | grep -c .) || _qp=0
+  _qg=$(find "$_q/uploads" -type f -name index.php 2>/dev/null | grep -c .) || _qg=0
   [ "${_qp:-0}" -gt 0 ] && _warn "Quarantined ${_qp} executable file(s) from uploads"
+  [ "${_qg:-0}" -gt 0 ] && _note "Set aside ${_qg} index.php file(s) from uploads — scan names any that are not plain directory-index guards"
+
+  # ── What the scan named, kept out before anything is copied ──────────────
+  # PHP renamed so it does not run, and escape-obfuscated PHP anywhere a
+  # plugin or theme does not live. Neither is needed by a working site; both
+  # were the malware on the first real import. Set aside with their paths, as
+  # evidence. Obfuscated files inside plugins are left for the plugin repair
+  # after import, which replaces a modified wordpress.org plugin wholesale.
+  if [ "$_remed" = 1 ] && [ -r "$THREATS" ]; then
+    _rmq=0; mkdir -p "${_st}/meta"
+    { sh "$THREATS" renamed "${_src}/wp-content" 2>/dev/null
+      sh "$THREATS" obfuscated "${_src}/wp-content" 2>/dev/null | cut -f3 \
+        | grep -vE '/wp-content/(plugins|themes)/' ; } | sort -u > "${_st}/meta/remediate-files.txt"
+    while IFS= read -r _rf; do
+      [ -f "$_rf" ] || continue
+      _rel="${_rf#"${_src}/"}"
+      mkdir -p "$_q/remediated/$(dirname "$_rel")"
+      mv "$_rf" "$_q/remediated/${_rel}" && _rmq=$((_rmq + 1)) \
+        && _note "Kept out: ${_rel}"
+    done < "${_st}/meta/remediate-files.txt"
+    [ "$_rmq" -gt 0 ] && _warn "Kept ${_rmq} renamed or obfuscated PHP file(s) out of the import (in ${_q}/remediated)"
+  fi
 
   # ── Files ────────────────────────────────────────────────────────────────
   _hdr "Importing content"
@@ -1207,12 +1625,21 @@ apply)
       # This runs whether or not the text pass appeared to work, because
       # "appeared to work" is precisely what went wrong.
       if [ "$_theirpfx" != "$_ourpfx" ]; then
-        _oldhex=$(printf '%s%%' "$_theirpfx" | od -An -tx1 | tr -d ' \n')
-        _newhex=$(printf '%s' "$_ourpfx"     | od -An -tx1 | tr -d ' \n')
-        _cut=$(( ${#_theirpfx} + 1 ))
-        _fixsql="UPDATE ${_ourpfx}options  SET option_name = CONCAT(0x${_newhex}, SUBSTRING(option_name, ${_cut})) WHERE option_name LIKE 0x${_oldhex};
-UPDATE ${_ourpfx}usermeta SET meta_key   = CONCAT(0x${_newhex}, SUBSTRING(meta_key,   ${_cut})) WHERE meta_key   LIKE 0x${_oldhex};
-SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHERE option_name LIKE 0x${_oldhex}) + (SELECT COUNT(*) FROM ${_ourpfx}usermeta WHERE meta_key LIKE 0x${_oldhex}));"
+        # Compared with LEFT(), never LIKE. In LIKE, "_" matches any single
+        # character, so the source prefix "wp_" as a pattern also matched this
+        # VM's own "wp5c1e9a_": the count reported correctly renamed keys as
+        # stranded, and a second apply rewrote wp5c1e9a_capabilities to
+        # wp5c1e9a_c1e9a_capabilities -- every user losing every role while
+        # the check printed the same number. An exact byte comparison has no
+        # wildcards, and once a run succeeds nothing starts with the source
+        # prefix, so running it again changes nothing.
+        _oldhex=$(printf '%s' "$_theirpfx" | od -An -tx1 | tr -d ' \n')
+        _newhex=$(printf '%s' "$_ourpfx"   | od -An -tx1 | tr -d ' \n')
+        _plen=${#_theirpfx}
+        _cut=$(( _plen + 1 ))
+        _fixsql="UPDATE ${_ourpfx}options  SET option_name = CONCAT(0x${_newhex}, SUBSTRING(option_name, ${_cut})) WHERE LEFT(option_name, ${_plen}) = 0x${_oldhex};
+UPDATE ${_ourpfx}usermeta SET meta_key   = CONCAT(0x${_newhex}, SUBSTRING(meta_key,   ${_cut})) WHERE LEFT(meta_key, ${_plen}) = 0x${_oldhex};
+SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHERE LEFT(option_name, ${_plen}) = 0x${_oldhex}) + (SELECT COUNT(*) FROM ${_ourpfx}usermeta WHERE LEFT(meta_key, ${_plen}) = 0x${_oldhex}));"
         _fixout=$(printf '%s\n' "$_fixsql" | podman exec -i mariadb sh -c \
                     'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -N -B "${WORDPRESS_DB_NAME:-wordpress}"' \
                     2>/dev/null | grep '^stranded-remaining:' | cut -d: -f2)
@@ -1363,6 +1790,21 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
   _wp cache flush >/dev/null 2>&1
   _wp rewrite flush >/dev/null 2>&1 && _ok "Permalinks flushed"
 
+  # ── Automated remediation of the live, imported site ────────────────────
+  # Now that the files and the database are in place: wordpress.org plugins
+  # whose files differ from their published copy are reinstalled clean (the
+  # modified copy quarantined), and accounts with two or more signs of being
+  # planted are locked rather than deleted. The same pass `wp-malware-scan.sh
+  # remediate` runs on a live site, here without asking, because an import of
+  # a site to be cleaned is the case it exists for. --no-remediate skips it.
+  if [ "$_remed" = 1 ] && [ -x /usr/local/bin/wp-malware-scan.sh ]; then
+    _hdr "Automated remediation"
+    /usr/local/bin/wp-malware-scan.sh remediate --apply --yes 2>&1 | sed 's/^/  /' 
+  elif [ "$_remed" = 0 ]; then
+    _warn "Automated remediation skipped (--no-remediate)."
+    _note "  Run it when ready:  doas wp-malware-scan.sh remediate"
+  fi
+
   echo ""
   _hdr "Administrators on the imported site"
   _wp user list --role=administrator --fields=ID,user_login,user_email,user_registered 2>/dev/null \
@@ -1374,11 +1816,21 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
 
   # ── Record and verify ────────────────────────────────────────────────────
   {
-    printf '%s  id=%s critical=%s high=%s force=%s quarantined=%s by=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_id" "${_c:-0}" "${_h:-0}" "$_force" "${_qp:-0}" \
+    printf '%s  id=%s critical=%s high=%s force=%s quarantined=%s remediate=%s by=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_id" "${_c:-0}" "${_h:-0}" "$_force" "${_qp:-0}" "$_remed" \
       "${SUDO_USER:-${DOAS_USER:-${USER:-unknown}}}"
   } >> "${STAGING}/import-log.txt"
   chmod 600 "${STAGING}/import-log.txt" 2>/dev/null || true
+
+  # ── Clean up ─────────────────────────────────────────────────────────────
+  # The site is live; the staging copy and the archives it came from are now
+  # only a second and third copy of a client's database. --keep-files skips it.
+  _hdr "Cleaning up"
+  if [ "$_keep" = 1 ]; then
+    _note "Kept (--keep-files). Later:  wp-import.sh clean ${_id}"
+  else
+    _cleanup_set "$_id"
+  fi
 
   _hdr "Verify"
   _note "  validate-wordpress.sh"
@@ -1393,5 +1845,122 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
   _ok "Import complete. Recorded in ${STAGING}/import-log.txt"
   ;;
 
-*) sed -n '4,10p' "$0" ;;
+# ── Restore: the whole pipeline in one command ───────────────────────────────
+# extract → scan → apply → clean up, stopping where a person has to decide.
+# With nothing named, the one thing in the inbox is used: a single UpdraftPlus
+# set (however many parts) or a single archive. Two or more, and it asks which.
+restore)
+  shift
+  _tgt=""; _pass=""
+  for _a in "$@"; do
+    case "$_a" in
+      --accept-findings|--force|--no-remediate|--keep-files) _pass="${_pass} ${_a}" ;;
+      -*) _bad "Unknown option: ${_a}"; exit 1 ;;
+      *) _tgt="$_a" ;;
+    esac
+  done
+  if [ -z "$_tgt" ]; then
+    _cands=$( { _updraft_sets "$INBOX"
+                for _c in "$INBOX"/*; do
+                  [ -f "$_c" ] || continue
+                  [ -n "$(_updraft_prefix "$_c")" ] && continue
+                  case "$_c" in *.zip|*.tar.gz|*.tgz|*.wpress|*.sql.gz|*.gz) basename "$_c" ;; esac
+                done; } | grep . )
+    _ncand=$(printf '%s\n' "$_cands" | grep -c .) || _ncand=0
+    if [ "$_ncand" = 0 ]; then
+      _bad "Nothing in ${INBOX} to restore."
+      _note "  wp-import.sh where     how to get a backup here"
+      exit 1
+    elif [ "$_ncand" -gt 1 ]; then
+      _bad "More than one backup in the inbox — name the one to restore:"
+      printf '%s\n' "$_cands" | sed 's/^/       wp-import.sh restore /'
+      exit 1
+    fi
+    _tgt="$_cands"
+  fi
+
+  _hdr "Restore: ${_tgt}"
+  sh "$0" extract "$_tgt" || exit $?
+  _id=$(cat "${STAGING}/.latest" 2>/dev/null)
+  [ -n "$_id" ] || { _bad "Extract did not record a staging set."; exit 1; }
+
+  _src=0; sh "$0" scan "$_id" || _src=$?
+  case "$_src" in
+    0) : ;;
+    1)
+      case "$_pass" in *--accept-findings*|*--force*) : ;; *)
+        if [ -t 0 ]; then
+          echo ""
+          printf '  Import anyway, with these findings recorded as accepted? [y/N] : '
+          read -r _yn || _yn=""
+          case "$_yn" in y|Y|yes) _pass="${_pass} --accept-findings" ;;
+            *) _note "Stopped. Nothing imported. Later:  wp-import.sh apply ${_id} --accept-findings"
+               _note "Or discard it:  wp-import.sh clean ${_id}"; exit 1 ;;
+          esac
+        else
+          _note "Stopped at findings. Re-run with --accept-findings, or: wp-import.sh apply ${_id} --accept-findings"
+          exit 1
+        fi ;;
+      esac ;;
+    2)
+      case "$_pass" in *--force*) : ;; *)
+        _bad "CRITICAL findings: not importing without a deliberate --force."
+        _note "Importing a compromised site to clean it is legitimate; do it knowingly:"
+        _note "  wp-import.sh apply ${_id} --force"
+        _note "Or discard it:  wp-import.sh clean ${_id}"
+        exit 2 ;;
+      esac ;;
+    *) _bad "The scan did not finish (exit ${_src}). Nothing imported."; exit "$_src" ;;
+  esac
+  # shellcheck disable=SC2086
+  sh "$0" apply "$_id" $_pass
+  ;;
+
+# ── Clean: remove leftover copies of imported sites ──────────────────────────
+clean)
+  shift
+  case "${1:-}" in
+    '')
+      echo "Usage: wp-import.sh clean <id> | --all [--yes] | --stale <days> [--yes]" >&2
+      echo "       (wp-import.sh staged lists the ids)" >&2
+      exit 1 ;;
+    --all|--stale)
+      _days=""
+      if [ "$1" = --stale ]; then
+        _days="${2:-}"
+        case "$_days" in ''|*[!0-9]*) _bad "--stale takes a number of days"; exit 1 ;; esac
+        [ "$_days" -ge 1 ] || { _bad "--stale needs at least 1 day"; exit 1; }
+      fi
+      _yes=0; for _a in "$@"; do [ "$_a" = --yes ] && _yes=1; done
+      _old() { [ -z "$_days" ] || [ -n "$(find "$1" -maxdepth 0 -mtime +"$_days" 2>/dev/null)" ]; }
+      # A set already cleaned after its import holds only evidence: not listed.
+      _ids=""; for _d in "$STAGING"/*/; do
+        [ -d "$_d" ] || continue
+        [ -d "${_d}files" ] || [ -d "${_d}db" ] || continue
+        _old "$_d" && _ids="${_ids} $(basename "$_d")"
+      done
+      _loose=""; for _c in "$INBOX"/*; do [ -f "$_c" ] && _old "$_c" && _loose="${_loose} $(basename "$_c")"; done
+      if [ -z "${_ids}${_loose}" ]; then _ok "Nothing to clean${_days:+ older than ${_days} days}."; exit 0; fi
+      _hdr "Clean up${_days:+ — older than ${_days} days}"
+      [ -n "$_ids" ] && printf '  staging set  %s\n' $_ids
+      [ -n "$_loose" ] && printf '  inbox file   %s\n' $_loose
+      if [ "$_yes" != 1 ]; then
+        printf '\n  Imported sets keep their quarantine and meta (evidence). Type CLEAN to proceed: '
+        read -r _cf || { _bad "No input available. Use --yes to clean unattended."; exit 1; }
+        [ "$_cf" = CLEAN ] || { echo "  Cancelled — nothing changed."; exit 0; }
+      fi
+      for _i in $_ids; do _cleanup_set "$_i"; done
+      for _c in $_loose; do [ -f "${INBOX}/${_c}" ] && rm -f "${INBOX}/${_c}" && _ok "Removed ${_c}"; done
+      logger -t wp-import "clean ${1}${_days:+ ${_days}}: staging [${_ids# }] inbox [${_loose# }]" 2>/dev/null || true
+      ;;
+    *)
+      case "$1" in *[!A-Za-z0-9._-]*) _bad "Not a staging id: $1"; exit 1 ;; esac
+      [ -d "${STAGING}/$1" ] || { _bad "No staging set $1"; _note "wp-import.sh staged"; exit 1; }
+      _cleanup_set "$1"
+      logger -t wp-import "clean $1" 2>/dev/null || true
+      ;;
+  esac
+  ;;
+
+*) sed -n '4,18p' "$0" ;;
 esac

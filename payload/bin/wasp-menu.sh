@@ -490,7 +490,7 @@ EOF
 
   EXAMPLE
     Press 2. To add a vendor, from a shell:
-      doas wasp-egress.sh allow .elementor.com
+      doas wasp-egress.sh allow .elementor.com --permanent
     Every entry is also a route OUT for a compromised site, so add the
     specific host the log names, not a wildcard you guessed.
 EOF
@@ -714,6 +714,151 @@ EOF
     quiet failure -- the dashboard looks busy and nobody is being stopped.
 EOF
     ;;
+  security.19) _card "19 — Open file sharing for 1 hour" <<'EOF'
+  WHAT IT DOES
+    Lets this VM reach a file-sharing service -- Dropbox, Google Drive,
+    OneDrive, WeTransfer, Box or SyncedTool -- through the egress proxy, for
+    60 minutes at most. It then closes by itself, whether or not anyone
+    remembers, because cron checks every minute.
+
+  WHEN TO USE IT
+    A plugin or an import needs to download a file from one of them. For
+    wp-import.sh fetch url you do not need this: fetch opens the right service
+    for its own download and closes it after.
+
+  WHAT IT ASKS YOU
+    The service name(s): dropbox gdrive onedrive wetransfer box syncedtool
+
+  EXAMPLE
+    Service : dropbox
+    Close it sooner: wasp-egress.sh fileshare close
+EOF
+    ;;
+  security.20) _card "20 — What is open temporarily" <<'EOF'
+  WHAT IT DOES
+    Lists every temporary egress entry -- one-off allows, file-sharing
+    services, maintenance windows, import downloads -- with the minutes each
+    has left, who opened it and why.
+
+  WHEN TO USE IT
+    Before you leave a site, and whenever a site reached something it should
+    not have. The permanent list is in "Egress (proxy) status".
+EOF
+    ;;
+  security.21) _card "21 — Close all temporary egress" <<'EOF'
+  WHAT IT DOES
+    Closes every temporary entry now, instead of waiting for it to expire.
+    The permanent allowlist (theme vendors, WordPress.org) is not touched.
+
+  WHEN TO USE IT
+    The download is done, or you opened something by mistake.
+EOF
+    ;;
+  security.22) _card "22 — Send the security report now" <<'EOF'
+  WHAT IT DOES
+    Runs a fresh vulnerability check and e-mails the weekly security report
+    straight away: when the daily vulnerability and malware scans last ran,
+    whether they completed, what they found, and what egress is open.
+
+  WHEN TO USE IT
+    After setting up mail, to prove reports reach you. After a fix, to send a
+    clean report to whoever was told about the finding. It is also sent by
+    itself every Monday at 07:15 UTC.
+
+  IF NOTHING ARRIVES
+    wp-notify.sh --status, then wp-notify.sh --test.
+EOF
+    ;;
+  security.23) _card "23 — WASP Hive reporting status" <<'EOF'
+  WHAT IT DOES
+    Shows which WASP Hive this VM reports to, the pinned key, when the last
+    report was delivered and, if the last one failed, why.
+
+  WHAT A HIVE IS
+    The MSP's fleet console. This VM pushes a summary of its own state every
+    15 minutes: health, vulnerabilities, malware, integrity, CrowdSec, backups,
+    controls. The Hive never connects to this VM and holds nothing that could.
+
+  IF IT SAYS THE KEY DOES NOT MATCH
+    The Hive was re-keyed, or something on the network is in the middle.
+    Reports are withheld until you re-enroll (23 → enroll again with the line
+    from hive-admin rotate). Do not re-enroll until you know which it is.
+EOF
+    ;;
+  security.24) _card "24 — Join a WASP Hive" <<'EOF'
+  WHAT IT DOES
+    Enrolls this VM in an MSP's WASP Hive using the line `hive-admin enroll`
+    prints on the Hive, and sends the first report.
+
+  WHAT YOU NEED
+    The whole line from the Hive: its address, this VM's node name, a token
+    and the Hive's key pin. The token can only replace this VM's own report.
+EOF
+    ;;
+  security.25) _card "25 — Path to a WASP Hive (address)" <<'EOF'
+  WHAT IT DOES
+    Records the address of the WASP Hive this VM reports to, and makes sure
+    the firewall lets exactly that connection out. Then it tests it.
+
+  HOW THE CONNECTION WORKS
+    wasp-hive-report.sh runs on this VM (not in WordPress), so Squid is not
+    involved. Every 15 minutes it makes one HTTPS POST to the Hive; the Hive
+    never connects back.
+      - Hive on 443 (the default): already allowed, nothing is opened.
+      - Hive on another port, with egress restricted: ONE rule is added, to
+        that address and port only.
+      - A name is resolved once and that address is pinned, so the rule and
+        the connection always agree. Re-resolve: wasp-egress.sh hive refresh
+    Who answers at that address is proven by the key pin taken at enrollment.
+
+  ALSO NEEDED
+    The network between this VM and the Hive must allow it (OPNsense rule
+    from this VM's VLAN to the Hive, tcp 443). Then join: Security -> 24.
+EOF
+    ;;
+  security.26) _card "26 — Test the WASP Hive connection" <<'EOF'
+  WHAT IT DOES
+    Shows the recorded address and firewall rule, checks it matches the
+    address this VM enrolled with, asks the Hive for /api/v1/ping, and prints
+    the key the Hive presents next to the pin this VM trusts.
+
+  IF THE KEY DOES NOT MATCH
+    Reports are being withheld, correctly. Either the Hive was re-keyed (then
+    re-enroll with the line from hive-admin rotate) or something is in the
+    middle. Find out which before changing anything.
+EOF
+    ;;
+  security.27) _card "27 — AppSec (WAF) status" <<'EOF'
+  WHAT IT DOES
+    Whether CrowdSec AppSec is inspecting requests, whether its listener is
+    answering, CrowdSec's memory against the watchdog threshold, and how many
+    times the watchdog has restarted it in the last day.
+EOF
+    ;;
+  security.28) _card "28 — AppSec (WAF): switch ON" <<'EOF'
+  WHAT IT DOES
+    Every PHP request is checked by CrowdSec before WordPress runs, body
+    included, against virtual patches for known plugin CVEs and a few generic
+    rules (the "light" set; no OWASP CRS). A match gets 403.
+
+  THE COST — read before switching on
+    Memory: CrowdSec 1.8.x has an open report of AppSec memory growing
+    without bound (crowdsecurity/crowdsec#4797). CrowdSec stays capped at
+    512 MB and is restarted at 448 MB; during a restart (~15 s) requests
+    pass uninspected. CPU: 1-5 ms per PHP request. Recommended 2 GB / 2 vCPU.
+    Bodies over 128 KiB and uploaded files are not inspected.
+
+  IT ROLLS ITSELF BACK
+    If the listener does not come up, or refuses the key, everything it
+    changed is undone and CrowdSec is restarted as it was.
+EOF
+    ;;
+  security.29) _card "29 — AppSec (WAF): switch OFF" <<'EOF'
+  WHAT IT DOES
+    Stops forwarding requests, removes the listener and its firewall rule,
+    and restarts CrowdSec and WordPress. CrowdSec goes back to reading logs.
+EOF
+    ;;
   security.18) _card "18 — Report bans to a central LAPI" <<'EOF'
   WHAT IT DOES
     Points this VM's CrowdSec agent at a shared Local API on another host, so
@@ -730,7 +875,7 @@ EOF
     Login    : wp01-clientname
     Password : (typed, not shown)
     Register the machine on the LAPI host FIRST:
-      cscli machines add wp01-clientname --password '<pw>'
+      cscli machines add wp01-clientname --password '<pw>' -f /dev/null
     Passwords cap at 72 characters there -- longer ones are rejected.
 EOF
     ;;
@@ -1133,6 +1278,42 @@ EOF
   EXAMPLE
     This reaches .alpinelinux.org through the egress proxy, so it works
     without opening anything new. Reboot afterwards if the kernel moved.
+EOF
+    ;;
+  import.6) _card "6 — [!] Restore in one go" <<'EOF'
+  WHAT IT DOES
+    extract → scan → apply → clean up, in one command, stopping only where
+    a person has to decide (findings, and the IMPORT confirmation).
+
+  UPDRAFTPLUS
+    Copy every file of the backup into the inbox (scp -O backup_* ...) and
+    press Enter: the -db.gz and all the zips are taken as ONE site. The set
+    is checked first: database present, nothing encrypted, no hostile zip.
+
+  AFTERWARDS
+    The archives and the staging copy are deleted once the site is live.
+    Quarantined files and the record of what was imported are kept.
+    Keep everything instead: wp-import.sh restore --keep-files
+EOF
+    ;;
+  import.7) _card "7 — List the inbox" <<'EOF'
+  WHAT IT DOES
+    Lists what is waiting in the inbox, and for an UpdraftPlus backup which
+    parts are present and whether the set can be imported.
+EOF
+    ;;
+  import.8) _card "8 — Clean up leftover copies" <<'EOF'
+  WHAT IT DOES
+    Removes a staging set and the archives it came from. After an import
+    that happens on its own; this is for imports you abandoned.
+
+  WHAT IS KEPT
+    For an imported site: quarantined files and meta/ (evidence). Nothing
+    outside the import inbox is ever deleted.
+
+  ALSO AUTOMATIC
+    Anything left in the inbox or staging for 30 days is removed by a daily
+    job, and logged (syslog: wp-import).
 EOF
     ;;
   import.5) _card "5 — [!] Apply the import" <<'EOF'
@@ -1586,9 +1767,20 @@ menu_security() {
     1) Hardening status              ${DIM}wp-hardening.sh status${R}
     2) Egress (proxy) status         ${DIM}wasp-egress.sh status${R}
     3) Test egress is enforced       ${DIM}wasp-egress.sh test${R}
+   19) Open file sharing for 1 hour  ${DIM}wasp-egress.sh fileshare open <service>${R}
+   20) What is open temporarily      ${DIM}wasp-egress.sh temporary${R}
+   21) Close all temporary egress    ${DIM}wasp-egress.sh close --all${R}
+   25) Path to a WASP Hive (address) ${DIM}wasp-egress.sh hive set <address>${R}
+   26) Test the WASP Hive connection ${DIM}wasp-egress.sh hive status + test${R}
+   22) Send the security report now  ${DIM}wp-vuln-cron.sh --digest${R}
+   23) WASP Hive reporting status    ${DIM}wasp-hive-report.sh status${R}
+   24) Join a WASP Hive              ${DIM}wasp-hive-report.sh enroll …${R}
     4) CrowdSec whitelist            ${DIM}wp-hardening.sh crowdsec-whitelist list${R}
    17) Is CrowdSec actually blocking? ${DIM}wp-hardening.sh crowdsec-doctor${R}
    18) Report bans to a central LAPI ${DIM}wp-hardening.sh cs-lapi <url> <login> <pw>${R}
+   27) AppSec (WAF) status           ${DIM}wasp-appsec.sh status${R}
+   28) AppSec (WAF): switch ON       ${DIM}wasp-appsec.sh on${R}
+   29) AppSec (WAF): switch OFF      ${DIM}wasp-appsec.sh off${R}
     5) Plugin vulnerability scan     ${DIM}wp-plugins.sh vulns${R}
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
@@ -1606,6 +1798,61 @@ EOF
       1) _have wp-hardening.sh && run "Hardening status" 0 wp-hardening.sh status || _missing wp-hardening.sh ;;
       2) _have wasp-egress.sh && run "Egress status" 0 wasp-egress.sh status || _missing wasp-egress.sh ;;
       3) _have wasp-egress.sh && run "Egress enforcement test" 0 wasp-egress.sh test || _missing wasp-egress.sh ;;
+      19) if _have wasp-egress.sh; then
+            echo ""
+            echo "  Services: dropbox gdrive onedrive wetransfer box syncedtool"
+            echo "  Opens for 60 minutes at most, then closes by itself."
+            if ask "Service (or several, space-separated)" _fs; then
+              # shellcheck disable=SC2086
+              run "Open file sharing" 1 wasp-egress.sh fileshare open $_fs
+            fi
+          else _missing wasp-egress.sh; fi ;;
+      20) _have wasp-egress.sh && run "Temporary egress" 0 wasp-egress.sh temporary || _missing wasp-egress.sh ;;
+      21) _have wasp-egress.sh && run "Close temporary egress" 0 wasp-egress.sh close --all || _missing wasp-egress.sh ;;
+      25) if _have wasp-egress.sh; then
+            echo ""
+            echo "  The WASP Hive's address, as hive-admin enroll printed it, or a"
+            echo "  name or IP with an optional :port (443 if none). A name is"
+            echo "  resolved now and that address is the one allowed and used."
+            if ask "WASP Hive address" _ha; then
+              run "Path to the WASP Hive" 1 wasp-egress.sh hive set "$_ha"
+            fi
+          else _missing wasp-egress.sh; fi ;;
+      26) if _have wasp-egress.sh; then
+            run "WASP Hive connection" 0 wasp-egress.sh hive status
+            run "WASP Hive reachable" 0 wasp-egress.sh hive test
+          else _missing wasp-egress.sh; fi ;;
+      27) _have wasp-appsec.sh && run "AppSec status" 0 wasp-appsec.sh status || _missing wasp-appsec.sh ;;
+      28) if _have wasp-appsec.sh; then
+            if grep -q '^enforcement=upstream' /etc/wp-install/crowdsec-topology 2>/dev/null; then
+              echo ""
+              echo "  This VM reports to a central LAPI: make the key there first:"
+              echo "      on the LAPI host:  cscli bouncers add $(hostname)-appsec"
+              if ask "Path to a file holding that key" _kf; then
+                run "AppSec on" 1 wasp-appsec.sh on --key-file "$_kf"
+              fi
+            else
+              run "AppSec on" 1 wasp-appsec.sh on
+            fi
+          else _missing wasp-appsec.sh; fi ;;
+      29) _have wasp-appsec.sh && run "AppSec off" 1 wasp-appsec.sh off || _missing wasp-appsec.sh ;;
+      22) _have wp-vuln-cron.sh && run "Weekly security report (sent now)" 0 wp-vuln-cron.sh --digest || _missing wp-vuln-cron.sh ;;
+      23) _have wasp-hive-report.sh && run "WASP Hive reporting" 0 wasp-hive-report.sh status || _missing wasp-hive-report.sh ;;
+      24) if _have wasp-hive-report.sh; then
+            echo ""
+            echo "  Paste the line hive-admin printed (from 'enroll' to the end), or"
+            echo "  just its four values: <https://hive> <node> <token> <pin>"
+            printf '  > '; read -r _hl
+            _hl=${_hl#*enroll }
+            read -r _hu _hn _ht _hp _hx <<HIVELINE
+$_hl
+HIVELINE
+            if [ -n "$_hp" ] && [ -z "$_hx" ]; then
+              run "Join a WASP Hive" 1 wasp-hive-report.sh enroll "$_hu" "$_hn" "$_ht" "$_hp"
+            else
+              echo "  Expected four values; nothing changed."
+            fi
+          else _missing wasp-hive-report.sh; fi ;;
       4) _have wp-hardening.sh && run "CrowdSec whitelist" 0 wp-hardening.sh crowdsec-whitelist list || _missing wp-hardening.sh ;;
       17) _have wp-hardening.sh && run "CrowdSec remediation chain (live test)" 0 wp-hardening.sh crowdsec-doctor || _missing wp-hardening.sh ;;
       18) # Needs three arguments, so prompt rather than offering a bare run
@@ -1708,6 +1955,9 @@ menu_import() {
     3) Extract (bounded staging)     ${DIM}wp-import.sh extract <file>${R}
     4) Scan staged content           ${DIM}wp-import.sh scan${R}
     5) ${RED}[!]${R} Apply the import             ${DIM}wp-import.sh apply${R}
+    6) ${RED}[!]${R} Restore in one go            ${DIM}wp-import.sh restore${R}
+    7) List the inbox                 ${DIM}wp-import.sh list${R}
+    8) Clean up leftover copies       ${DIM}wp-import.sh clean${R}
     b) back
 EOF
     _sel import
@@ -1718,6 +1968,14 @@ EOF
       3) if ask "Path to archive" _f; then run "Extract archive" 0 wp-import.sh extract "$_f"; fi ;;
       4) run "Scan staged" 0 wp-import.sh scan ;;
       5) run "Apply import" 1 wp-import.sh apply ;;
+      6) echo ""
+         echo "  Blank = the one backup in the inbox (an UpdraftPlus set counts as one)."
+         printf '  Archive or set (blank = auto) : '; read -r _f || _f=""
+         if [ -n "$_f" ]; then run "Restore" 1 wp-import.sh restore "$_f"
+         else run "Restore" 1 wp-import.sh restore; fi ;;
+      7) run "Import inbox" 0 wp-import.sh list ;;
+      8) run "Staged imports" 0 wp-import.sh staged
+         if ask "Staging id to clean (or --all)" _f; then run "Clean up" 1 wp-import.sh clean "$_f"; fi ;;
       b|B) return ;;
     esac
   done

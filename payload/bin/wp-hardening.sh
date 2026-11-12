@@ -514,8 +514,8 @@ case "${1:-status}" in
       echo "Usage: wp-hardening.sh cs-lapi <lapi-url> <machine-login> <password>"
       echo ""
       echo "  Register the machine first — these run on the LAPI host, not here:"
-      echo "    on the LAPI host       cscli machines add <login> --password '<pw>'"
-      echo "    on NPMplus (container) podman exec crowdsec cscli machines add …"
+      echo "    on the LAPI host       cscli machines add <login> --password '<pw>' -f /dev/null"
+      echo "    on NPMplus (container) podman exec crowdsec cscli machines add … -f /dev/null"
       echo ""
       echo "  Then point this VM at it, e.g.:"
       echo "      doas wp-hardening.sh cs-lapi http://10.20.10.10:8080/ wp01 's3cret'"
@@ -529,6 +529,32 @@ case "${1:-status}" in
     _topo=/etc/wp-install/crowdsec-topology
     _proxy=""
     [ -r "$_topo" ] && _proxy=$(sed -n 's/^proxy_ip=//p' "$_topo" | head -1)
+
+    # This VM's own egress filter, checked before anything is torn down. With
+    # restricted egress, :8080 -- where nearly every LAPI listens -- is closed,
+    # and the agent then fails exactly like a wrong password or a LAPI bound
+    # to loopback. Opening a way out is the operator's decision, so this
+    # names the command rather than running it.
+    _lhp="${_u#*://}"; _lhp="${_lhp%%/*}"
+    _lhost="${_lhp%%:*}"; _lport="${_lhp##*:}"
+    if [ "$_lport" = "$_lhp" ]; then
+      case "$_u" in https://*) _lport=443 ;; *) _lport=80 ;; esac
+    fi
+    if nft list chain inet filter output 2>/dev/null | grep -q "nft-egress-drop"; then
+      case "$_lport" in
+        80|443) : ;;
+        *)
+          if ! nft list set inet filter egress_extra_tcp 2>/dev/null | grep -qw "$_lport" \
+             && ! nft list chain inet filter output 2>/dev/null \
+                  | grep -q "ip daddr ${_lhost} tcp dport ${_lport} accept"; then
+            echo "✗  This VM's egress is restricted and tcp/${_lport} is not allowed out,"
+            echo "   so the agent could never reach ${_u}. Nothing has been changed."
+            echo "   Allow it, then re-run this command:"
+            echo "      doas wp-hardening.sh egress-allow ${_lport} tcp"
+            exit 1
+          fi ;;
+      esac
+    fi
 
     # Resolve the image BEFORE destroying the container that knows it.
     # Order matters: the running container's own image first (true even on a
@@ -578,7 +604,7 @@ case "${1:-status}" in
       echo "✗  The agent could not authenticate to ${_u}."
       echo "   On the LAPI host:   cscli machines list      (is '${_l}' there?)"
       echo "   On the LAPI host:   is it listening off 127.0.0.1?"
-      echo "   From here:          nc -z \${host} 8080"
+      echo "   From here:          nc -z -w 5 ${_lhost} ${_lport}"
       echo "   Nothing has been lost — re-run this command with corrections."
       exit 1
     fi
@@ -769,15 +795,15 @@ SNIPPET
     printf '#\n'
     printf '# Directives at this level inherit into every location that does\n'
     printf '# not override them, so put them HERE, outside any block.\n'
-    printf 'proxy_set_header Host              \$host;\n'
-    printf 'proxy_set_header X-Real-IP         \$remote_addr;\n'
-    printf '# REPLACE, not append. \$proxy_add_x_forwarded_for appends to\n'
+    printf 'proxy_set_header Host              $host;\n'
+    printf 'proxy_set_header X-Real-IP         $remote_addr;\n'
+    printf '# REPLACE, not append. $proxy_add_x_forwarded_for appends to\n'
     printf '# whatever the CLIENT sent, so a forged header arrives as\n'
     printf '# "<forged>, <real>". mod_remoteip should still pick the right one,\n'
     printf '# but only if RemoteIPTrustedProxy is exactly right. Replacing it\n'
     printf '# states the truth and removes the class of bug entirely.\n'
-    printf 'proxy_set_header X-Forwarded-For   \$remote_addr;\n'
-    printf 'proxy_set_header X-Forwarded-Proto \$scheme;\n\n'
+    printf 'proxy_set_header X-Forwarded-For   $remote_addr;\n'
+    printf 'proxy_set_header X-Forwarded-Proto $scheme;\n\n'
     printf '# ── admin-ajax.php MUST stay open ──────────────────────────────\n'
     printf '# admin-post.php serves logged-out visitors too: it is where WASP'"'"'s\n'
     printf '# own contact form posts. Apache keeps both open for the same reason.\n'
@@ -794,10 +820,10 @@ SNIPPET
     printf '# without widening the restriction by a single byte.\n'
     _public_location() {
       printf '    proxy_pass http://%s:80;\n' "${_vmip:-VM_IP}"
-      printf '    proxy_set_header Host              \$host;\n'
-      printf '    proxy_set_header X-Real-IP         \$remote_addr;\n'
-      printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
-      printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
+      printf '    proxy_set_header Host              $host;\n'
+      printf '    proxy_set_header X-Real-IP         $remote_addr;\n'
+      printf '    proxy_set_header X-Forwarded-For   $remote_addr;\n'
+      printf '    proxy_set_header X-Forwarded-Proto $scheme;\n'
       printf '}\n\n'
     }
     printf 'location = /wp-admin/admin-ajax.php {\n'
@@ -823,16 +849,16 @@ SNIPPET
     printf '    # proxy_set_header discards all inherited ones -- so if you\n'
     printf '    # ever add a header here, these must already be present or\n'
     printf '    # they vanish silently. Stating them costs nothing.\n'
-    printf '    proxy_set_header Host              \$host;\n'
-    printf '    proxy_set_header X-Real-IP         \$remote_addr;\n'
+    printf '    proxy_set_header Host              $host;\n'
+    printf '    proxy_set_header X-Real-IP         $remote_addr;\n'
     printf '    # REPLACE, not append. NPM defaults to\n'
-    printf '    #   \$proxy_add_x_forwarded_for\n'
+    printf '    #   $proxy_add_x_forwarded_for\n'
     printf '    # which appends to whatever the CLIENT sent, so a forged header\n'
     printf '    # arrives as "<forged>, <real>". mod_remoteip should still pick\n'
     printf '    # the right one, but only if RemoteIPTrustedProxy is exactly\n'
     printf '    # right. Replacing it states the truth and removes the class.\n'
-    printf '    proxy_set_header X-Forwarded-For   \$remote_addr;\n'
-    printf '    proxy_set_header X-Forwarded-Proto \$scheme;\n'
+    printf '    proxy_set_header X-Forwarded-For   $remote_addr;\n'
+    printf '    proxy_set_header X-Forwarded-Proto $scheme;\n'
     printf '}\n\n'
     printf 'location = /xmlrpc.php { deny all; }\n\n'
     printf '# ── Never serve these, whatever WordPress or a plugin thinks ───\n'
@@ -870,17 +896,17 @@ SNIPPET
     printf 'proxy_hide_header X-Content-Type-Options;\n'
     printf 'proxy_hide_header Referrer-Policy;\n'
     printf 'proxy_hide_header Permissions-Policy;\n'
-    printf 'add_header X-Frame-Options        \"SAMEORIGIN\" always;\n'
-    printf 'add_header X-Content-Type-Options \"nosniff\" always;\n'
-    printf 'add_header Referrer-Policy        \"strict-origin-when-cross-origin\" always;\n'
-    printf 'add_header Permissions-Policy     \"camera=(), microphone=(), geolocation=(), payment=()\" always;\n'
+    printf 'add_header X-Frame-Options        "SAMEORIGIN" always;\n'
+    printf 'add_header X-Content-Type-Options "nosniff" always;\n'
+    printf 'add_header Referrer-Policy        "strict-origin-when-cross-origin" always;\n'
+    printf 'add_header Permissions-Policy     "camera=(), microphone=(), geolocation=(), payment=()" always;\n'
     printf '\n'
-    printf '# includeSubDomains added. The scan found \"max-age=63072000; preload\"\n'
+    printf '# includeSubDomains added. The scan found "max-age=63072000; preload"\n'
     printf '# WITHOUT it — which is not merely weaker, it is INVALID for the HSTS\n'
     printf '# preload list. A preload submission is rejected without\n'
     printf '# includeSubDomains, so the directive was doing nothing.\n'
     printf '# Only add this once you are certain EVERY subdomain serves HTTPS.\n'
-    printf 'add_header Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\" always;\n'
+    printf 'add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;\n'
     printf '\n'
     printf '# CSP is deliberately NOT set here. The VM tailors it per-path --\n'
     printf '# wp-admin needs unsafe-eval, the public site does not -- and a\n'
@@ -891,11 +917,21 @@ SNIPPET
     cat <<'SNIPPET2'
 
 ───────────────────────────────────────────────────────────────────
- 2. NPM HOST -> /data/nginx/custom/http_top.conf
+ 2. NPM HOST -> http_top.conf   (the path depends on which NPM)
 ───────────────────────────────────────────────────────────────────
 
  limit_req_zone lives in the http block, which the Advanced tab cannot
  reach. Create the file if it does not exist, then restart NPM.
+
+   NPMplus   /opt/npmplus/custom_nginx/http_top.conf   on the host
+             (/data/custom_nginx/ inside the container. NPMplus migrates
+             /data/nginx/custom/ once and then deletes it, so a file put
+             there later is never read.)
+   NPM       /data/nginx/custom/http_top.conf          inside the container
+
+ Check it was loaded:   nginx -T 2>/dev/null | grep 'zone=wplogin'
+ It must print the limit_req_zone line. Nothing printed means section 1's
+ limit_req will refuse to load.
 
 # Keyed on POST only. An empty key is not rate limited, so GETs — every
 # CSS, JS and image the login page pulls — pass freely.
@@ -1904,6 +1940,10 @@ SNIPPET2
     echo "  Always allowed:  53 DNS · 123 NTP · 67/68 DHCP · 80 HTTP · 443 HTTPS"
     echo "                   25/465/587 mail (connection-rate-limited)"
     echo ""
+    # The upstream CrowdSec LAPI, if the installer allowed it to one host.
+    _lapir=$(nft list chain inet filter output 2>/dev/null | grep 'wasp-lapi' \
+             | sed -n 's/.*ip daddr \([^ ]*\) tcp dport \([0-9]*\).*/\1:\2/p')
+    [ -n "$_lapir" ] && echo "  CrowdSec LAPI:   tcp to ${_lapir} only (set at install)" && echo ""
     echo "  Operator-added TCP ports:"
     nft list set inet filter egress_extra_tcp 2>/dev/null \
       | sed -n 's/.*elements = {\(.*\)}.*/    \1/p' | grep . || echo "    (none)"
