@@ -74,6 +74,7 @@ All of these can be regenerated from the provider. None loses data.
 | WordPress DB password | `/etc/wordpress/env` and `wp.env` (0600) | Rotate with `wp-rotate-secrets.sh db` |
 | WordPress salts | `wp-config.php` | Rotate with `wp-rotate-secrets.sh salts` — logs everyone out |
 | SMTP relay password | `/home/wpuser/wp/secrets/smtp.ini` (0440) | Reissue at the relay, then `wp-rotate-secrets.sh smtp` |
+| Security-alert settings (not a secret: recipients and on/off per event) | `/home/wpuser/wp/secrets/alerts.ini` (0440, read-only inside WordPress) | Change with `wasp-alerts.sh`; kept outside wp-admin so an admin session cannot silence alerts |
 | Admin account password | Not stored — set at install | WordPress password reset, or console |
 | Root console password | Not stored — set at install | Proxmox console + single-user boot |
 | CrowdSec enrolment key | `/etc/crowdsec/` | Re-enrol from the CrowdSec console |

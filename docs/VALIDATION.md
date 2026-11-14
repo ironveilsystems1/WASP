@@ -84,6 +84,14 @@ check was written after a specific defect reached hardware:
 - `test-appsec.sh` — written with the AppSec option, which itself followed the finding that the `appsec-wordpress` rules installed on every VM had never inspected a request
 - `test-hive-role.sh` — written with install.sh's Hive role
 - `test-updraft-import.sh` — written when an UpdraftPlus import still meant re-packing five files by hand, outside every import check
+- `test-remoteip-fix.sh` — written after every tenant's wp-admin answered its own administrator with 403, and the hand repair "did nothing" until a second file declaring the same proxy was found
+- `test-smtp-config.sh` — written after `wp-rotate-secrets.sh smtp` reported success, changed nothing, and the relay banned a whole premises for the failed logins that followed
+- `test-malware-scan.sh` — written after a clean site produced 16 HIGH lines on its own verified core, and an import 28 SUSPECT lines on customer photos
+- `test-alerts.sh` / `test-alerts.php` — written with the security alerts, so an alert that silently stops firing, leaks a secret or floods the inbox fails the build
+- `test-links.sh` / `test-links.php` — written after casino links pasted into three live pages passed every scan, and a link checker could not reach the site at all
+- `test-upgrade.sh` / `check-upgrade-map.py` — written when each release's upgrade was a block of commands pasted by hand on every VM, checked by nothing, and growing with every release
+- `test-links-clean.php` — written after the spam an import brought was found, and removing it meant six SQL queries and the editor by hand, page by page
+- `test-verify-integrity.sh` — written before the tooling check's result was emailed, when it turned out every VM reported files it never keeps
 
 Several caught their own class again within days of being written, including
 two mistakes made while writing the fix for the original.

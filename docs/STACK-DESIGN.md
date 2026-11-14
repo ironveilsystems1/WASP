@@ -30,6 +30,11 @@ independently, in the same terms:
 > WASP pins it as `RemoteIPTrustedProxy`, and that value must be a **single
 > literal address, never a CIDR**.
 
+Since 10.15 WASP declares it as `RemoteIPInternalProxy` — still one literal
+address. `RemoteIPTrustedProxy` discards private client addresses, which locked
+every LAN or overlay administrator out of wp-admin. The single-address rule is
+unchanged; the npmplus README's wording predates the switch.
+
 And `OPNSENSE.md` in this project already contains §7 "Why a backend cannot
 enforce its own bans" — the B2 reasoning WASP 10.4 acted on — plus a
 config.xml reference precise enough to generate from.
@@ -353,7 +358,7 @@ be sequencing between three things that do not.
 
 - **B1 — what NPMplus sends as `X-Forwarded-For`**, replace or append. Open in
   both repos. Nothing above depends on the answer, because single-literal
-  `RemoteIPTrustedProxy` is correct either way — belt and braces if replace,
+  `RemoteIPInternalProxy` is correct either way — belt and braces if replace,
   load-bearing if append. Settle it before the tenant count makes a retrofit
   expensive; npmplus TODO has the raw-listener procedure.
 - **OPNsense config.xml import across versions.** The appendix is verified
