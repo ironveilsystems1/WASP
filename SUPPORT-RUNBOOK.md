@@ -261,7 +261,7 @@ Then rotate everything and reset admin passwords:
 
 ```sh
 wp-rotate-secrets.sh all                  # database + salts, kept in sync, reversible
-wp-rotate-secrets.sh smtp '<new>'         # after changing it at the relay
+wp-rotate-secrets.sh smtp                 # prompts; after changing it at the relay
 wp-forensics.sh admins                    # then reset each admin's password
 ```
 

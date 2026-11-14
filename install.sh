@@ -179,9 +179,9 @@ fi
 # that is silently wrong is worse than one that carries less information.
 #
 # If a build stamp is wanted again later, generate it rather than typing it.
-WASP_RELEASE="10.14"
-WASP_VERSION="10.14"
-WASP_VERSION_NOTE="UpdraftPlus backups import as one site; wp-import.sh restore runs the whole import in one command and cleans up the archives and staging copy afterwards. 10.13: Optional CrowdSec AppSec request inspection (light ruleset, memory watchdog); install.sh builds a WASP Hive and joins VMs to one; the egress path to the Hive from the menu. 10.12: WASP Hive: a read-only fleet console that VMs push signed-in reports to over pinned TLS, with vulnerability, malware, integrity, CrowdSec and backup state per VM, optional Wazuh, and compliance evidence mapped to CIS v8, PCI DSS 4.0, HIPAA, SOC 2 and NIST CSF 2.0"
+WASP_RELEASE="10.18"
+WASP_VERSION="10.18"
+WASP_VERSION_NOTE="wasp-upgrade.sh: a VM upgrades itself to a new release, verified against its pinned signing key, planned, backed up, applied the same way every time and rolled back on request; wp-links.sh clean removes named spam widgets, titles, articles, revisions and IndexNow entries through Elementor, with evidence and a database backup first; spam links are emailed as they are saved; the import scan flags spam titles and articles by ID and the application passwords a site brings. 10.17: spam links and broken links (wp-links.sh): injected casino/pharmacy links found per page and Elementor widget, weekly; the site crawled for broken links; import and malware scans end in a plain-language verdict with a saved report. 10.16: security alerts: WordPress and the VM email the operator about administrators, sign-ins, credentials, two-factor, code and settings changes, outages, planted admins and modified files (wasp-alerts.sh); SMTP password rotation really changes the password; UpdraftPlus restores keep plugin .sql files; fewer scanner false positives. 10.15: wp-admin reachable through the reverse proxy from the LAN and overlay networks: the proxy is declared once as a single-address RemoteIPInternalProxy, and wp-hardening.sh remoteip-fix repairs VMs built earlier. 10.14: UpdraftPlus backups import as one site; wp-import.sh restore runs the whole import in one command and cleans up the archives and staging copy afterwards. 10.13: Optional CrowdSec AppSec request inspection (light ruleset, memory watchdog); install.sh builds a WASP Hive and joins VMs to one; the egress path to the Hive from the menu. 10.12: WASP Hive: a read-only fleet console that VMs push signed-in reports to over pinned TLS, with vulnerability, malware, integrity, CrowdSec and backup state per VM, optional Wazuh, and compliance evidence mapped to CIS v8, PCI DSS 4.0, HIPAA, SOC 2 and NIST CSF 2.0"
 
 # Persist a durable record that this install skipped signature verification.
 # validate-wordpress.sh and wasp-testreport.sh surface it, so an unverified
@@ -487,7 +487,7 @@ verify_release "$REPO_DIR"
 contract_preflight() {
   local fail=0
 
-  # TRUST-COUNT. RemoteIPTrustedProxy must name exactly ONE literal address:
+  # TRUST-COUNT. RemoteIPInternalProxy must name exactly ONE literal address:
   # mod_remoteip walks X-Forwarded-For from the right, popping entries while
   # they match a trusted proxy, and takes the first untrusted one as the
   # client. A range therefore lets any host inside it prepend whatever client
@@ -499,14 +499,14 @@ contract_preflight() {
   if [[ -n "${WASP_PROXY_IP:-}" ]]; then
     if [[ "$WASP_PROXY_IP" =~ [/,[:space:]] ]]; then
       echo "FATAL: WASP_PROXY_IP='${WASP_PROXY_IP}' is a range or a list." >&2
-      echo "  RemoteIPTrustedProxy takes one literal address. A range lets any" >&2
+      echo "  RemoteIPInternalProxy takes one literal address. A range lets any" >&2
       echo "  host inside it forge the client IP in X-Forwarded-For, which is" >&2
       echo "  the address CrowdSec bans and the one wp-admin checks." >&2
       echo "  Use the proxy's own address, e.g. WASP_PROXY_IP=10.20.10.10" >&2
       fail=1
     elif [[ ! "$WASP_PROXY_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
       echo "FATAL: WASP_PROXY_IP='${WASP_PROXY_IP}' is not an IPv4 address." >&2
-      echo "  A hostname is not usable here — Apache resolves RemoteIPTrustedProxy" >&2
+      echo "  A hostname is not usable here — Apache resolves RemoteIPInternalProxy" >&2
       echo "  once at startup, so a name that later resolves elsewhere leaves" >&2
       echo "  Apache trusting an address nothing told it about." >&2
       fail=1

@@ -6,6 +6,344 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.18 — Upgrades a VM runs itself, and cleaning spam up
+
+### `wasp-upgrade.sh` (new): verified, planned, repeatable upgrades with rollback
+
+Until now each release's CHANGELOG ended with a block of commands to paste on every VM, and each release added to it: copy the payload, install the tools, install a new mu-plugin, rewrite one cron line, append two more. Pasted by hand across a fleet, that drifts, and nothing checked that the release being pasted was the signed one.
+
+- **`check <release>`** takes the tarball or its unpacked directory and changes nothing.
+  - **Verifies:**
+    - the minisign signature on `MANIFEST.sha256`, against the key pinned on the VM at build (`release.pub`), never one the release brings;
+    - every file against the manifest;
+    - that nothing under `payload/` is unlisted.
+  - **Refuses:**
+    - an unsigned release, unless `--unsigned`;
+    - a tarball with absolute or `../` paths, or links.
+  - **Plans:**
+    - tools, mu-plugins, rules and cron lines that change, with line counts (`--diff` for the lines);
+    - the version steps that will run;
+    - build-time configuration that changed upstream, which is reported and never replaced.
+- **`apply <release>`** works in this order:
+  1. the same verification and plan;
+  2. every new mu-plugin checked by PHP inside the wordpress container;
+  3. a backup of everything it will touch (`/var/lib/wasp-upgrade/backups/`, newest five kept);
+  4. the changes, from the new release's `payload/upgrade/files.map`;
+  5. each version's step (`payload/upgrade/hooks/<version>.sh`);
+  6. checks: PHP on each mu-plugin, the site's health, and the tooling against the manifest. A mu-plugin that fails PHP's check after install is put back at once.
+- **Blocked by an edited tool.** A tool or mu-plugin that differs from what was installed blocks the upgrade, because an edited root script is evidence. `--force` overwrites it after you have looked.
+- **Keeps this VM's settings:**
+  - mu-plugins are rendered with the VM's own login slug and two-factor enforcement and grace, read from the installed files rather than vars.sh;
+  - cron lines are added once and removed when retired (`cron-retired.txt` covers VMs upgraded by hand);
+  - an operator's moved schedule and their own lines are kept.
+- **Repeatable and reversible.** A second `apply` changes nothing. A downgrade is refused. **`rollback`** restores the last backup exactly and removes what the upgrade added. **`status`** shows the version, history and backups.
+- **Version steps:**
+  - 10.15: `wp-hardening.sh remoteip-fix`, when the check says it is needed;
+  - 10.16: `wasp-alerts.sh setup` where no alerts.ini exists.
+- **Guarded by `test/check-upgrade-map.py`.** It fails when a stage installs a payload file the map does not cover, or a tool no stage installs. New VMs get `wasp-upgrade.sh` from stage 08.
+- **Menu:** Updates → 23 (check), 24 (apply), 25 (status), 26 (rollback).
+
+### `wp-links.sh clean` (new): removing what `spam` found
+
+- **How it saves.** Through WP-CLI and Elementor's own document save (`php-tools/wasp-content-clean.php`), so the page's HTML copy and CSS are rebuilt. A direct database edit leaves them holding the spam. If Elementor's save is unavailable, it writes the data directly and says to re-save the page.
+- **What it removes:**
+  - `--widgets` takes Elementor widget IDs;
+  - `--title <id>=<text>` sets a page title;
+  - `--trash` moves posts to the Trash, not deleting them;
+  - `--revisions` deletes the revisions that hold spam, judged one by one;
+  - `--indexnow` drops the spam entries from Rank Math's log and keeps the rest.
+- **Only what is named and tests as spam.** Detection is the content scanner's own, included. A mistyped ID, a real widget, a clean title, a spam replacement title or a clean page is refused, and nothing in that run is applied.
+- **Preview by default.** Without `--apply` it only describes the changes.
+- **What `--apply` does, in order:**
+  1. needs a terminal or `--yes`;
+  2. saves the scan, the plan and the IndexNow log to `/var/lib/wasp/evidence/content-spam-<time>/` (0700);
+  3. takes a database backup and stops if it fails;
+  4. applies the changes, then scans again and says what is left.
+- **Supporting changes:**
+  - `wp-plugins.sh __wp` runs WP-CLI for WASP's own tools, so there is one definition of how WP-CLI runs;
+  - the content scanner skips trashed posts;
+  - the widget-text extraction is shared between the scanner and the cleaner.
+- **Menu:** Security → 34.
+
+### Spam links alerted as they are saved
+
+- **New `content_spam` event in `07-wasp-alerts.php`.** It covers:
+  - a post's content;
+  - Elementor data, widget by widget;
+  - a menu item's URL;
+  - a sidebar widget.
+- **What it judges.** Links only, never wording alone. Links to the site itself are ignored, and so are revisions and trashed posts.
+- **One email per save.** A save seen by several hooks is one email. It names the page and each widget, gives the `wp-links.sh clean --widgets …` command, and says who saved it and from where. It repeats once a day per page while the spam stays.
+- **One switch.** The same `content_spam` key in alerts.ini turns off this alert and the weekly scan's email. `test-links.sh` holds the alert's host list to the scanner's.
+
+### The import scan, and accounts
+
+- **Read from the posts table itself** (`wasp-threats.sh dump-posts`):
+  - titles carrying spam;
+  - spam articles by address, each with the post ID and the exact `wp-links.sh clean --trash` / `--title` command in the verdict. Revisions are left out.
+- **Application passwords the site brings** (`dump-appwd`): listed by account and name, never their hashes, as a REVIEW item. They reach the API without the login page or two-factor, and survive the password changes everyone makes after a compromise.
+- **`wp-forensics.sh app-passwords`** lists every one with when it was created and last used, and from where. **`app-passwords revoke <user id>|all`** removes them. Menu: Diagnostics → 12.
+
+### Documentation
+
+- README: "Upgrading WASP on a VM" and "Cleaning up content spam" (with the search-engine steps).
+- INCIDENT-PLAYBOOK: "Content spam", from the first alert to the all-clear.
+
+### Tests
+
+| Test | Cases |
+|---|---|
+| `test/test-upgrade.sh` | 60, host shell and BusyBox: a VM root at 10.14 upgraded to this tree; refusals, plan, block, apply, settings kept, cron, idempotence, lint gate, rollback, downgrade |
+| `test/check-upgrade-map.py` | every stage install covered by the map, every tool installed by a stage, hooks named and described |
+| `test/test-links-clean.php` | 21: the cleaner against a stand-in WordPress |
+| `test-links.sh` | +11: `clean` plumbing (evidence, backup before change, refusals), the alert's word list |
+| `test-alerts.php` | +4: the save-time spam alert |
+| `test-updraft-import.sh` | +3: spam titles, spam articles by ID, application passwords; now runs the real dump reader |
+
+### Bringing a VM built earlier up to 10.18
+
+From this release on, no blocks of commands to paste. On a VM at any earlier release, run the upgrader from the release once. It installs itself, applies every change since the VM's own version (including the 10.15, 10.16 and 10.17 ones), and runs their steps:
+
+```sh
+doas tar xzf /tmp/wasp-10.18-2026-11-14.tar.gz -C /root
+doas sh /root/wasp-10.18/payload/bin/wasp-upgrade.sh check /root/wasp-10.18
+doas sh /root/wasp-10.18/payload/bin/wasp-upgrade.sh apply /root/wasp-10.18
+```
+
+After that: `doas wasp-upgrade.sh apply <next release>`. Sign the manifest first (SIGNING.md); an unsigned release needs `--unsigned`.
+
+## 10.17 — Spam links, broken links, and scan results a person can read
+
+### Spam and broken links: `wp-links.sh` (new)
+
+A real import brought casino links into three live pages, a casino advert into a page title, and spam articles that Rank Math's IndexNow had announced to search engines. Every file and signature check passed, because this is content, not code. Separately, an online link checker could not reach the site at all.
+
+- **`wp-links.sh spam`** runs `payload/php-tools/wasp-content-scan.php` inside the wordpress container. The script is fed in on stdin; nothing is added to the site.
+  - **What it reads:** the database directly, read-only, without loading WordPress.
+  - **Where it looks:** posts, pages, drafts, Elementor templates, widget by widget inside Elementor's page data, menus, sidebar widgets and the IndexNow log.
+  - **What each finding names:** the page, its status, who last saved it, and the Elementor widget ID to delete. Findings pasted from a Google Sheet or hidden with CSS are marked as such.
+  - **Also reported:** revisions that still hold spam, and an inventory of every outside domain the site links to.
+  - **Clean sites stay clean:** "slotted posts", a pricing table pasted from Sheets, supplier links and footer credits are not reported.
+- **`wp-links.sh spam --notify`** runs weekly from cron and emails only when spam is found. Turn it off with `wasp-alerts.sh off content_spam`.
+- **`wp-links.sh broken`** crawls the site through the reverse proxy, as a visitor does.
+  - **What it reports:** missing pages, images and files, each with the pages that link to it, plus server errors and certificate problems (for example a `www.` link the certificate does not cover).
+  - **How politely:** it sends a browser identity, which the site requires, and fetches one page a second.
+  - **What it never touches:** login, admin, login-slug, API and search paths.
+  - **Other sites:** their links are listed by domain, not fetched (the VM's outbound traffic is limited), with the command to check them from a workstation.
+- Menu: Security → 32 (spam) and 33 (broken).
+
+### The import scan, readable
+
+- **New content section, run on the dump before it is loaded:**
+  - links to gambling, pharmacy or adult domains, read through Elementor's JSON and SQL escaping;
+  - Google Sheets pastes;
+  - links hidden with CSS;
+  - spam article addresses on the site's own domain, including from the IndexNow log.
+
+  It uses the same word lists as the content scanner, and `test-links.sh` fails if they drift.
+- **A verdict that says it in words:**
+  - **A headline:** `ACTION NEEDED`, `REVIEW BEFORE IMPORTING` or `CLEAN`, with the counts.
+  - **One line per kind of finding:** for example "5 × PHP file(s) where only images and documents belong (uploads)", and what happens to it: "quarantined at import", "locked at import", "remove after import (wp-links.sh spam)".
+  - **The next commands, in order.** Before, the verdict was two numbers and a pointer to a report command that did not exist.
+- **The report now exists:**
+  - `wp-import.sh scan` saves the whole scan as plain text in `meta/scan-report.txt`, ending with every file finding and its full path;
+  - `wp-import.sh report [id]` shows it.
+- **Counts come from the findings record, one row per file.** Counting `[CRITICAL]` lines in the output stops being a count once findings are grouped.
+
+### The malware scan, readable (live sites and imports)
+
+- **Grouped by rule.** Signature matches are grouped as `[SEV] rule — N file(s)`, with:
+  - what the rule means in plain words, from the new `wp-malware-scan.sh explain <rule>`;
+  - the first eight files;
+  - "… and N more", pointing at where every file is listed;
+  - the advice once per rule, not once per file.
+
+  An import had printed the same two lines 28 times.
+- **Short paths.** Paths on finding headlines are relative to the scanned site. Full paths stay in the findings record, the JSON, the alert email and copy-paste commands.
+- **Full list for callers.** `WASP_FINDINGS_OUT` lets a caller keep the full record; `wp-import.sh` uses it for the saved report.
+
+### Tests
+
+| Test | Cases |
+|---|---|
+| `test/test-links.php` | 24: the content scanner, on fixtures shaped like the real import plus the legitimate content that must not be flagged |
+| `test/test-links.sh` | 38, host shell and BusyBox: a real local web server crawled; never-requested paths verified from its request log; word-list consistency; spam plumbing and notify |
+| `test-updraft-import.sh` | +10: content checks on a dump with Elementor-escaped spam, the verdict, the saved report and `report` |
+| `test-malware-scan.sh` | +5: grouping, relative paths, advice once per rule, "and N more", the full record |
+| `test-alerts.sh` | updated for the eleventh event |
+
+### Bringing a VM built earlier up to 10.17
+
+As for 10.16 (that section has the full block). The staged payload copy now also brings `php-tools/`. Add the weekly line:
+
+```sh
+grep -q 'wp-links.sh spam' /etc/crontabs/root || \
+  echo '40 4 * * 2 /usr/local/bin/wp-links.sh spam --notify >/dev/null 2>&1' >> /etc/crontabs/root
+wp-links.sh spam
+```
+
+## 10.16 — Security alerts, and fixes from a real import
+
+### Security alerts
+
+WordPress and the VM now email the operator about security-relevant changes. Managed with `wasp-alerts.sh`, and under menu → Diagnostics → 9–11.
+
+**From WordPress** (`payload/mu-plugins/07-wasp-alerts.php`):
+- administrator added, promoted, demoted or deleted
+- administrator sign-in from an address that account has not used in 90 days
+- administrator password or email changed, or a reset requested
+- application password created
+- two-factor turned off or changed
+- plugins and themes installed, updated, activated, deactivated, deleted or switched, and core updated
+- site address, admin email, open registration or default role changed
+
+**From the VM**, through `wasp-alerts.sh` on cron:
+- **`watch-site`:** the site down for 10 minutes, its recovery, and a reminder every 6 hours in between
+- **`watch-admins`:** the administrator list as the **database** holds it, so an account inserted with SQL is caught
+- **`watch-integrity`:** plugin files that no longer match wordpress.org, or WASP's tools modified. This replaces the weekly `wp-plugins.sh verify`, which only logged.
+
+How it behaves:
+- **Settings.** They live in `secrets/alerts.ini`, mounted read-only into WordPress, so a wp-admin session cannot turn alerts off or redirect them. The recipient is never taken from `admin_email`.
+- **Noise control.** One email per request, a quiet window per event, and a ceiling of 20 an hour with one notice when it is reached. Sign-ins are remembered per address.
+- **No secrets.** No password, reset key or application-password value ever appears in an email.
+- **Install.** It is set up from the operator alert email. Without one, nothing is written and `validate-wordpress.sh` warns.
+- **Recipient lists.** `wp-notify.sh` now delivers to a comma-separated recipient list.
+
+### Fixes, all found importing a real site
+
+1. **`wp-rotate-secrets.sh smtp` printed ✔ and changed nothing.**
+   - **Cause.** It edited `password=` / `AuthPass=` lines, while `smtp.ini` holds `pass_b64 =`. The site kept the old password and failed every login. The relay's brute-force guard then banned the premises' address, and every site behind it lost mail.
+   - **Now.** It replaces `pass_b64`, reads the value back before claiming success, and keeps the inode. It prompts twice when no argument is given, so the password stays out of `ps` and history; the menu no longer passes it on the command line. It refuses a file without `pass_b64` and points at `wp-mail.sh setup`.
+2. **`wp-mail.sh doctor` always printed `mu-plugin : MISSING`.** `MU_PLUGIN` was never defined.
+3. **Mail-override plugins are now named.** `doctor` and a failed `wp-mail.sh test` list active plugins that replace the mailer with their own settings. FluentSMTP came over in an import still aimed at the old host, and the error named WASP's relay.
+4. **An UpdraftPlus restore swept every `.sql` file out of the plugins.** LiteSpeed Cache's six `src/data_structure/*.sql` table definitions were moved into `db/`, which broke the plugin and stopped the import over "7 dumps". The sweep is now skipped for UpdraftPlus sets, as it already was for `.wpress`.
+5. **Scanner: images.** `php_in_nonphp_extension` matched the three bytes `<?=` by chance inside JPEG data, giving 28 SUSPECT lines on customer photos. `<?=` now counts only outside JPEG, PNG, GIF, WebP, MP4/HEIC/AVIF and PDF. `<?php` counts everywhere.
+6. **Scanner: core files.** `wp-malware-scan.sh full` reported 16 HIGH matches in `wp-includes` and `wp-admin` directly under "All core PHP files match the pinned image". A core file whose hash equals the pinned image's is now not reported, and the skip is stated with a count. A **modified** core file is still reported, by YARA and as CRITICAL by the core check. With no readable image, nothing is suppressed.
+7. **`wasp-verify-integrity.sh` reported every VM as modified.** It checked the whole release manifest, but a VM never keeps `install.sh`, `lib/` or `hive/`, and keeps `payload/stages/` as `stages/`. It now checks what a VM keeps, under the names it keeps it as. The signature still covers the whole manifest. This had to come before emailing the result weekly.
+
+### Tests
+
+| Test | Cases |
+|---|---|
+| `test/test-alerts.php` | 15 scenarios for the mu-plugin, against a stand-in WordPress |
+| `test/test-alerts.sh` | 52, host shell and BusyBox |
+| `test/test-smtp-config.sh` | 24 |
+| `test/test-malware-scan.sh` | 9 |
+| `test/test-verify-integrity.sh` | 10 |
+| `test-updraft-import.sh` | +1 |
+
+Every new test was checked to fail against 10.15.
+
+### Bringing a VM built earlier up to 10.16
+
+VMs do not update their own tooling. Copy the release to the VM, then, as root:
+
+```sh
+R=/root/wasp-10.16     # the unpacked release
+cp -a "$R/payload/." /etc/wp-install/payload/ && rm -rf /etc/wp-install/payload/stages /etc/wp-install/payload/install-wordpress.sh
+cp -a "$R/payload/stages/." /etc/wp-install/stages/
+cp "$R/MANIFEST.sha256" /etc/wp-install/; [ -f "$R/MANIFEST.sha256.minisig" ] && cp "$R/MANIFEST.sha256.minisig" /etc/wp-install/
+for f in "$R"/payload/bin/*.sh; do install -m 0755 "$f" /usr/local/bin/; done
+install -m 0644 "$R/payload/malware/"*.yar /etc/wp-install/malware/
+install -m 0644 -o 33 -g 33 "$R/payload/mu-plugins/07-wasp-alerts.php" /home/wpuser/wp/html/wp-content/mu-plugins/
+sed -i 's#^30 4 \* \* 1 /usr/local/bin/wp-plugins.sh verify .*#30 4 * * 1 /usr/local/bin/wasp-alerts.sh watch-integrity >/dev/null 2>\&1#' /etc/crontabs/root
+grep -q 'wasp-alerts.sh watch-site' /etc/crontabs/root || printf '%s\n' \
+  '*/5 * * * * /usr/local/bin/wasp-alerts.sh watch-site >/dev/null 2>&1' \
+  '17 * * * * /usr/local/bin/wasp-alerts.sh watch-admins >/dev/null 2>&1' >> /etc/crontabs/root
+wasp-alerts.sh setup you@example.com && wasp-alerts.sh test
+wasp-verify-integrity.sh
+```
+
+Every tool in `/usr/local/bin` is installed from the release. That keeps them identical to the staged copies, which is what the integrity check compares.
+
+## 10.15 — wp-admin reachable through the proxy from the LAN and overlays
+
+### The defect
+
+On every tenant behind the reverse proxy, wp-admin answered its own
+administrator with Apache's `Forbidden — You don't have permission to access
+this resource`. Internet visitors were unaffected, and the access log showed
+their real addresses, so the site looked healthy.
+
+- **Wrong directive.** WASP declared the proxy with `RemoteIPTrustedProxy`,
+  which treats what the proxy reports as an *external* address and discards
+  private values: `X-Forwarded-For value of 10.20.1.254 appears to be a private
+  IP or nonsensical. Ignored`. Administrators reach the proxy from the LAN, or
+  over NetBird masqueraded onto it, so their address is always private. Apache
+  kept the proxy as the client, and `Require not ip <proxy>` refused it.
+- **Declared twice.** The same directive was also written into a second file,
+  mounted over `mods-enabled/remoteip.conf`. `mod_remoteip`'s proxy lists
+  append, so correcting `wp-security.conf` alone changed nothing.
+
+### The fix
+
+- `wp-security.conf` declares `RemoteIPInternalProxy <proxy>`: one literal
+  address, as before. Only a connection *from* the proxy has its
+  `X-Forwarded-For` read, and the proxy overwrites that header, so accepting a
+  private value does not widen who can set it. The image's danger was its
+  RFC1918 ranges, which stay masked.
+- The `mods-enabled/remoteip.conf` file that lib/06 stages is now a
+  directive-free mask, so the proxy is declared in one place.
+- **`test/check-trusted-proxy.py`, rewritten.** It refuses
+  `RemoteIPTrustedProxy`, refuses any `RemoteIPInternalProxy` that is not a
+  single variable, requires exactly one declaring file, and requires the mask
+  to carry no directive. It replaces the 10.4 rule that forbade
+  `RemoteIPInternalProxy` outright, which conflicted with the field fix.
+- **`validate-wordpress.sh`** asks the running container which declarations
+  Apache reads. It fails on the old form, or on anything other than exactly
+  one `RemoteIPInternalProxy <proxy>`.
+- **`wp-hardening.sh proxy-check`** flags the old declaration and names the
+  repair.
+
+### Repairing a VM built by 10.14 or earlier
+
+`wp-hardening.sh remoteip-fix [--check]` performs the repair:
+
+- **Rewrite.** It rewrites the declaration and masks the second file, both in
+  place, because they are bind-mounted.
+- **Test, restart, verify.** It runs `apache2ctl configtest`, restarts
+  WordPress, and confirms that the live container reads exactly one
+  declaration.
+- **Rollback.** A failed configtest restores both files byte for byte and
+  restarts nothing.
+- **Refusals.** It refuses a range, a list, an unexpected declaration, or a
+  file with none.
+- **Already fixed.** A VM repaired by hand with the 10.14 field fix is recognised
+  and left alone.
+
+It is available in the menu under Security → 31, next to → 30
+(`proxy-check`).
+
+A VM that predates this tool can be repaired from the Proxmox host through the
+guest agent:
+
+```sh
+VMID=<id>
+qm guest exec $VMID -- sh -c 'printf "# masked: mod_remoteip is configured in conf-enabled/wp-security.conf\n" > /home/wpuser/wp/apache-mods/remoteip.conf'
+qm guest exec $VMID -- sh -c 'f=/home/wpuser/wp/apache-conf/wp-security.conf; sed "s/^RemoteIPTrustedProxy \(.*\)$/RemoteIPInternalProxy \1/" "$f" > /tmp/ws.conf && cat /tmp/ws.conf > "$f" && rm -f /tmp/ws.conf'
+qm guest exec $VMID --timeout 120 -- podman restart wordpress
+qm guest exec $VMID -- podman exec wordpress grep -rn RemoteIP /etc/apache2/   # one RemoteIPInternalProxy line
+```
+
+### Telling the two 403s apart
+
+README → *Reaching wp-admin through the proxy*:
+
+- **A bare `403 Forbidden`** comes from the proxy. It usually means the admin
+  workstation resolved the site through public DNS. The request then came back
+  through the router's NAT loopback, so the proxy saw the premises' public
+  address.
+- **Fix it in DNS.** Use a hosts-file line, a NetBird DNS record or a
+  nameserver group pointing the name at the proxy's private address. Do not
+  add the public address to the allow rule.
+- **A new, unimported site shows the bare 403 to everyone.** WordPress
+  redirects every page to `install.php`, which is behind the admin rule.
+
+### Tests
+
+`test/test-remoteip-fix.sh`: 21 cases, each run under the host shell and under
+BusyBox, 42 in total.
+
 ## 10.14 — UpdraftPlus as one site, one-command restore, clean-up
 
 ### UpdraftPlus sets import as one site

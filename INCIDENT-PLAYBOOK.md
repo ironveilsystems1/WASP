@@ -198,6 +198,90 @@ not approval — it is the record that makes an out-of-band approval auditable.
 
 ---
 
+## Content spam (casino, pharmacy, adult links)
+
+**Alert:** email tagged `wp-content-spam` (the weekly scan), a security alert
+"Spam link saved on page N" (as it was saved), or `wp-import.sh scan` reporting
+spam links, titles or articles in a backup.
+
+### What it means
+
+Someone placed links to gambling, pharmacy or adult sites in the site's
+content, usually to sell the site's search ranking. It is **content, not code**:
+no file scan sees it, and nothing on the server has to be compromised for it to
+happen. It goes in through a valid session, so treat the account that saved it
+as possibly in someone else's hands until shown otherwise. The usual trail is a
+paste from a Google Sheet (the scan says so) and an article on the site's own
+address that the SEO plugin announced to search engines.
+
+It does not harm visitors' computers. It does harm the site's ranking and
+trust: search engines treat a business linking to casinos as a hacked site.
+
+### Do not
+
+- **Edit the text by hand in the widget.** Pasted spam often hides a second
+  link or a hidden block. Delete the whole widget.
+- **Restore an older revision of the page.** Revisions from the time of the
+  spam hold it too; the scan counts them.
+- **Delete the account that saved it before looking.** Its sessions and
+  application passwords are the evidence of how, and an application password
+  survives a password change.
+
+### Do, in order
+
+1. **Who and when.** The alert names who saved it and from where. For an import,
+   the scan names the accounts and any application passwords that came with it.
+   ```sh
+   doas wp-forensics.sh admins
+   doas wp-forensics.sh app-passwords
+   ```
+2. **Close the way in.** If the account is not yours, or you cannot tell:
+   ```sh
+   doas wp-plugins.sh lock-user <id> "content spam"
+   doas wp-forensics.sh app-passwords revoke <id>
+   doas wp-rotate-secrets.sh salts        # signs everyone out
+   ```
+   Ask everyone who edits the site to close any open Elementor tabs: an open
+   editor can save the old version, spam included, over your clean-up.
+3. **See everything to clean, with IDs.**
+   ```sh
+   doas wp-links.sh spam
+   doas wp-links.sh clean                 # what could be cleaned; changes nothing
+   ```
+4. **Preview, then clean.** Name each thing. It is refused unless it also tests
+   as spam:
+   ```sh
+   doas wp-links.sh clean --widgets <id>,<id> --title <id>="<real title>" \
+                          --trash <post id> --revisions --indexnow
+   doas wp-links.sh clean <the same> --apply
+   ```
+   The evidence (the scan, the plan, the IndexNow log) is saved under
+   `/var/lib/wasp/evidence/`, and a database backup is taken before anything
+   changes. A Proxmox snapshot first costs nothing: `qm snapshot <vmid> pre-clean`.
+5. **Update what let it in.** Page builders and SEO plugins are the usual
+   route. Then confirm the site is clean:
+   ```sh
+   doas wp-plugins.sh vulns
+   doas wp-plugins.sh update-plugins <slug>
+   doas wp-links.sh spam                  # exit 0: clean
+   doas wp-malware-scan.sh full
+   ```
+6. **Tell the search engines.** The spam articles now answer 404.
+   - In Rank Math → Instant Indexing, submit those addresses.
+   - In Google Search Console, check Security & Manual Actions, request
+     removal of the addresses, and resubmit the sitemap.
+   - In Bing Webmaster Tools, do the same.
+
+### Then decide
+
+Whether the site owner needs to be told, and what. Saved revisions and the
+evidence directory date the spam: when it first appeared, and under which
+account. That is usually enough to say whether it came with an import, a
+contractor's account, or a stolen password. The weekly scan and the save-time
+alert stay on, so a return is reported the same day.
+
+---
+
 ## Backup failure
 
 **Alert:** email tagged `wp-db-backup`. **No cooldown — this one repeats

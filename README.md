@@ -68,6 +68,7 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Egress control (Squid)](#egress-control-squid)
 - [Checking the whole VM](#checking-the-whole-vm-at-once)
 - [Alerts](#alerts)
+- [Security alerts](#security-alerts)
 - [Choosing a DNS resolver](#choosing-a-dns-resolver)
 - [The operator menu](#the-operator-menu)
 - [File integrity: WordPress checksums](#file-integrity-wordpress-checksums)
@@ -105,6 +106,7 @@ It's also honest about where it stops. Every control here states its own limits 
   - [The enforcement gap](#the-enforcement-gap)
   - [Never-ban lists behind a proxy](#never-ban-lists-and-why-they-matter-more-behind-a-proxy)
   - [The trusted proxy must be exactly one address](#the-trusted-proxy-must-be-exactly-one-address)
+  - [Reaching wp-admin through the proxy](#reaching-wp-admin-through-the-proxy)
   - [WP-Cron and the loopback path](#wp-cron-and-the-loopback-path)
   - [Rolling out a fleet](#rolling-out-a-fleet)
 - [Split-horizon DNS (Technitium)](#split-horizon-dns-technitium--so-lan-clients-get-a-real-ip)
@@ -112,6 +114,8 @@ It's also honest about where it stops. Every control here states its own limits 
 - [Off-VM Backup](#off-vm-backup)
   - [Creating the encryption key](#creating-the-encryption-key)
 - [Self-Test](#self-test-proving-the-guarantees-hold)
+- [Upgrading WASP on a VM](#upgrading-wasp-on-a-vm)
+- [Spam links and broken links](#spam-links-and-broken-links)
 - [Malware & Integrity Scanning](#malware--integrity-scanning)
 - [Outbound Firewall (optional, host-service layer)](#outbound-firewall-optional-host-service-layer)
 - [Outbound Email](#outbound-email)
@@ -142,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.14` — and both exist only because the codebase
+same value — currently `10.18` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -313,9 +317,19 @@ Safe to run on a backup you don't trust — which is rather the point.
 
 ```sh
 wp-import.sh extract backup.tar.gz    # to staging, outside the docroot
-wp-import.sh scan                      # files AND the dump
+wp-import.sh scan                      # files, the dump, and the content
+wp-import.sh report                    # the saved scan, every file named
 wp-import.sh staged                    # what's currently staged
 ```
+
+**The scan ends in a verdict a person can act on** (10.17):
+- **A headline:** `ACTION NEEDED`, `REVIEW BEFORE IMPORTING` or `CLEAN`, with the counts.
+- **One line per kind of finding, in words:** for example "5 × PHP files where only images and documents belong (uploads)". Each line says what happens to it, such as "quarantined at import, not copied into the site" or "remove after import: wp-links.sh spam".
+- **The next commands, in order.**
+
+Since 10.18 the scan also lists **application passwords** the site brings, by account and name, for review. They reach the REST API without the login page or two-factor, and changing an account's password does not revoke them, so rotating every password after a compromise leaves them working. After import, `wp-forensics.sh app-passwords` lists them with when each was last used, and `app-passwords revoke <user id>` removes them.
+
+Signature matches are grouped by rule: what the rule means, how many files, and the first eight by path relative to the site. Until 10.17 the same match printed one line per file, 28 identical pairs in one real import. The whole scan is saved as plain text beside the staged set, with every file's full path, and `wp-import.sh report` shows it.
 
 Links are refused. A backup needs files and directories, nothing else, so a symlink, hard link or device in an archive stops it at `inspect` and again at `extract`, and whatever actually landed in staging is checked before anything touches it. Zips need Info-ZIP to be listed, and the installer adds it. A zip that cannot be listed is refused rather than extracted unchecked.
 
@@ -753,6 +767,53 @@ wp-notify.sh --test
 Identical alerts are deduplicated over 24 hours so a recurring fault doesn't become noise, with two exceptions that always send: backup failure and self-test failure. Both are silent-until-it-matters problems, and suppressing a repeat is how they stay unnoticed for months.
 
 `wp-notify.sh` sends governance notices to a separate address, warned about at install if it matches the admin address — a record only the decision-maker receives is a diary, not oversight.
+
+## Security alerts
+
+```sh
+wasp-alerts.sh status                  # what is emailed, and to whom
+wasp-alerts.sh test                    # a real alert, sent through WordPress
+wasp-alerts.sh off code_change         # one event off (on to turn it back)
+wasp-alerts.sh to you@example.com,ops@example.com
+```
+
+Every other alert on this page comes from the host: scans, backups, disk, TLS. They see files and logs. What they cannot see is a change made **through WordPress by someone with a valid session**: a stolen administrator password, a developer's reused credential, or a plugin flaw that grants a role. Those look exactly like normal use and leave no file behind. They are usually the first step of everything that follows. Only the operator can tell normal use from an intrusion, so since 10.16 the operator is told at the moment it happens.
+
+**WordPress emails you when:**
+
+| Event (`alerts.ini` key) | Emailed when |
+|---|---|
+| `admin_role` | an account becomes an administrator, loses administrator rights, or an administrator is deleted |
+| `admin_login` | an administrator's password is accepted from an address that account has not used in 90 days (`login-mode all`: every sign-in) |
+| `admin_credentials` | an administrator's password or email changes, or a password reset is requested for one |
+| `app_password` | an application password is created. It signs in to the REST API without the login page or two-factor. |
+| `mfa_change` | two-factor is turned off, set up or changed for an administrator |
+| `code_change` | a plugin or theme is installed, updated, activated, deactivated, deleted or switched, or core is updated |
+| `settings_change` | the site address, admin email, open registration or default role changes. `default_role = administrator` is flagged **DANGER**. |
+| `content_spam` | a page, Elementor widget, menu item or sidebar widget is **saved** with a link to a gambling, pharmacy or adult site (10.18). The email names the page, each widget and the `wp-links.sh clean` command that removes them, and says who saved it. Only links are judged, never wording alone. One email per page per day while the spam stays. The weekly scan (`wp-links.sh spam --notify`) uses the same switch. |
+
+**The VM emails you when:**
+
+| Event | Emailed when |
+|---|---|
+| `site_down` | the health check fails twice in a row (10 minutes), with its output; again when the site recovers, with how long it was down; a reminder every 6 hours in between. Not while `update.sh` holds its lock. |
+| `admin_db` | the administrators **in the database** change. This reads the table directly, so it also sees an account inserted with SQL, which passes through no WordPress hook. Hourly. |
+| `integrity` | plugin files no longer match wordpress.org, or WASP's own tools differ from the signed release. Weekly. Both checks existed before but only logged. |
+
+Each email says what happened, to which account, who did it and from which address, and what to run if it was not you. No password, reset key or application-password value is ever included.
+
+**Why the settings are not in wp-admin.** They live in `/home/wpuser/wp/secrets/alerts.ini`, which WordPress reads read-only at `/var/www/private/alerts.ini`. An intruder with an administrator session cannot switch alerts off or redirect them, and those are the first two things one would try. For the same reason the recipient never comes from WordPress's `admin_email` option: changing that option is itself one of the events.
+
+**Noise control.**
+- Several changes in one request arrive as **one** email; updating ten plugins is one message.
+- An identical event is not repeated within its quiet window.
+- WordPress alerts have a ceiling of `max_per_hour` (20). When it is reached, one notice says so.
+- An administrator's sign-ins are remembered per address, so day-to-day sign-ins from your usual places are silent.
+- If one event is noise for a site, for example `code_change` where a developer updates plugins daily, turn just that one off.
+
+**What is not emailed.** Changes made with WASP's own tools on the VM run wp-cli in a container that does not mount the private directory. That is you at the console, so it is not reported back to you.
+
+Alerts are set up at install from the **operator alert email**. With no address given, nothing is written and `validate-wordpress.sh` warns. Set it up later with `doas wasp-alerts.sh setup you@example.com`. The menu has them under Diagnostics → 9–11.
 
 ## Choosing a DNS resolver
 
@@ -1608,7 +1669,7 @@ The incident playbook says to rotate everything after a compromise. This does it
 wp-rotate-secrets.sh status           # what can be rotated, and the right order
 wp-rotate-secrets.sh salts            # instant, logs everyone out (stolen cookies die)
 wp-rotate-secrets.sh db               # kept in sync across env + MariaDB, verified, rolls back on failure
-wp-rotate-secrets.sh smtp '<new>'     # after you change it at the relay
+wp-rotate-secrets.sh smtp           # prompts; after you change it at the relay
 wp-rotate-secrets.sh all              # salts + db
 ```
 
@@ -2065,6 +2126,7 @@ wp-notify.sh --test       # send a test alert now
 | Database backup | **any failure** — no cooldown |
 | **Weekly security report** | **always** — Monday, whether or not anything was found |
 | Automated remediation | whenever it runs |
+| **Security alerts** | administrators, sign-ins, credentials, two-factor, plugins, key settings, site down, planted admins, modified files. See [Security alerts](#security-alerts) |
 
 **Sent host-side via `msmtp`, not through WordPress.** Reusing `wp_mail()` would be the tidier reuse, but these alerts fire when something is wrong — and "WordPress or MariaDB is down" is both the moment an alert matters most and the moment `wp_mail()` cannot run. Credentials come from the same `smtp.ini` the mu-plugin uses; no second config is written, and the password reaches msmtp via `--passwordeval` rather than the argument list where `ps` would expose it.
 
@@ -2422,12 +2484,13 @@ the plumbing rather than the protection.
 ### The trusted proxy must be exactly one address
 
 ```apache
-RemoteIPTrustedProxy 10.20.10.10      # correct
-RemoteIPTrustedProxy 10.20.0.0/16     # authentication bypass
+RemoteIPInternalProxy 10.20.10.10      # correct (10.15 and later)
+RemoteIPInternalProxy 10.20.0.0/16     # authentication bypass
+RemoteIPTrustedProxy  10.20.10.10      # 10.14 and earlier: locks LAN/overlay admins out
 ```
 
 `mod_remoteip` walks `X-Forwarded-For` from the **right**, popping entries for
-as long as they match a trusted proxy, and takes the first address it does not
+as long as they match a declared proxy, and takes the first address it does not
 trust as the client. Name a range and every host inside that range can prepend
 whatever client address it likes and have Apache believe it.
 
@@ -2441,7 +2504,7 @@ That forged address is:
 One compromised neighbour on the same segment becomes an authentication bypass.
 This is why it is a contract rather than a recommendation, enforced at four
 points: `install.sh` refuses a CIDR or a list before anything is built,
-`lib/03` and `lib/06` each assert it where they write the directive, and
+`lib/03` and `lib/06` each assert it before writing, and
 `test/check-trusted-proxy.py` stops the constraint being loosened in the source
 tree — the one failure the runtime assertions cannot catch, since they would
 faithfully assert whatever weaker rule replaced them.
@@ -2450,11 +2513,83 @@ A hostname is refused too. Apache resolves the directive once at startup, so a
 name that later resolves elsewhere leaves Apache trusting an address nothing
 told it about.
 
+**Why `InternalProxy` and not `TrustedProxy` (10.15).** `RemoteIPTrustedProxy`
+treats what the proxy reports as an *external* address and throws away any
+private value (`appears to be a private IP or nonsensical. Ignored`). Behind a
+private reverse proxy the administrator's own address is always private — the
+LAN, or an overlay such as NetBird masquerading onto it. So Apache kept the
+proxy as the client, the `Require not ip <proxy>` guard denied it, and wp-admin
+returned Apache's 403 to the operator on every tenant, while every internet
+visitor was substituted correctly and the site looked healthy.
+`RemoteIPInternalProxy` with **one** address accepts private client values
+without widening who may set the header: only a connection *from* that address
+has its `X-Forwarded-For` read at all, and the proxy overwrites the header with
+`$remote_addr` (see the NPMplus configuration below), so the value is the
+proxy's own observation of the client.
+
+**Declared once.** `mod_remoteip`'s proxy lists append across files. Through
+10.14 the directive was written into `wp-security.conf` *and* into a second file
+mounted over `mods-enabled/remoteip.conf`, so correcting one changed nothing.
+Since 10.15 that second file is a directive-free mask, and the static check
+refuses a declaration anywhere but `lib/03`.
+
 **The WordPress image works against you here.** It ships
 `/etc/apache2/conf-enabled/remoteip.conf` declaring every RFC1918 range as
-`RemoteIPInternalProxy`. That both widens XFF trust to all private space and
-discards LAN clients' real addresses. WASP disables that file at install, and
-the static check refuses to let `RemoteIPInternalProxy` back into the tree.
+`RemoteIPInternalProxy`. That widens XFF trust to all private space. The
+danger is the ranges, not the directive. WASP masks that file at install, and
+the static check refuses any declaration that is not a single variable.
+
+**A VM built by 10.14 or earlier** has the old declaration. Repair it on the VM:
+
+```sh
+doas wp-hardening.sh remoteip-fix --check   # report only
+doas wp-hardening.sh remoteip-fix           # rewrite in place, configtest, restart, verify
+```
+
+or from the Proxmox host, before the tool is on the VM, with the commands in the
+10.15 entry of `CHANGELOG.md`. `validate-wordpress.sh` fails on the old
+declaration, and the menu has it under Security → 31.
+
+### Reaching wp-admin through the proxy
+
+Two different 403 pages mean two different refusals:
+
+| Page | Who refused you | Why |
+|---|---|---|
+| A bare **403 Forbidden** (nginx) | The reverse proxy | You reached it from an address its admin rule does not allow |
+| **Forbidden** — *You don't have permission to access this resource.* | Apache on the VM | `mod_remoteip` did not substitute your address; on 10.14 and earlier, the `TrustedProxy` declaration above |
+
+The first is almost always DNS. If your workstation resolves the site's name
+through public DNS, the request leaves for the internet and comes back through
+the router's NAT loopback, which rewrites the source to the premises' public
+address. The proxy then sees every device at that location as one public IP,
+and none of them matches an allow rule for the overlay or the LAN.
+
+Check what your workstation resolves, and what the proxy saw:
+
+```sh
+resolvectl query <domain>                          # workstation: want the proxy's private address
+docker logs npmplus 2>&1 | grep wp-admin | tail -3   # on the proxy host: the client: field
+```
+
+Make your admin machines resolve the published name to **the proxy's private
+address**, by one of:
+
+- a line in each admin machine's hosts file: `10.20.10.10 <domain> www.<domain>`
+  (`resolvectl` then reports `Data from: synthetic`)
+- a DNS record in the overlay (NetBird DNS), or a nameserver group sending the
+  client domains to the split-horizon resolver (OPNsense Unbound), which covers
+  every enrolled device at once
+
+The request then crosses the overlay and arrives at the proxy from the overlay's
+masquerade address, which is the one the proxy's admin rule allows. Do **not**
+add the premises' public address to that rule: it admits every device at that
+location.
+
+A brand-new site shows the bare 403 to *everyone*, on every page: with no
+database, WordPress redirects every request to `/wp-admin/install.php`, which
+is behind the admin rule. That is the rule working. It clears once the site is
+imported or installed from the admin path.
 
 ### WP-Cron and the loopback path
 
@@ -2538,7 +2673,8 @@ Per tenant, end to end:
    error.
 3. Issue the certificate by DNS-01 rather than HTTP-01 — inbound 80 may be
    blocked upstream, and DNS-01 gets you wildcards besides.
-4. Confirm `RemoteIPTrustedProxy` is the proxy's single literal address.
+4. Confirm `RemoteIPInternalProxy` is the proxy's single literal address,
+   declared once (`doas wp-hardening.sh remoteip-fix --check`).
 5. Add the split-horizon record for the published name → **the proxy**, never
    the VM's own address. Internal clients then take the identical path external
    clients take, so what you test inside is what the world gets.
@@ -2686,7 +2822,7 @@ proxy_set_header X-Real-IP         $remote_addr;
 # REPLACE, not append. NPM's default is $proxy_add_x_forwarded_for, which
 # appends to whatever the CLIENT sent — so a forged header arrives as
 # "<forged>, <real>". mod_remoteip should still pick the right one, but only if
-# RemoteIPTrustedProxy is exactly right. Replacing it states the truth and
+# RemoteIPInternalProxy is exactly right. Replacing it states the truth and
 # removes the class of bug entirely.
 proxy_set_header X-Forwarded-For   $remote_addr;
 proxy_set_header X-Forwarded-Proto $scheme;
@@ -2749,7 +2885,7 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; prelo
 location ~* ^/wp-content/uploads/.*\.(php|phtml|phar|php[0-9])$ { deny all; }
 ```
 
-**On `X-Forwarded-For $remote_addr`** — NPM defaults to `$proxy_add_x_forwarded_for`, which *appends* to whatever the client sent, so a forged header arrives as `<forged>, <real>`. mod_remoteip should still choose correctly, but only while `RemoteIPTrustedProxy` is exactly right. Replacing states the truth and removes the class.
+**On `X-Forwarded-For $remote_addr`** — NPM defaults to `$proxy_add_x_forwarded_for`, which *appends* to whatever the client sent, so a forged header arrives as `<forged>, <real>`. mod_remoteip should still choose correctly, but only while `RemoteIPInternalProxy` is exactly right. Replacing states the truth and removes the class.
 
 #### Verify the headers actually arrive
 
@@ -2823,7 +2959,7 @@ Prints Nginx Proxy Manager config filled in with this VM's actual admin CIDR, al
 
 **Why restricting at nginx beats the Apache rule.** Apache only knows the client IP because a *header* told it. nginx is the edge — `$remote_addr` **is** the client. No header to trust, no substitution step to fail silently. Keep both; two layers that fail independently.
 
-It also sets `X-Forwarded-For $remote_addr` rather than NPM's default `$proxy_add_x_forwarded_for`, which **appends** to whatever the client sent — so a forged header arrives as `<forged>, <real>`. mod_remoteip should still pick correctly, but only if `RemoteIPTrustedProxy` is exactly right. Replacing states the truth and removes the class.
+It also sets `X-Forwarded-For $remote_addr` rather than NPM's default `$proxy_add_x_forwarded_for`, which **appends** to whatever the client sent — so a forged header arrives as `<forged>, <real>`. mod_remoteip should still pick correctly, but only if `RemoteIPInternalProxy` is exactly right. Replacing states the truth and removes the class.
 
 And an edge rate limit (6/min per real IP) that costs no WordPress bootstrap — the one control here that holds even if everything downstream is misconfigured, since it never touches `X-Forwarded-For`.
 
@@ -3094,6 +3230,103 @@ Runs weekly (Sunday 05:30 UTC) and emails **only on failure** — a guarantee th
 
 ---
 
+## Upgrading WASP on a VM
+
+```sh
+wasp-upgrade.sh check wasp-10.18-2026-11-14.tar.gz    # verify it, show what would change
+wasp-upgrade.sh apply wasp-10.18-2026-11-14.tar.gz    # back up, change, check
+wasp-upgrade.sh status                                 # version, history, backups
+wasp-upgrade.sh rollback                               # undo the last upgrade
+```
+
+A VM does not update its own tooling: a new release reaches it only when you bring it. Until 10.18 each release's CHANGELOG carried a block of commands to paste, and every release added to it. Pasted by hand across a fleet, that drifts: a step skipped on one VM, a cron line appended twice on another. Nothing checked that the release being pasted was the one that was signed. `wasp-upgrade.sh` does the same work the same way every time.
+
+- **Verified first.** The signature on `MANIFEST.sha256` is checked against the key **pinned on this VM** when it was built (`/etc/wp-install/release.pub`), never a key the release brings with it. Then every file is checked against the manifest, and a file the manifest does not list is refused. An unsigned release is refused unless you pass `--unsigned`. A tarball holding absolute or `../` paths, or links, is not used.
+- **Planned before anything changes.** `check` lists:
+  - which tools, WordPress mu-plugins, rules and cron lines change, with line counts (`--diff` shows the lines);
+  - each version's upgrade steps (for example the 10.15 proxy repair) that will run;
+  - build-time configuration that changed upstream: Apache, PHP, MariaDB, CrowdSec, Squid, init scripts. Those hold this VM's own values, so they are reported and **never replaced**; the CHANGELOG says whether one needs action.
+- **An edited tool stops it.** A tool or mu-plugin that differs from what was installed blocks the upgrade. A script that runs as root on a schedule and was changed on the VM is evidence, not something to overwrite; look at it, then `--force` if you choose to.
+- **Your settings are kept.** The mu-plugins are rendered with the values this VM already runs with: its login slug, and its two-factor enforcement and grace period. Each is checked by PHP inside the wordpress container before it is installed. A cron job you moved to another time is left where you put it, and so are lines you added yourself.
+- **Safe to repeat.** A second `apply` changes nothing.
+- **Reversible.** Everything it touches is backed up first, to `/var/lib/wasp-upgrade/backups/`; the newest five are kept. `rollback` restores the last one exactly and removes what the upgrade added. Every upgrade and rollback is recorded (`status`).
+
+**What it does not do:** rebuild the VM, change containers or images (`update.sh` does that), or rewrite configuration that holds this VM's own values. What it may change is listed in `payload/upgrade/files.map`, read from the new release. `test/check-upgrade-map.py` fails if a stage installs a file that the map does not cover.
+
+**A VM built before 10.18** has no `wasp-upgrade.sh` yet. Run it from the release once; it installs itself:
+
+```sh
+scp -O wasp-10.18-2026-11-14.tar.gz <admin>@<vm>:/tmp/
+doas tar xzf /tmp/wasp-10.18-2026-11-14.tar.gz -C /root
+doas sh /root/wasp-10.18/payload/bin/wasp-upgrade.sh apply /tmp/wasp-10.18-2026-11-14.tar.gz
+```
+
+If the VM has no `minisign`, it is installed with `apk add minisign`. Menu: Updates → 23–26.
+
+## Spam links and broken links
+
+```sh
+wp-links.sh spam                 # injected links, spam titles and pages, per page and widget
+wp-links.sh spam --all-domains   # ...and every other site this one links to
+wp-links.sh broken               # crawl the site; missing pages, images, files, certificate problems
+wp-links.sh clean                # what could be cleaned, with the IDs to name (changes nothing)
+wp-links.sh clean --widgets w1spam1,w2spam2 --title 120="Our services" --trash 214 --revisions --indexnow
+                                 # a preview of exactly that; then the same with --apply
+```
+
+**Spam is content, not code.** One real import brought over:
+- casino links in three live pages;
+- a casino advert appended to a page title;
+- spam articles in three languages, which Rank Math's IndexNow had announced to search engines.
+
+Every file and signature check passed, because nothing in it is code. It was pasted into the editor through a valid session. Finding it took six hand-written SQL queries. `wp-links.sh spam` does the same in one pass, from inside the WordPress container:
+
+- **What it reads.** The database directly, read-only, with the container's own credentials. It never loads WordPress, so no plugin code runs and a compromised plugin cannot hide its own content.
+- **Where it looks.** Every post, page, draft and Elementor template, and inside Elementor's page data widget by widget. Also menu items, sidebar widgets, and Rank Math's IndexNow log.
+- **What counts as spam.** Gambling, pharmacy, adult and payday-loan words in link targets, link text, titles and URL slugs, in several languages. The list is deliberately narrow: "slot" counts in a domain but not in text, because an ordinary business site may say "slotted posts".
+- **Reported beside the spam:**
+  - links pasted from a Google Sheet (`data-sheets-root`), the usual trail of paid link placement;
+  - links hidden with CSS;
+  - revisions that still hold spam.
+- **What each finding names.** The page, its ID and status, the account that last saved it, and the **Elementor widget ID** to delete. It ends with what to do, in order, and an inventory of every outside domain the site links to.
+
+It also runs weekly from cron and emails you only when it finds something. Since 10.18 a spam link is also emailed **as it is saved**, naming the page and the widget (`content_spam` in [Security alerts](#security-alerts)).
+
+### Cleaning up content spam
+
+`wp-links.sh clean` removes what `spam` found. It goes through WordPress and Elementor's own save, which rebuilds the page's HTML copy and its CSS; a database edit would leave both still holding the spam.
+
+- **Nothing is removed by pattern alone.** A widget, title or post changes only when you **name** it and the scanner's own test also finds spam in it. A mistyped ID, or a real widget named by mistake, is refused and left alone.
+- **What it can do:**
+  - remove Elementor widgets by ID;
+  - set a page title (`--title <id>="<real title>"`), refused if the old title holds no spam or the new one does;
+  - move spam articles to the Trash, where WordPress keeps them 30 days; their addresses answer 404 at once;
+  - delete the saved revisions that still hold spam, judged one by one, leaving clean revisions alone;
+  - drop the spam entries from Rank Math's IndexNow log, keeping the rest.
+- **Preview first.** Without `--apply` it says exactly what it would change and changes nothing.
+- **Before `--apply` changes anything**, it saves the evidence to `/var/lib/wasp/evidence/content-spam-<time>/`: the scan, the plan and the IndexNow log. It then takes a database backup (`wp-db-backup.sh`) and stops if that fails. Afterwards it scans again and says what, if anything, is left.
+
+**After cleaning, tell the search engines.** The spam articles' addresses now answer 404.
+- In Rank Math → Instant Indexing, submit those addresses: Bing and Yandex re-crawl them, see the 404 and drop them.
+- In Google Search Console, check Security & Manual Actions, request removal of the addresses, and resubmit the sitemap.
+- In Bing Webmaster Tools, do the same.
+
+The full sequence, from first alert to all-clear, is in `INCIDENT-PLAYBOOK.md` (Content spam).
+
+**The import scan checks the same things in the dump**, before it is loaded:
+- links to spam domains, with escaping undone so a link stored inside Elementor's JSON reads like any other;
+- Google Sheets pastes;
+- hidden links;
+- spam article addresses on the site's own domain;
+- since 10.18, from the posts table itself: titles carrying spam and spam articles by address, each with the post ID that `wp-links.sh clean` takes.
+
+The importer, the scanner and the save-time alert share one word list. `test-links.sh` fails if the copies drift apart.
+
+**Broken links.** Online link checkers usually cannot reach a WASP site: it refuses requests that carry no browser identity, which is what most scripted attacks send. `wp-links.sh broken` crawls from the VM itself, through the reverse proxy, as a visitor would:
+- **What it reports:** missing or failing pages, images and files, each with the pages that link to it. Certificate problems are reported too, for example a `www.` link the certificate does not cover.
+- **Pace:** one page a second by default, and never the login, admin, login-slug or API paths. The proxy's crawler detection should not ban the VM for checking its own site.
+- **Links to other sites are listed, not fetched.** The VM may only reach the sites it needs, so from there a dead link and a blocked one look the same. The tool prints a ready-made command for checking them from a workstation that reaches the site over NetBird.
+
 ## Malware & Integrity Scanning
 
 `wp-malware-scan.sh` covers the layer container scanning cannot reach: the site's own files and database.
@@ -3258,6 +3491,10 @@ How it's handled:
 | **Rate limit** | nftables caps outbound submission at 30 new connections/hour (burst 10), logging `nft-smtp-ratelimit`. A compromised site spamming through an authenticated relay damages your sending domain's reputation, and that outlasts the compromise. Enforced at the packet layer because the application layer is what the attacker already controls. |
 
 One honest limitation: the rate limit bounds *connections*, not messages — one SMTP connection can carry many recipients. It's a meaningful throttle and a good tripwire, not a hard per-message cap. Pair it with a per-account sending limit on the relay.
+
+**Changing the relay password.** Change it at the relay first, then run `doas wp-rotate-secrets.sh smtp`. It prompts for the password twice, stores it, and reads it back before claiming success. Run `wp-mail.sh test` afterwards: the relay is the only judge of a password. Through 10.15 this command printed ✔ and changed nothing. That left the site on the old password, failing every login until the relay's brute-force guard banned the sending address, and **every site behind that address** lost mail. `wp-mail.sh setup` re-enters everything and has always worked.
+
+**Imported sites bring their own mail plugin.** FluentSMTP, WP Mail SMTP, Post SMTP and the like replace WordPress's mailer with their **own** stored relay and password. An imported copy still points at the old host. WASP's firewall only allows the configured relay, so every send fails with `Could not connect to SMTP host`, and the message names WASP's relay because that is what the test prints. `wp-mail.sh doctor` lists any such active plugin (`overrides :`), and a failed `wp-mail.sh test` names it. Deactivate and delete it: WASP's mu-plugin does the job, and the plugin is holding the old host's password.
 
 ---
 
@@ -3590,7 +3827,7 @@ This project has been through several rounds of independent security review and 
 - A host firewall rule that silently dropped every container-to-container DNS lookup — the exact cause of a real "mariadb hostname does not resolve" install failure — has been fixed, and the generated nftables ruleset is syntax-checked before it's ever loaded.
 - Digest resolution via Skopeo is validated as a single well-formed digest before use (a previous version could return every layer digest alongside the manifest digest and silently break both pinning and `update.sh check`).
 - **CrowdSec bans behind a reverse proxy are enforced where the packets are, not where the log is.** The local bouncer bans the real client address at a firewall no packet from that address passes through: the decision is written, nftables holds it, the console shows a remediation component, and the attacker is unaffected. Worse, the production profile used to *require* that bouncer — insisting on the one configuration that cannot work behind a proxy and reading its presence as proof. Enforcement is now chosen at install (`upstream`, `detect-only`, `local`), the production gate asks whether enforcement exists on this traffic path rather than whether a local service is running, and `cs-doctor` checks whether a local ban can match real traffic at all. See [Behind a reverse proxy](#behind-a-reverse-proxy).
-- **`RemoteIPTrustedProxy` cannot be widened to a range.** A CIDR lets any host inside it forge the client address in `X-Forwarded-For` — the address CrowdSec bans, wp-admin allows, and the login guard counts against. Refused by `install.sh` before the build starts, asserted again at both places that write the directive, and held in the source tree by `check-trusted-proxy.py`.
+- **The trusted proxy (`RemoteIPInternalProxy`) cannot be widened to a range.** A CIDR lets any host inside it forge the client address in `X-Forwarded-For` — the address CrowdSec bans, wp-admin allows, and the login guard counts against. Refused by `install.sh` before the build starts, asserted again at both places that write the directive, and held in the source tree by `check-trusted-proxy.py`.
 
 **Deliberate design tradeoffs (documented, not defects)**
 - Trivy CVE scanning can be waved through by the operator on a HIGH/CRITICAL finding, or on a scanner failure — by design, so a scanner outage or an accepted risk doesn't block an otherwise-wanted update.
@@ -3615,6 +3852,10 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.18 | **Upgrades, and cleaning spam up.** `wasp-upgrade.sh` brings a VM to a new release: verified against the key pinned on the VM, planned (tools, mu-plugins, rules, cron, build-time config reported), backed up, applied the same way every time, safe to repeat, and rolled back on request. An edited tool blocks it. `wp-links.sh clean` removes named spam widgets, titles, articles, revisions and IndexNow entries through Elementor's own save, with evidence and a database backup first. Spam links are emailed **as they are saved**. The import scan names spam titles and articles by ID and lists the application passwords a site brings; `wp-forensics.sh app-passwords` reviews and revokes them |
+| 10.17 | **Spam links and broken links.** `wp-links.sh spam` finds injected gambling, pharmacy and adult links, spam titles and articles, Sheets-pasted and hidden links, naming the page and Elementor widget; it also runs weekly. `wp-links.sh broken` crawls the site through the proxy. **Readable scans:** the import scan checks content in the dump and ends with a verdict in words, with what happens to each finding and the next command; `wp-import.sh report` shows the saved scan; signature matches are grouped by rule with plain explanations and short paths |
+| 10.16 | **Security alerts.** WordPress emails the operator when an administrator is added, removed or signs in from a new address, when credentials, two-factor, plugins or key settings change; the VM emails when the site goes down and recovers, when an administrator appears in the database, and when plugin files or WASP's tools are modified (`wasp-alerts.sh`). **Fixes from a real import:** `wp-rotate-secrets.sh smtp` now really changes the password; `wp-mail.sh doctor` names mail-override plugins and no longer reports the SMTP mu-plugin missing; an UpdraftPlus restore leaves plugins' own `.sql` files alone; the scanner stops flagging chance `<?=` bytes in images and core files identical to the pinned image; the on-VM tooling check no longer reports files a VM never keeps |
+| 10.15 | **wp-admin through the proxy from the LAN and overlays.** The proxy is declared once, as a single-address `RemoteIPInternalProxy`; `RemoteIPTrustedProxy` discarded every private administrator address and answered wp-admin with 403. **`wp-hardening.sh remoteip-fix`** repairs VMs built earlier, in place, with rollback. README explains the two different 403 pages and the DNS fix for the proxy's |
 | 10.14 | **UpdraftPlus sets import as one site.** Name any part, or nothing. The set is checked as a whole: a missing or encrypted database or one hostile zip refuses it. **`wp-import.sh restore`** runs extract → scan → apply in one command. **Clean-up:** the archives and the staging copy are deleted after a successful import, `clean` handles abandoned ones, and a daily job removes anything 30 days old |
 | 10.13 | **Optional CrowdSec AppSec** request inspection, light ruleset only (no CRS), with the open 1.8.x memory-growth report stated up front and a watchdog that restarts CrowdSec below its cap. It was found that the `appsec-wordpress` rules every VM installed had never inspected anything. **install.sh builds a WASP Hive** (role choice), and **joins a VM to one** at install. **Egress to the Hive** from the menu: one rule to one address, a name resolved once and pinned |
 | 10.12 | **WASP Hive**, a read-only fleet console. VMs push a report every 15 minutes over TLS pinned to the Hive's own key, and the Hive holds no credential for any VM. One page per fleet and per VM: vulnerabilities, malware, integrity, CrowdSec, backups, open egress, controls, 30-day trends. Optional Wazuh (agent, file-integrity events, SCA). Compliance evidence mapped to CIS v8, PCI DSS 4.0, HIPAA, SOC 2 and NIST CSF 2.0, with WASP's exemptions and deviations stated per control |

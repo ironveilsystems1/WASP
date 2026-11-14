@@ -439,7 +439,7 @@ process is a command rather than an afternoon of hand-editing:
 
 ```sh
 wp-rotate-secrets.sh all              # database + salts, verified and reversible
-wp-rotate-secrets.sh smtp '<new>'     # after changing it at the relay
+wp-rotate-secrets.sh smtp           # prompts; after changing it at the relay
 ```
 
 The age backup key is deliberately excluded — rotating it makes every existing
