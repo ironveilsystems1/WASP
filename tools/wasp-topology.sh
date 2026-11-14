@@ -447,7 +447,7 @@ printf '  %-12s %-6s %-5s %-18s %s\n' "NPMplus"  "$ID_PROXY" "$T_PROXY" "${N_PRO
 printf '  %-12s %-6s %-5s %-18s %s\n' "WASP"     "$ID_WASP"  "$T_SITE"  "${N_SITE}.10/24"         "${N_SITE}.1"
 
 printf '\n%sHow these three are tuned to each other%s\n' "$BLD" "$CL"
-printf '  WASP trusts   %s   as its single literal RemoteIPTrustedProxy\n' "${N_PROXY}.10"
+printf '  WASP trusts   %s   as its single literal RemoteIPInternalProxy\n' "${N_PROXY}.10"
 printf '  WASP reports  bans to the LAPI at http://%s:8080/\n' "${N_PROXY}.10"
 printf '  NPMplus knows %s/24 as a backend CIDR\n' "${N_SITE}.0"
 printf '  OPNsense gets a %s segment and a %s segment, the proxy-to-backend\n' "PROXY" "WP01"
