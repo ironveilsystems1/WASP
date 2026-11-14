@@ -588,7 +588,7 @@ if [[ -n "$ADMIN_CIDR" || -n "$ALLOWED_ADMIN_IP" ]]; then
     # client. If mod_remoteip does not apply -- the module missing, the
     # header absent because the proxy was not configured to send it, or the
     # connection arriving from an address other than the declared
-    # RemoteIPTrustedProxy -- then Apache evaluates these rules against the
+    # RemoteIPInternalProxy -- then Apache evaluates these rules against the
     # PROXY'S address.
     #
     # And a proxy on the LAN is usually inside the operator's own admin CIDR.
@@ -664,7 +664,7 @@ fi
 if [[ -n "$PROXY_IP" ]]; then
   case "$PROXY_IP" in
     */*|*,*|*[[:space:]]*)
-      msg_warn "RemoteIPTrustedProxy takes one literal address. A range lets any"
+      msg_warn "RemoteIPInternalProxy takes one literal address. A range lets any"
       msg_warn "  host inside it forge the client IP that CrowdSec bans and that"
       msg_warn "  the wp-admin restriction allows."
       msg_error "PROXY_IP is '${PROXY_IP}' — expected a single IPv4 address." ;;
@@ -676,18 +676,44 @@ LogFormat "%t peer=%{c}a interpreted=%a \"%r\" %>s" wp_remoteip_debug
 CustomLog /var/log/apache2/remoteip-debug.log wp_remoteip_debug
 RIDEBUG
 )
+  # 10.15: RemoteIPInternalProxy, one literal address, and ONLY here.
+  #
+  # Through 10.14 this was RemoteIPTrustedProxy. That directive treats what the
+  # proxy reports as an EXTERNAL address and discards any private value as
+  # "a private IP or nonsensical". On a platform where administrators reach
+  # the proxy over an overlay (NetBird masquerades onto the LAN, e.g.
+  # 10.20.1.254) or from the LAN itself, the administrator's address is
+  # always private -- so Apache kept the proxy as the client, `Require not ip
+  # <proxy>` below denied it, and wp-admin returned 403 to the one person it
+  # exists for, while internet clients were substituted correctly. Found on
+  # every tenant of a two-site deployment; fixed by hand on each.
+  #
+  # RemoteIPInternalProxy accepts private client values. With ONE literal
+  # address the trust boundary is unchanged: only a connection FROM the proxy
+  # has its X-Forwarded-For read at all, and the proxy overwrites that header
+  # with $remote_addr (see the nginx snippet), so the value is the proxy's own
+  # observation, not the client's claim. What made the image's default
+  # remoteip.conf dangerous was its RANGES, not the directive -- which is why
+  # TRUST-COUNT still refuses a range or a list.
+  #
+  # This file is the only place the directive is written. The mods-enabled
+  # remoteip.conf lib/06 stages is a directive-free mask: two mounted files
+  # configuring one module is how the 10.14 field fix initially "did nothing"
+  # -- the proxy lists APPEND, so correcting one file left the other in force.
   REMOTEIP_BLOCK=$(cat << RIBLOCK
 # mod_remoteip — loaded because a reverse proxy IP was specified.
-# Tells Apache to trust X-Forwarded-For from ${PROXY_IP} only.
-# Other sources' X-Forwarded-For headers are ignored (prevents IP spoofing).
+# X-Forwarded-For is read ONLY from connections that come from ${PROXY_IP}.
+# InternalProxy (not TrustedProxy) so that a private client address -- an
+# administrator on the LAN or over an overlay network -- is accepted rather
+# than discarded. One literal address; never a range.
 LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so
 RemoteIPHeader X-Forwarded-For
-RemoteIPTrustedProxy ${PROXY_IP}
+RemoteIPInternalProxy ${PROXY_IP}
 RIBLOCK
 )
 else
   REMOTEIP_DEBUG_LOG="# remoteip-debug.log not enabled (no PROXY_IP set — the peer-vs-interpreted"$'\n'"# comparison it exists to verify is meaningless without a trusted proxy)."
-  REMOTEIP_BLOCK="# mod_remoteip not loaded (direct access — no proxy IP specified)."$'\n'"# If you add a reverse proxy later, set RemoteIPTrustedProxy here and"$'\n'"# LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so"
+  REMOTEIP_BLOCK="# mod_remoteip not loaded (direct access — no proxy IP specified)."$'\n'"# If you add a reverse proxy later, set RemoteIPInternalProxy <one address> here and"$'\n'"# LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so"
 fi
 
 # ── Build custom admin slug Apache block ──────────────────────────────────────
@@ -851,7 +877,7 @@ CustomLog /var/log/apache2/access.log combined
 # This second log captures both IPs side by side purely for verification:
 # %{c}a is the raw connection peer (the proxy's own IP, if any), %a is the
 # post-substitution address. If a trusted proxy is configured and these two
-# never differ, RemoteIPTrustedProxy doesn't match the real proxy source —
+# never differ, RemoteIPInternalProxy doesn't match the real proxy source —
 # a silent misconfiguration that would otherwise be invisible.
 #
 # BUG FIX (v7-14): this used to be emitted UNCONDITIONALLY, writing a second

@@ -39,7 +39,39 @@ which does what:
   with stubs; it needs `php` with the curl extension. `test/test-hive-role.sh`
   exercises install.sh's WASP Hive role on the host side.
   `test/test-updraft-import.sh` takes a realistic multi-part UpdraftPlus set
-  through `restore` and checks the clean-up afterwards. The suite finishes with
+  through `restore` and checks the clean-up afterwards.
+  `test/test-remoteip-fix.sh` runs `wp-hardening.sh remoteip-fix` against files
+  shaped like a 10.14 VM, under the host shell and under BusyBox: the rewrite
+  keeps each file's inode (they are bind-mounted), a failed configtest restores
+  both byte for byte, and a range or an unexpected declaration is refused.
+  `test/test-alerts.sh` covers the security alerts: `test/test-alerts.php`
+  drives the 07-wasp-alerts.php mu-plugin against a stand-in WordPress (every
+  event class, one email per request, the hourly ceiling, no secret in any
+  email, no header injection), and the shell half drives `wasp-alerts.sh`
+  settings and its three watches. `test/test-smtp-config.sh` proves
+  `wp-rotate-secrets.sh smtp` really stores the password and `wp-mail.sh
+  doctor` reports the SMTP mu-plugin and override plugins truthfully.
+  `test/test-malware-scan.sh` runs the real scanner and rules: core files
+  identical to the pinned image and chance `<?=` bytes in images are not
+  findings, while a modified core file and `<?php` in an image still are.
+  `test/test-verify-integrity.sh` builds a VM-shaped tree from the checkout and
+  checks the tooling integrity check reports clean when clean and names each
+  kind of change.
+  `test/test-links.sh` covers `wp-links.sh`: `test/test-links.php` drives
+  the content scanner with fixtures shaped like a real spam import (and the
+  legitimate content that must not be flagged), and the shell half crawls a
+  real local web server, checking from its request log which paths were never
+  requested. `test/test-links-clean.php` runs `wp-links.sh clean`'s cleaner
+  against a stand-in WordPress: only named widgets, titles and posts that also
+  test as spam change, posts go to the Trash, clean revisions stay.
+  `test/test-upgrade.sh` builds a VM filesystem at an older release and runs
+  `wasp-upgrade.sh` against it: refused releases (unsigned, wrong key, changed
+  after signing, unlisted files, `../` paths), the plan, an edited tool
+  blocking it, the mu-plugins keeping the VM's own settings, cron reconciled,
+  a second run changing nothing, and rollback restoring exactly what was there.
+  `test/check-upgrade-map.py` fails when a stage installs a file the upgrade
+  map does not cover, or a tool no stage installs.
+  The suite finishes with
   `test/test-busybox-run.sh`, which runs the import and scan tools with BusyBox
   applets in place of GNU tools, as they run on the VM. That run is required: without BusyBox the suite fails, because
   a skipped run is how two critical import bugs passed every test here. Install

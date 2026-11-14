@@ -10,7 +10,8 @@
 #
 #   - list and inspect show the set as one, with what it holds and lacks
 #   - extract, named by ANY part or by the prefix, stages ONE site: every
-#     zip unpacked into one wp-content, the dump in db/, wpcore skipped
+#     zip unpacked into one wp-content, the dump in db/, wpcore skipped, and
+#     a plugin's own .sql files (LiteSpeed Cache) left where they belong
 #   - a set with no database, an encrypted database, or one hostile zip is
 #     refused whole, before anything is unpacked
 #   - restore with nothing named uses the one backup in the inbox, refuses
@@ -41,7 +42,7 @@ sed -e 's#^  if command -v doas.*##' \
     -e "s#^INBOX=.*#INBOX=$T/inbox#" \
     -e "s#^STAGING=.*#STAGING=$T/staging#" \
     -e "s#^WP_ROOT=.*#WP_ROOT=$T/html#" \
-    -e "s#^THREATS=.*#THREATS=$T/bin/none#" \
+    -e "s#^THREATS=.*#THREATS=$REPO/payload/bin/wasp-threats.sh#" \
     -e "s#/usr/local/bin/wp-db-backup.sh#$T/bin/wp-db-backup.sh#g" \
     -e "s#/usr/local/bin/wp-plugins.sh#$T/bin/none#g" \
     -e "s#/usr/local/bin/wp-malware-scan.sh#$T/bin/none#g" \
@@ -63,7 +64,10 @@ d, p, mode = sys.argv[1:4]
 def z(name, members):
     with zipfile.ZipFile(f"{d}/{p}-{name}.zip", "w", zipfile.ZIP_DEFLATED) as f:
         for n, b in members: f.writestr(n, b)
-z("plugins",  [("plugins/akismet/akismet.php", "<?php /* Plugin Name: Akismet */\n")])
+# LiteSpeed Cache ships table definitions as .sql files inside the plugin.
+z("plugins",  [("plugins/akismet/akismet.php", "<?php /* Plugin Name: Akismet */\n"),
+               ("plugins/litespeed-cache/src/data_structure/crawler.sql", "`id` bigint(20) NOT NULL,\n"),
+               ("plugins/litespeed-cache/src/data_structure/url.sql", "`url` varchar(500) NOT NULL,\n")])
 z("themes",   [("themes/twentytwentyfive/style.css", "/* Theme Name: TT5 */\n")])
 z("uploads",  [("uploads/2026/10/a.jpg", "jpg")])
 z("uploads2", [("uploads/2026/11/b.jpg", "jpg")])
@@ -72,6 +76,33 @@ z("wpcore",   [("wp-includes/version.php", "<?php $wp_version = '6.8.3';\n")])
 if mode == "hostile":
     z("uploads3", [("../../outside/planted.php", "<?php system($_GET['c']);")])
 sql = b"CREATE TABLE `wp_options` (option_id int);\nINSERT INTO `wp_options` VALUES ('siteurl','https://old.example.com');\n"
+if mode == "spam":
+    # As a real dump holds it: Elementor page data is JSON (slashes escaped,
+    # as PHP writes it) inside an SQL string (quotes and backslashes escaped).
+    import json
+    def sqlq(t): return t.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+    el = json.dumps([{"id": "w1spam1", "elType": "widget", "widgetType": "text-editor", "settings": {"editor":
+          '<p><span data-sheets-root="1">Il marchio <a class="in-cell-link" href="https://casino-spam.example/">slotsbonus</a> premi.</span></p>'}}]).replace("/", "\\/")
+    ix = 'a:1:{i:0;a:2:{s:3:"url";s:57:"https://old.example.com/kasinon-arvo-esimerkki-artikkeli/";s:4:"time";i:1770000000;}}'
+    hid = '<div style="position:absolute;left:-9999px"><a href="https://cheap-meds.example/">x</a></div><a href="https://www.supplier.example/">Supplier</a>'
+    sql += ("INSERT INTO `wp_postmeta` VALUES (1,327,'_elementor_data','%s');\n" % sqlq(el)).encode()
+    sql += ("INSERT INTO `wp_options` VALUES (9,'rank_math_indexnow_log','%s','no');\n" % sqlq(ix)).encode()
+    sql += ("INSERT INTO `wp_posts` VALUES (40,'page','%s');\n" % sqlq(hid)).encode()
+    # 10.18: whole rows, WordPress's column order: a casino advert on a real
+    # title, a spam article by its address, a real page beside them.
+    def row(i, title, status, name, typ, body="<p>x</p>"):
+        return ("(%d,2,'2026-02-12 10:00:00','2026-02-12 10:00:00','%s','%s','','%s','closed','closed','','%s','','',"
+                "'2026-11-14 13:44:51','2026-11-14 13:44:51','',0,'https://old.example.com/?p=%d',0,'%s','',0)"
+                % (i, sqlq(body), sqlq(title), status, name, i, typ))
+    sql += ("INSERT INTO `wp_posts` VALUES %s,%s,%s,%s;\n" % (
+        row(327, "Commercial Gioca al grande casino online", "publish", "commercial", "page"),
+        row(512, "Esimerkki", "publish", "kasinon-esimerkki-artikkeli", "post"),
+        row(41, "Residential", "publish", "residential", "page", "Our slotted posts"),
+        row(330, "Commercial casino old copy", "inherit", "327-revision-v1", "revision"))).encode()
+    sql += b"INSERT INTO `wp_users` VALUES (2,'designer','$P$Bhash','designer','designer@example.com','','2024-01-01 10:12:00','',0,'Designer');\n"
+    ap = ('a:2:{i:0;a:7:{s:4:"uuid";s:4:"6f6c";s:6:"app_id";s:0:"";s:4:"name";s:6:"Zapier";s:8:"password";s:14:"$P$Bsecrethash";'
+          's:7:"created";i:1770000000;s:9:"last_used";N;s:7:"last_ip";N;}i:1;a:3:{s:4:"uuid";s:4:"7a7b";s:4:"name";s:4:"seo1";s:8:"password";s:13:"$P$Bothrhash";}}')
+    sql += ("INSERT INTO `wp_usermeta` VALUES (5,2,'_application_passwords','%s');\n" % sqlq(ap)).encode()
 if mode == "crypt":
     open(f"{d}/{p}-db.gz.crypt", "wb").write(b"encrypted")
 elif mode != "nodb":
@@ -101,6 +132,10 @@ _id=$(cat "$T/staging/.latest" 2>/dev/null); S="$T/staging/$_id"
   || _f "set extract" "rc=$_rc $(printf '%s' "$_o" | tail -6)"
 [ ! -e "$S/files/wp-content/wp-includes" ] && printf '%s' "$_o" | grep -q 'skipped .*-wpcore.zip' \
   && _p "the wpcore part is skipped, said so, and never lands in wp-content" || _f "wpcore" "$(ls "$S/files/wp-content")"
+{ [ -f "$S/files/wp-content/plugins/litespeed-cache/src/data_structure/crawler.sql" ] \
+  && [ "$(ls -1 "$S/db" | grep -c .)" = 1 ] && ! printf '%s' "$_o" | grep -q 'database dumps found'; } \
+  && _p "a plugin's own .sql files stay in the plugin; the -db.gz is the only dump" \
+  || _f "plugin .sql swept into db/" "$(ls "$S/db") $(printf '%s' "$_o" | grep -i dump)"
 [ "$(grep -c . "$S/meta/sources.txt")" = 7 ] && _p "every part is recorded as a source of this set" || _f "sources" "$(cat "$S/meta/sources.txt")"
 _reset; _mkset "$T/inbox" "$P"
 _o=$(_imp extract "$P"); _rc=$?
@@ -119,6 +154,55 @@ _reset; _mkset "$T/inbox" "$P" hostile
 _o=$(_imp extract "$P-plugins.zip"); _rc=$?
 { [ "$_rc" = 2 ] && [ "$(_staged)" = 0 ] && [ ! -e "$T/outside/planted.php" ] && [ ! -e "$T/planted.php" ]; } \
   && _p "one hostile part refuses the whole set before anything is unpacked" || _f "hostile part" "rc=$_rc $(printf '%s' "$_o" | tail -3)"
+
+# ── scan: content, the verdict, the saved report (10.17) ────────────────────
+_reset; _mkset "$T/inbox" "$P" spam
+_imp extract "$P" >/dev/null; _id=$(cat "$T/staging/.latest")
+_o=$(_imp scan "$_id"); _rc=$?
+_o=$(printf '%s\n' "$_o" | sed 's/\x1b\[[0-9;]*m//g')
+{ printf '%s' "$_o" | grep -q '1 link(s) to 1 gambling/pharmacy/adult domain(s)' \
+  && printf '%s' "$_o" | grep -qE 'casino-spam\.example +1' && ! printf '%s' "$_o" | grep -q 'supplier.example  '; } \
+  && _p "scan finds a casino link stored inside Elementor JSON in the dump, before it is loaded" || _f "content spam" "$(printf '%s' "$_o" | sed -n '/Content:/,/Verdict/p')"
+printf '%s' "$_o" | grep -q '1 block(s) pasted from a Google Sheet' \
+  && _p "...and says it was pasted from a Google Sheet" || _f "sheets" ""
+printf '%s' "$_o" | grep -q '1 link(s) inside content hidden with CSS' \
+  && _p "a link hidden with CSS is reported" || _f "hidden" "$(printf '%s' "$_o" | sed -n '/Content:/,/Verdict/p')"
+printf '%s' "$_o" | grep -q 'https://old.example.com/kasinon-arvo-esimerkki-artikkeli/' \
+  && _p "a spam article address on the site's own domain (IndexNow log) is reported" || _f "own spam url" ""
+{ [ "$_rc" = 1 ] && printf '%s' "$_o" | grep -q 'REVIEW BEFORE IMPORTING' \
+  && printf '%s' "$_o" | grep -q 'HIGH      1 × spam link(s) in page content, to: casino-spam.example' \
+  && printf '%s' "$_o" | grep -q '→ imported as content; remove after import (wp-links.sh spam'; } \
+  && _p "the verdict names what was found in words, and what happens to each" || _f "verdict" "rc=$_rc $(printf '%s' "$_o" | sed -n '/Verdict/,$p')"
+printf '%s' "$_o" | grep -q "Import:  wp-import.sh apply ${_id} --accept-findings" \
+  && printf '%s' "$_o" | grep -q 'wp-links.sh spam  shows each page and widget' \
+  && _p "...and the next commands, in order" || _f "next steps" ""
+{ printf '%s' "$_o" | grep -q '1 title(s) carry spam' && printf '%s' "$_o" | grep -q 'page 327: "Commercial Gioca al grande casino online"' \
+  && ! printf '%s' "$_o" | grep -q 'old copy' \
+  && printf '%s' "$_o" | grep -q 'HIGH      1 × title(s) carrying spam: post 327' \
+  && printf '%s' "$_o" | grep -q '→ after import: wp-links.sh clean --title <id>="<real title>"'; } \
+  && _p "a casino advert on a page title is found in the posts rows (not in revisions), with the clean command" \
+  || _f "spam title" "$(printf '%s' "$_o" | sed -n '/Content:/,$p')"
+{ printf '%s' "$_o" | grep -q '1 post(s) or page(s) whose address is spam' && printf '%s' "$_o" | grep -q 'post 512: /kasinon-esimerkki-artikkeli/' \
+  && printf '%s' "$_o" | grep -q '→ after import: wp-links.sh clean --trash 512'; } \
+  && _p "a spam article by its address, with its ID for wp-links.sh clean --trash" || _f "spam slug" "$(printf '%s' "$_o" | sed -n '/Content:/,$p')"
+{ printf '%s' "$_o" | grep -q '2 application password(s) come with this site' && printf '%s' "$_o" | grep -qE 'designer +2: Zapier, seo1' \
+  && printf '%s' "$_o" | grep -q 'review    2 × application password(s)' && printf '%s' "$_o" | grep -q 'wp-forensics.sh app-passwords' \
+  && ! printf '%s' "$_o" | grep -q 'secrethash\|othrhash'; } \
+  && _p "application passwords in the dump are listed by account and name (never their hashes), for review" \
+  || _f "app passwords" "$(printf '%s' "$_o" | grep -B2 -A6 -i 'application')"
+_rf="$T/staging/$_id/meta/scan-report.txt"
+{ [ -f "$_rf" ] && ! grep -q "$(printf '\033')" "$_rf" && grep -q '^Verdict$' "$_rf" && grep -q "^Staged set : ${_id}" "$_rf"; } \
+  && _p "the whole scan is saved as plain text beside the staged set" || _f "report file" "$(head -5 "$_rf" 2>/dev/null)"
+_o2=$(_imp report "$_id"); [ $? = 0 ] && [ "$_o2" = "$(cat "$_rf")" ] \
+  && _p "wp-import.sh report shows it (the command the verdict always pointed at, now real)" || _f "report cmd" "$_o2"
+_o2=$(_imp report no-such-set); [ $? = 1 ] && _p "report on an unscanned set says how to scan it" || _f "report missing" "$_o2"
+_reset; _mkset "$T/inbox" "$P"
+_imp extract "$P" >/dev/null; _id=$(cat "$T/staging/.latest")
+_o=$(_imp scan "$_id" | sed 's/\x1b\[[0-9;]*m//g'); _rc=$?
+{ printf '%s' "$_o" | grep -q 'CLEAN   0 critical · 0 high · 0 to review' && printf '%s' "$_o" | grep -q "Import:  wp-import.sh apply ${_id}\$" \
+  && printf '%s' "$_o" | grep -q 'No links to gambling, pharmacy or adult sites' \
+  && printf '%s' "$_o" | grep -q 'No titles carry spam' && printf '%s' "$_o" | grep -q 'No application passwords'; } \
+  && _p "a clean set says CLEAN and gives the one command to import it" || _f "clean verdict" "$(printf '%s' "$_o" | sed -n '/Content:/,$p')"
 
 # ── restore ─────────────────────────────────────────────────────────────────
 _reset; _mkset "$T/inbox" "$P"; _mkset "$T/inbox" backup_2026-10-01-0300_Example_Site_ffffffffffff

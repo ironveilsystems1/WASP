@@ -801,7 +801,7 @@ echo ""
 # BUG FIX (v7-15, audit #13): validate every CIDR/IP before it's accepted.
 # These values are inserted verbatim into root-owned security config —
 # nftables rules (`ip saddr ${SSH_CIDR} ...`) and Apache directives
-# (`Require ip ${ADMIN_CIDR}`, `RemoteIPTrustedProxy ${PROXY_IP}`). A
+# (`Require ip ${ADMIN_CIDR}`, `RemoteIPInternalProxy ${PROXY_IP}`). A
 # malformed value doesn't just get ignored: it makes nftables fail to load
 # (potentially leaving the firewall down) or Apache fail to start
 # (potentially leaving the site down), and a stray token could weaken the

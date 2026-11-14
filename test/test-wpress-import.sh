@@ -170,7 +170,7 @@ grep -qx 'plugin,oldplug,1.2.3' "$T/log/inventory" 2>/dev/null \
 grep -qx 'theme,oldtheme,9.8' "$T/log/inventory" \
   && _p "and a staged theme's from style.css" || _f "theme version" ""
 [ -e /tmp/wasp-ran ] && _f "staged code" "it ran" || _p "no staged code was executed to read them"
-{ [ "$_rc" = 1 ] && printf '%s' "$_o" | grep -q 'high 1'; } \
+{ [ "$_rc" = 1 ] && printf '%s' "$_o" | grep -q '1 high'; } \
   && _p "a HIGH vulnerability reaches the gate before import" || _f "gate" "exit $_rc: $_o"
 _o=$(VULN_RC=3 _imp scan "$_id" 2>&1)
 printf '%s' "$_o" | grep -q 'NOT fully checked' \

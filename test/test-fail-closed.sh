@@ -807,7 +807,7 @@ _t8() { # mode, proxy_ip, bouncer_up, bouncer_registered, lapi_ready -> blocked?
         "that is exactly the inference 10.4 exists to remove"
 
 echo ""
-echo "── TRUST-COUNT: RemoteIPTrustedProxy takes one literal address"
+echo "── TRUST-COUNT: the trusted proxy (RemoteIPInternalProxy) takes one literal address"
 # Driven through the REAL guard shape used in lib/03 and lib/06. A range lets
 # any host inside it forge the client address in X-Forwarded-For — the address
 # CrowdSec bans, wp-admin allows, and the login guard counts against.
@@ -914,7 +914,7 @@ _guard "detect-only is a blocker" \
 _guard "no local bouncer is installed in upstream mode" \
   "payload/stages/09-crowdsec-and-backup.sh" 'CS_ENFORCEMENT" = "local"'
 _guard "lib/06 asserts TRUST-COUNT before writing the directive" \
-  "lib/06-vars-and-payload-inject.sh" 'RemoteIPTrustedProxy needs a single literal'
+  "lib/06-vars-and-payload-inject.sh" 'the trusted proxy needs a single literal'
 _guard "lib/03 asserts TRUST-COUNT at its own write site" \
   "lib/03-dynamic-configs.sh" "expected a single IPv4 address"
 _guard "install.sh validates the deployment contract before building" \

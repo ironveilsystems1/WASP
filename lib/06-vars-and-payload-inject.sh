@@ -195,7 +195,7 @@ msg_ok "wp-security.conf injected (admin: ${ADMIN_CIDR:-open}, extra-ip: ${ALLOW
 # TRUST-COUNT contract, asserted here at the point of use rather than trusted
 # from the prompt that collected it.
 #
-# RemoteIPTrustedProxy must name exactly ONE literal address. mod_remoteip
+# The trusted proxy must be exactly ONE literal address. mod_remoteip
 # walks X-Forwarded-For from the RIGHT, popping entries while they match a
 # trusted proxy, and takes the first untrusted one as the client. Give it a
 # range and every host inside that range can prepend whatever address it likes
@@ -220,17 +220,23 @@ if [[ -n "$PROXY_IP" ]]; then
       msg_warn "  address is what CrowdSec bans, what wp-admin allows, and what"
       msg_warn "  the login guard counts — so this is not a cosmetic constraint."
       msg_warn "  Name the proxy's own address, e.g. 10.20.10.10, and re-run."
-      msg_error "PROXY_IP is '${PROXY_IP}' — RemoteIPTrustedProxy needs a single literal address." ;;
+      msg_error "PROXY_IP is '${PROXY_IP}' — the trusted proxy needs a single literal address." ;;
   esac
   cat > "$MNT/root/wp-remoteip.load" << RILOAD
 LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so
 RILOAD
-  cat > "$MNT/root/wp-remoteip.conf" << RICONF
-RemoteIPHeader X-Forwarded-For
-RemoteIPTrustedProxy ${PROXY_IP}
+  # 10.15: a MASK, carrying no directive. It is mounted over
+  # mods-enabled/remoteip.conf so nothing the image or Debian puts there can
+  # configure mod_remoteip. The one live declaration is in wp-security.conf
+  # (lib/03). Through 10.14 this file carried its own RemoteIPTrustedProxy,
+  # and because mod_remoteip's proxy lists append, correcting wp-security.conf
+  # alone left this one deciding the outcome. check-trusted-proxy.py refuses a
+  # directive here.
+  cat > "$MNT/root/wp-remoteip.conf" << 'RICONF'
+# masked: mod_remoteip is configured in conf-enabled/wp-security.conf
 RICONF
   chmod 644 "$MNT/root/wp-remoteip.load" "$MNT/root/wp-remoteip.conf"
-  msg_ok "mod_remoteip files injected (trusted proxy: ${PROXY_IP} — single literal address)"
+  msg_ok "mod_remoteip files injected (trusted proxy: ${PROXY_IP} — single literal address, declared once)"
 fi
 
 # ─ Stage payload/ onto the VM disk (NEW -- replaces per-file heredocs) ───────
