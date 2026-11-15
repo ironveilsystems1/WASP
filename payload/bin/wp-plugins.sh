@@ -1509,6 +1509,11 @@ case "${1:-status}" in
   # wizard actually been completed? Silent by design -- it is called from cron
   # every 10 minutes and must not fill a log with noise while waiting.
   is-site-installed) _wp core is-installed >/dev/null 2>&1 && exit 0 || exit 1 ;;
+  # WP-CLI as the other WASP tools run it (the wp-cli container, this site's
+  # database, the egress proxy), for a WASP tool that needs WordPress loaded:
+  # wp-links.sh clean saves through Elementor. WPCLI_MOUNT adds a read-only
+  # mount. Not for operators -- one definition of how WP-CLI is run, not two.
+  __wp) shift; _wp "$@" ;;
   # Applies any schema migrations a core file update requires. Called by
   # update.sh after it syncs core out of a new image.
   core-update-db) _wp core update-db ;;

@@ -1,0 +1,7 @@
+# Cron lines an earlier release installed and a later one replaced. wasp-upgrade.sh
+# removes an exact match from /etc/crontabs/root. Needed because a VM upgraded
+# by hand may have had its staged copy replaced already, so the previous
+# release's cron file is no longer there to compare against.
+#
+# 10.16: the weekly integrity check moved to wasp-alerts.sh, which emails a failure.
+30 4 * * 1 /usr/local/bin/wp-plugins.sh verify >/dev/null 2>&1

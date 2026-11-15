@@ -48,6 +48,37 @@ _cfg() {
 
 _configured() { [ -r "$SMTP_FILE" ] && [ -n "$(_cfg host)" ]; }
 
+# The SMTP mu-plugin. Referenced by `doctor` and never defined, so under
+# 10.15 and earlier every doctor run printed "mu-plugin : MISSING" -- on sites
+# whose mail was working, which taught the operator to ignore the line.
+MU_PLUGIN="${WASP_MU_PLUGIN:-/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php}"
+
+# Plugins that take WordPress's mail over: they replace or reconfigure the
+# mailer with their OWN stored relay and password, so WASP's relay settings
+# are bypassed. Imported sites bring them along still configured for the old
+# host. Found on a real import: FluentSMTP active, every send aimed at the old
+# host's mail server, WASP's firewall dropping it (it allows only the relay),
+# and the error -- "Could not connect to SMTP host" -- naming WASP's relay,
+# because that is what WASP's own message prints.
+_MAIL_OVERRIDE_SLUGS="fluent-smtp wp-mail-smtp wp-mail-smtp-pro post-smtp easy-wp-smtp wp-smtp smtp-mailer gmail-smtp suremails site-mailer wp-ses wp-offload-ses mailgun sendgrid-email-delivery-simplified sendinblue-wp-mailer"
+_mail_overrides() {
+  _active=$(_wp plugin list --status=active --field=name 2>/dev/null) || return 0
+  for _sl in $_active; do
+    case " $_MAIL_OVERRIDE_SLUGS " in
+      *" $_sl "*) printf '%s\n' "$_sl" ;;
+      *) case "$_sl" in *smtp*) printf '%s\n' "$_sl" ;; esac ;;
+    esac
+  done
+}
+_override_warning() {  # $1 = list of slugs
+  [ -n "$1" ] || return 0
+  echo "  ⚠  Active plugin(s) that take over WordPress mail with their OWN settings:"
+  printf '%s\n' "$1" | sed 's/^/       /'
+  echo "     WASP's relay is bypassed while they are active. An imported site's"
+  echo "     copy still points at the old host. Deactivate and delete:"
+  echo "       wp-admin → Plugins   (or: wp-plugins.sh list)"
+}
+
 # wp-cli runs in its OWN container: the wordpress image ships no `wp` binary.
 # This file called _wp without ever defining it, so `wp-mail.sh test` died with
 # "_wp: not found" on a live VM -- the mail path could not be verified at all.
@@ -141,7 +172,7 @@ show_status() {
     fi
   fi
 
-  _mu=/home/wpuser/wp/html/wp-content/mu-plugins/01-wpvm-smtp.php
+  _mu="$MU_PLUGIN"
   if [ -r "$_mu" ]; then
     # Present is not the same as loading. Ask PHP whether the hook is live.
     if podman exec wordpress php -l /var/www/html/wp-content/mu-plugins/01-wpvm-smtp.php >/dev/null 2>&1; then
@@ -219,6 +250,12 @@ do_test() {
       echo "✗  Send failed. Output:" >&2
       printf '%s\n' "$_out" >&2
       echo "" >&2
+      _ov=$(_mail_overrides)
+      if [ -n "$_ov" ]; then
+        _override_warning "$_ov" >&2
+        echo "     Likely cause: the message went to THAT plugin's server, not ${_h}." >&2
+        echo "" >&2
+      fi
       echo "   Next: wp-mail.sh doctor   (checks DNS, port reachability, config)" >&2
       exit 1 ;;
   esac
@@ -287,7 +324,14 @@ do_doctor() {
   _configured && echo "  config      : present" || { echo "  config      : MISSING (wp-mail.sh setup)"; exit 1; }
   _h=$(_cfg host); _p=$(_cfg port)
   echo "  relay       : ${_h}:${_p}"
-  [ -r "$MU_PLUGIN" ] && echo "  mu-plugin   : present" || echo "  mu-plugin   : MISSING"
+  [ -r "$MU_PLUGIN" ] && echo "  mu-plugin   : present" || echo "  mu-plugin   : MISSING — mail falls back to PHP mail() and fails"
+  _ov=$(_mail_overrides)
+  if [ -n "$_ov" ]; then
+    echo "  overrides   : $(printf '%s' "$_ov" | tr '\n' ' ')⚠"
+    _override_warning "$_ov"
+  else
+    echo "  overrides   : none (no active plugin replaces the mailer)"
+  fi
   printf "  mount       : "
   _m=$(podman inspect wordpress --format '{{range .Mounts}}{{.Destination}}={{.RW}} {{end}}' 2>/dev/null \
        | tr ' ' '\n' | grep '/var/www/private')

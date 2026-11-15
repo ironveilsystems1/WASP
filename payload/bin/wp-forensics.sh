@@ -6,6 +6,9 @@
 #   wp-forensics.sh since-backup      what changed since the last good backup
 #   wp-forensics.sh entry-class       walk the "how did this get in" decision tree
 #   wp-forensics.sh admins            accounts, roles, and when they appeared
+#   wp-forensics.sh app-passwords [revoke <user id>|all [--yes]]
+#                                     application passwords: who has them, when
+#                                     created and last used; revoke them
 #
 # WHAT THIS IS
 #
@@ -287,6 +290,60 @@ case "$CMD" in
     _note "cleaning the file that created it. Check registration dates against"
     _note "the timeline — an account appearing minutes after a suspicious file"
     _note "is the same event, not two." ;;
+
+  app-passwords)
+    # Application passwords reach the REST API and XML-RPC without the login
+    # page or two-factor, and changing the account's password does not revoke
+    # them: after a compromise, rotating every password leaves these working.
+    # WordPress keeps each account's in one usermeta row; names, dates and the
+    # IP last used are shown, never the hashes. (10.18)
+    _pfx=$(podman exec mariadb sh -c 'printf %s "${WORDPRESS_TABLE_PREFIX:-wp_}"' 2>/dev/null || printf 'wp_')
+    case "$_pfx" in *[!A-Za-z0-9_]*) echo "  Unexpected table prefix." >&2; exit 2 ;; esac
+    _sql() { podman exec mariadb sh -c \
+      'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" -N -B "${WORDPRESS_DB_NAME:-wordpress}" -e "$1"' _ "$1"; }
+    if [ "${2:-}" = revoke ]; then
+      _who="${3:-}"
+      case "$_who" in all) _where="" ;; ''|*[!0-9]*) echo "  Usage: wp-forensics.sh app-passwords revoke <user id>|all [--yes]" >&2; exit 2 ;;
+                      *) _where=" AND user_id=${_who}" ;; esac
+      _n=$(_sql "SELECT COUNT(*) FROM ${_pfx}usermeta WHERE meta_key='_application_passwords'${_where};" 2>/dev/null)
+      [ "${_n:-0}" -gt 0 ] 2>/dev/null || { echo "  No application passwords to revoke."; exit 0; }
+      if [ "${4:-}" != --yes ]; then
+        [ -t 0 ] || { echo "  Not a terminal: add --yes." >&2; exit 1; }
+        printf '  Revoke every application password of %s? Integrations using them stop working. [y/N] ' \
+          "$( [ "$_who" = all ] && echo 'every account' || echo "user ${_who}")"
+        read -r _a; case "$_a" in y|Y|yes) : ;; *) echo "  Not revoked."; exit 1 ;; esac
+      fi
+      _sql "DELETE FROM ${_pfx}usermeta WHERE meta_key='_application_passwords'${_where};" \
+        && { echo "  ✔ Revoked."; logger -t wasp-forensics "application passwords revoked: ${_who}" 2>/dev/null; exit 0; }
+      echo "  Could not update the database." >&2; exit 2
+    fi
+    _hdr "Application passwords"
+    _rows=$(_sql "SELECT u.ID, u.user_login, m.meta_value FROM ${_pfx}usermeta m JOIN ${_pfx}users u ON u.ID=m.user_id
+                  WHERE m.meta_key='_application_passwords' AND m.meta_value <> 'a:0:{}';" 2>/dev/null) \
+      || { echo "  Could not query the database."; exit 2; }
+    if [ -z "$_rows" ]; then
+      echo "  None. Nothing reaches this site's API without the login page."
+      exit 0
+    fi
+    _d() { case "$1" in ''|*[!0-9]*) echo "${2:-?}" ;; *) date -u -d "@$1" +%Y-%m-%d 2>/dev/null || echo "$1" ;; esac; }
+    printf '%s\n' "$_rows" | awk -F '\t' '
+      function field(s, k,   r) { r = ""
+        if (match(s, "s:" length(k) ":\"" k "\";(s:[0-9]+:\"[^\"]*\"|i:[0-9]+|N)")) {
+          r = substr(s, RSTART, RLENGTH); sub("^s:" length(k) ":\"" k "\";", "", r)
+          sub(/^s:[0-9]+:"/, "", r); sub(/"$/, "", r); sub(/^i:/, "", r); if (r == "N") r = "" }
+        gsub(/[\t\r\n]/, " ", r); return r }
+      { n = split($3, part, "s:4:\"uuid\";")
+        for (i = 2; i <= n; i++)
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, field(part[i], "name"), field(part[i], "created"), field(part[i], "last_used"), field(part[i], "last_ip") }' \
+    | while IFS="$(printf '\t')" read -r _uid _ul _an _ac _alu _aip; do
+        [ "$_uid" = "${_prev:-}" ] || printf '  %s (user %s)\n' "$_ul" "$_uid"; _prev=$_uid
+        printf '    %-28s created %s   last used %s%s\n' "${_an:-(unnamed)}" "$(_d "$_ac")" "$(_d "$_alu" never)" "${_aip:+ from $_aip}"
+      done
+    echo ""
+    _note "Each reaches the REST API and XML-RPC without the login page or two-factor, and"
+    _note "survives a password change. Keep the ones you recognise; revoke the rest:"
+    _note "  wp-forensics.sh app-passwords revoke <user id>      (or: revoke all)"
+    ;;
 
   entry-class)
     _hdr "How did this get in? — decision tree"

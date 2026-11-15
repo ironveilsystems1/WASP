@@ -859,6 +859,104 @@ EOF
     and restarts CrowdSec and WordPress. CrowdSec goes back to reading logs.
 EOF
     ;;
+  security.30) _card "30 — Who does Apache think I am?" <<'EOF'
+  WHAT IT DOES
+    Shows the address WordPress sees for recent visitors through the reverse
+    proxy, and flags anything that makes that address wrong: the image's own
+    remoteip.conf, forwarding headers set in only some locations, or a
+    pre-10.15 proxy declaration.
+
+  WHEN TO USE IT
+    wp-admin gives 403 to you but not to the internet, or the access log
+    shows the proxy's address instead of real visitors.
+EOF
+    ;;
+  security.31) _card "31 — Repair wp-admin 403 behind the proxy" <<'EOF'
+  WHAT IT DOES
+    For VMs built with 10.14 or earlier. Those declared the proxy in a way
+    that throws away a PRIVATE visitor address, so an administrator coming
+    from the LAN or over NetBird looked like the proxy itself and Apache
+    refused wp-admin. This switches the declaration to the 10.15 form (still
+    one proxy address, never a range), tests the config, and restarts
+    WordPress. If the config test fails, nothing is changed.
+
+  HOW TO TELL WHICH 403 YOU HAVE
+    Apache's page says "You don't have permission to access this resource."
+    That one this fixes. A bare "403 Forbidden" with nothing else is the
+    reverse proxy refusing you: your browser reached it from an address its
+    admin rule does not allow. Fix that with DNS (README: "Reaching wp-admin
+    through the proxy"), not here.
+EOF
+    ;;
+  security.32) _card "32 — Find spam links in the pages" <<'EOF'
+  WHAT IT DOES
+    Reads every page, post, Elementor template, menu and sidebar widget
+    straight from the database and lists links to gambling, pharmacy and
+    adult sites, spam titles, spam articles, links hidden with CSS, and spam
+    URLs the site announced to search engines. Each finding names the page,
+    the Elementor widget to delete, and who last saved it. Changes nothing.
+
+  WHEN TO USE IT
+    After importing a site, when a link checker shows odd domains, or when
+    the weekly check emails you. Injected links are content, not files: no
+    malware scan sees them.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    "Elementor widget w1spam1 (text-editor): link to casino-spam.example" —
+    open that page with Edit with Elementor, delete that widget, Update.
+EOF
+    ;;
+  security.33) _card "33 — Find broken links" <<'EOF'
+  WHAT IT DOES
+    Visits this site's pages the way a visitor does, through the reverse
+    proxy, one a second, and reports pages, images and files that are missing
+    or failing, with the pages that link to them. Certificate problems
+    (a www link the certificate does not cover) are reported too. Never
+    touches the login, admin or API paths.
+
+  WHEN TO USE IT
+    After an import or a redesign, or when someone reports a dead link.
+    Online link checkers usually cannot reach a WASP site: it refuses
+    requests that do not identify as a browser.
+
+  WHAT IT ASKS YOU
+    Nothing. Links to OTHER sites are listed, not checked: this VM may only
+    reach the sites it needs. The command to check them from a workstation
+    is printed at the end.
+
+  EXAMPLE
+    "404 — the page or file does not exist, linked from 2 page(s)".
+EOF
+    ;;
+  security.34) _card "34 — Clean spam out of the pages" <<'EOF'
+  WHAT IT DOES
+    From the menu: lists what could be cleaned — the spam domains and where
+    they are linked (any builder, theme setting, widget or menu), Elementor
+    widgets by ID, spam titles, spam articles, revisions holding spam and
+    spam entries in the IndexNow log — and the command to clean them.
+    Changes nothing.
+
+  WHEN TO USE IT
+    After "Find spam links" (32) or a spam alert, to remove what it found.
+
+  WHAT IT ASKS YOU
+    Nothing here. The clean-up itself runs from the console, naming each
+    thing to remove, previewed first:
+      wp-links.sh clean --links <domain>,<domain> --trash <id> \
+                        --revisions --indexnow
+    --links works for every builder and theme; Elementor widgets can also
+    go whole with --widgets <id>, a title with --title <id>="Real title"
+      ...then the same with --apply
+    Only what you name AND what tests as spam is changed. --apply saves the
+    evidence and takes a database backup first. Posts go to the Trash.
+
+  EXAMPLE
+    "widget w1spam1 (text-editor) on page 120: casino-spam.example"
+EOF
+    ;;
   security.18) _card "18 — Report bans to a central LAPI" <<'EOF'
   WHAT IT DOES
     Points this VM's CrowdSec agent at a shared Local API on another host, so
@@ -924,6 +1022,74 @@ EOF
   EXAMPLE
     Press 2. A bouncer line reading "agent-only, reporting to a remote LAPI"
     is normal when the LAPI lives on another host.
+EOF
+    ;;
+  updates.23) _card "23 — What a new release changes" <<'EOF'
+  WHAT IT DOES
+    Checks a WASP release against the signing key pinned on this VM and every
+    file against its manifest, then lists what an upgrade would change: tools,
+    WordPress mu-plugins, rules, cron lines, and build-time configuration that
+    changed upstream (reported, never replaced). Changes nothing.
+
+  WHEN TO USE IT
+    Before every upgrade, and to see whether a VM has fallen behind.
+
+  WHAT IT ASKS YOU
+    Where the release is: the wasp-X.tar.gz you copied over, or the
+    directory you unpacked it into.
+
+  EXAMPLE
+    "~ tool wp-links.sh (+120 −8 lines)" · "+ cron 40 4 * * 2 …"
+EOF
+    ;;
+  updates.24) _card "24 — Upgrade to a new release" <<'EOF'
+  WHAT IT DOES
+    The check in 23, then: backs up everything it will touch, installs the
+    release's tools, rules and mu-plugins (keeping this VM's login slug and
+    two-factor settings), reconciles cron, runs each version's upgrade steps,
+    and checks the result. Running it twice changes nothing the second time.
+
+  WHEN TO USE IT
+    To bring this VM to a new WASP release. Replaces the blocks of commands
+    each release's CHANGELOG used to list.
+
+  WHAT IT ASKS YOU
+    Where the release is, then to type UPGRADE. It stops if a tool here was
+    edited since it was installed: look at that first.
+
+  EXAMPLE
+    "This VM now runs WASP 10.18." — undo with 26.
+EOF
+    ;;
+  updates.25) _card "25 — Version and upgrade history" <<'EOF'
+  WHAT IT DOES
+    Shows the WASP version this VM runs, every upgrade and rollback with its
+    date, and the backups a rollback can restore.
+
+  WHEN TO USE IT
+    To see where a VM stands before or after an upgrade.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    "2026-11-20T09:12:00Z upgrade 10.17 -> 10.18 ok"
+EOF
+    ;;
+  updates.26) _card "26 — Undo the last upgrade" <<'EOF'
+  WHAT IT DOES
+    Puts back what the last upgrade replaced — tools, mu-plugins, rules,
+    cron, staged payload, version — from the backup it took, and removes what
+    it added.
+
+  WHEN TO USE IT
+    When something stopped working after an upgrade.
+
+  WHAT IT ASKS YOU
+    To type ROLLBACK.
+
+  EXAMPLE
+    "Rolled back to 10.17."
 EOF
     ;;
   updates.22) _card "22 — Newer versions upstream?" <<'EOF'
@@ -1044,6 +1210,24 @@ EOF
   who got in once gets in again by the same door if you never find it.
 EOF
     ;;
+  diag.12) _card "12 — Forensics: application passwords" <<'EOF'
+  WHAT IT DOES
+    Lists every application password: whose, its name, when it was created
+    and last used, and from where. Never the passwords themselves.
+
+  WHEN TO USE IT
+    After an import or a compromise. Application passwords reach the API
+    without the login page or two-factor, and changing an account's password
+    does NOT revoke them.
+
+  WHAT IT ASKS YOU
+    Nothing. To revoke, from the console:
+      wp-forensics.sh app-passwords revoke <user id>      (or: revoke all)
+
+  EXAMPLE
+    "Zapier   created 2026-02-02   last used 2026-02-03 from 203.0.113.10"
+EOF
+    ;;
   diag.1) _card "1 — Capture a session for review" <<'EOF'
   WHAT IT DOES
     Records your terminal session plus diagnostics into one local bundle,
@@ -1141,6 +1325,75 @@ EOF
     Use an address you can actually check. Then look in spam -- delivered but
     filtered is a different problem from not sent, and needs SPF and DKIM
     rather than more debugging here.
+EOF
+    ;;
+  diag.8) _card "8 — Mail: diagnose" <<'EOF'
+  WHAT IT DOES
+    Checks the mail path piece by piece: settings, the SMTP plugin, the
+    mount, DNS, and whether port 587 on the relay answers. Also names any
+    plugin that takes WordPress mail over with its own settings.
+
+  WHEN TO USE IT
+    A test message fails, or arrives from the wrong place.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    "overrides : fluent-smtp" after an import means the old site's mail
+    plugin is sending, to the old host. Deactivate it in wp-admin.
+EOF
+    ;;
+  diag.9) _card "9 — Security alerts: what is emailed" <<'EOF'
+  WHAT IT DOES
+    Lists every alert, on or off, and who receives them. WordPress emails
+    when an administrator is added or removed or signs in from a new
+    address; when an administrator's password or email changes; when an
+    application password is created or two-factor is turned off; when
+    plugins or themes change; and when the site address, admin email,
+    registration or default role change. The VM itself emails when the site
+    goes down and recovers, when an administrator appears in the database,
+    and when plugin files or WASP's tools are modified.
+
+  WHEN TO USE IT
+    To see what you will hear about, or to check alerts are set up at all.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    Change the recipient:  wasp-alerts.sh to you@example.com,ops@example.com
+EOF
+    ;;
+  diag.10) _card "10 — Security alerts: send a test" <<'EOF'
+  WHAT IT DOES
+    Sends one alert through WordPress itself, the same path a real one takes.
+
+  WHEN TO USE IT
+    After setting alerts up, after changing the recipient, or after any mail
+    change.
+
+  WHAT IT ASKS YOU
+    Nothing. It goes to the configured recipients.
+
+  EXAMPLE
+    Nothing arrives: check spam, then Mail: diagnose.
+EOF
+    ;;
+  diag.11) _card "11 — Security alerts: turn one on or off" <<'EOF'
+  WHAT IT DOES
+    Turns one alert on or off. The settings live on the VM, outside wp-admin,
+    so someone signed in to WordPress cannot switch them off.
+
+  WHEN TO USE IT
+    An alert is noise for this site, for example code_change on a site
+    whose developer updates plugins daily.
+
+  WHAT IT ASKS YOU
+    on or off, then the event name (status lists them), or "all".
+
+  EXAMPLE
+    off, code_change
 EOF
     ;;
   diag.7) _card "7 — Self-test (full)" <<'EOF'
@@ -1781,6 +2034,11 @@ menu_security() {
    27) AppSec (WAF) status           ${DIM}wasp-appsec.sh status${R}
    28) AppSec (WAF): switch ON       ${DIM}wasp-appsec.sh on${R}
    29) AppSec (WAF): switch OFF      ${DIM}wasp-appsec.sh off${R}
+   30) Who does Apache think I am?   ${DIM}wp-hardening.sh proxy-check${R}
+   31) Repair wp-admin 403 (proxy)   ${DIM}wp-hardening.sh remoteip-fix${R}
+   32) Find spam links in the pages  ${DIM}wp-links.sh spam${R}
+   33) Find broken links             ${DIM}wp-links.sh broken${R}
+   34) Clean spam out of the pages   ${DIM}wp-links.sh clean${R}
     5) Plugin vulnerability scan     ${DIM}wp-plugins.sh vulns${R}
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
@@ -1836,6 +2094,11 @@ EOF
             fi
           else _missing wasp-appsec.sh; fi ;;
       29) _have wasp-appsec.sh && run "AppSec off" 1 wasp-appsec.sh off || _missing wasp-appsec.sh ;;
+      30) _have wp-hardening.sh && run "Client address through the proxy" 0 wp-hardening.sh proxy-check || _missing wp-hardening.sh ;;
+      31) _have wp-hardening.sh && run "Repair wp-admin 403 behind the proxy" 1 wp-hardening.sh remoteip-fix || _missing wp-hardening.sh ;;
+      32) _have wp-links.sh && run "Spam links in the content" 0 wp-links.sh spam || _missing wp-links.sh ;;
+      33) _have wp-links.sh && run "Broken links" 0 wp-links.sh broken || _missing wp-links.sh ;;
+      34) _have wp-links.sh && run "What spam could be cleaned (changes nothing)" 0 wp-links.sh clean || _missing wp-links.sh ;;
       22) _have wp-vuln-cron.sh && run "Weekly security report (sent now)" 0 wp-vuln-cron.sh --digest || _missing wp-vuln-cron.sh ;;
       23) _have wasp-hive-report.sh && run "WASP Hive reporting" 0 wasp-hive-report.sh status || _missing wasp-hive-report.sh ;;
       24) if _have wasp-hive-report.sh; then
@@ -1895,7 +2158,7 @@ menu_rotate() {
   ${B}Rotate a secret${R}  ${DIM}(each verifies before committing, rolls back on failure)${R}
     1) ${RED}[!]${R} Salts                         ${DIM}wp-rotate-secrets.sh salts${R}
     2) ${RED}[!]${R} Database password             ${DIM}wp-rotate-secrets.sh db${R}
-    3) ${RED}[!]${R} SMTP relay password           ${DIM}wp-rotate-secrets.sh smtp <pass>${R}
+    3) ${RED}[!]${R} SMTP relay password           ${DIM}wp-rotate-secrets.sh smtp${R}
     4) ${RED}[!]${R} Everything                    ${DIM}wp-rotate-secrets.sh all${R}
     b) back
 EOF
@@ -1904,7 +2167,7 @@ EOF
   case "$c" in
     1) run "Rotate salts" 1 wp-rotate-secrets.sh salts ;;
     2) run "Rotate DB password" 1 wp-rotate-secrets.sh db ;;
-    3) if ask "New SMTP password" _p; then run "Rotate SMTP password" 1 wp-rotate-secrets.sh smtp "$_p"; fi ;;
+    3) run "Rotate SMTP password" 1 wp-rotate-secrets.sh smtp ;;
     4) run "Rotate everything" 1 wp-rotate-secrets.sh all ;;
     b|B) return ;;
   esac
@@ -1925,6 +2188,11 @@ menu_updates() {
     6) ${RED}[!]${R} Update CrowdSec              ${DIM}update.sh crowdsec${R}
     7) ${RED}[!]${R} Update Squid (egress proxy)  ${DIM}update.sh squid${R}
     8) ${RED}[!]${R} Update Alpine OS packages    ${DIM}update.sh os${R}
+  ${B}WASP's own tools${R}
+   23) What a new release changes    ${DIM}wasp-upgrade.sh check <release>${R}
+   24) ${RED}[!]${R} Upgrade to a new release     ${DIM}wasp-upgrade.sh apply <release>${R}
+   25) Version and upgrade history   ${DIM}wasp-upgrade.sh status${R}
+   26) ${RED}[!]${R} Undo the last upgrade        ${DIM}wasp-upgrade.sh rollback${R}
     b) back
 EOF
     _sel updates
@@ -1939,6 +2207,10 @@ EOF
       6) run "Update CrowdSec" 1 update.sh crowdsec ;;
       7) run "Update Squid" 1 update.sh squid ;;
       8) run "Update OS packages" 1 update.sh os ;;
+      23) _have wasp-upgrade.sh && { if ask "Release (wasp-X.tar.gz or its directory)" _a; then run "WASP release: verify and plan" 0 wasp-upgrade.sh check "$_a"; fi; } || _missing wasp-upgrade.sh ;;
+      24) _have wasp-upgrade.sh && { if ask "Release (wasp-X.tar.gz or its directory)" _a; then run "Upgrade WASP's tools" 1 wasp-upgrade.sh apply "$_a"; fi; } || _missing wasp-upgrade.sh ;;
+      25) _have wasp-upgrade.sh && run "WASP version and upgrades" 0 wasp-upgrade.sh status || _missing wasp-upgrade.sh ;;
+      26) _have wasp-upgrade.sh && run "Undo the last upgrade" 1 wasp-upgrade.sh rollback || _missing wasp-upgrade.sh ;;
       b|B) return ;;
     esac
   done
@@ -2141,6 +2413,11 @@ menu_diagnostics() {
     5) Mail: status                  ${DIM}wp-mail.sh status${R}
     6) Mail: send a test             ${DIM}wp-mail.sh test <addr>${R}
     7) Self-test (full)              ${DIM}wasp-selftest.sh all${R}
+    8) Mail: diagnose                ${DIM}wp-mail.sh doctor${R}
+    9) Security alerts: what is sent ${DIM}wasp-alerts.sh status${R}
+   10) Security alerts: send a test  ${DIM}wasp-alerts.sh test${R}
+   11) Security alerts: on / off     ${DIM}wasp-alerts.sh on|off <event>${R}
+   12) Forensics: app passwords      ${DIM}wp-forensics.sh app-passwords${R}
     b) back
 EOF
     _sel diag
@@ -2152,6 +2429,19 @@ EOF
       5) _have wp-mail.sh && run "Mail status" 0 wp-mail.sh status || _missing wp-mail.sh ;;
       6) _have wp-mail.sh && { if ask "Send test to" _a; then run "Mail test" 0 wp-mail.sh test "$_a"; fi; } || _missing wp-mail.sh ;;
       7) _have wasp-selftest.sh && run "Full self-test" 0 wasp-selftest.sh all || _missing wasp-selftest.sh ;;
+      8) _have wp-mail.sh && run "Mail diagnostics" 0 wp-mail.sh doctor || _missing wp-mail.sh ;;
+      9) _have wasp-alerts.sh && run "Security alerts" 0 wasp-alerts.sh status || _missing wasp-alerts.sh ;;
+     10) _have wasp-alerts.sh && run "Security alert test" 0 wasp-alerts.sh test || _missing wasp-alerts.sh ;;
+     12) _have wp-forensics.sh && run "Forensics: application passwords" 0 wp-forensics.sh app-passwords || _missing wp-forensics.sh ;;
+     11) if _have wasp-alerts.sh; then
+           if ask "on or off" _st && ask "Event (or all)" _ev; then
+             case "$_st" in
+               on)  run "Alert on" 1 wasp-alerts.sh on "$_ev" ;;
+               off) run "Alert off" 1 wasp-alerts.sh off "$_ev" ;;
+               *)   echo "    Type on or off." ; _pause ;;
+             esac
+           fi
+         else _missing wasp-alerts.sh; fi ;;
       b|B) return ;;
     esac
   done

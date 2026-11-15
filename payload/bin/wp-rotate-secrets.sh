@@ -5,7 +5,8 @@
 #   wp-rotate-secrets.sh status         what can be rotated, and from here
 #   wp-rotate-secrets.sh salts          WordPress salts only (fast, safe)
 #   wp-rotate-secrets.sh db             database application password
-#   wp-rotate-secrets.sh smtp <pass>    SMTP password (you supply the new one)
+#   wp-rotate-secrets.sh smtp [pass]    SMTP password (you supply the new one;
+#                                       prompted for when omitted)
 #   wp-rotate-secrets.sh all            salts + db (NOT smtp — needs the relay's)
 #
 # WHY THIS EXISTS
@@ -46,8 +47,8 @@ ENVF=/etc/wordpress/env
 WPENVF=/etc/wordpress/wp.env
 WP_ENV_FILE=$WPENVF
 [ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=$ENVF
-SECRETS=/home/wpuser/wp/secrets
-BACKUP_DIR=/root/.rotate-backups
+SECRETS="${WASP_SECRETS_DIR:-/home/wpuser/wp/secrets}"
+BACKUP_DIR="${WASP_ROTATE_BACKUP_DIR:-/root/.rotate-backups}"
 
 _ok()   { printf '  \033[32m✔\033[0m  %s\n' "$1"; }
 _bad()  { printf '  \033[31m✗\033[0m  %s\n' "$1" >&2; }
@@ -106,7 +107,7 @@ status)
   echo "  Rotatable from here:"
   _ok "WordPress salts     — wp-rotate-secrets.sh salts   (instant, logs everyone out)"
   _ok "Database password   — wp-rotate-secrets.sh db      (kept in sync across env + MariaDB)"
-  _ok "SMTP password       — wp-rotate-secrets.sh smtp <new>  (after you change it at the relay)"
+  _ok "SMTP password       — wp-rotate-secrets.sh smtp        (prompts; change it at the relay first)"
   echo ""
   echo "  Rotate at the PROVIDER, then update here:"
   _note "CTI / Wordfence keys — regenerate in their console, then re-run the"
@@ -120,7 +121,7 @@ status)
   echo ""
   echo "  After a compromise, the right order is:"
   _note "1. wp-rotate-secrets.sh all      (salts + database)"
-  _note "2. wp-rotate-secrets.sh smtp <new>  (change at the relay first)"
+  _note "2. wp-rotate-secrets.sh smtp  (prompts; change it at the relay first)"
   _note "3. Reset every WordPress admin password:  wp-forensics.sh admins"
   _note "4. Regenerate provider API keys in their consoles"
   ;;
@@ -218,28 +219,83 @@ db)
 
 smtp)
   _hdr "Rotating the SMTP password"
-  _new="${2:-}"
   # SMTP is different: the password is owned by the mail relay, not by this VM.
   # We cannot generate it -- the operator changes it at the provider and gives
   # us the new value to store. Generating one here would just break mail.
-  if [ -z "$_new" ]; then
-    _bad "Supply the new password: wp-rotate-secrets.sh smtp '<new-password>'"
-    _note "Change it at your mail relay FIRST, then pass the new value here."
-    _note "Unlike the database password, this one is owned by the relay, not"
-    _note "by this VM — so it cannot be generated locally."
+  #
+  # BUG FIX (10.16): this used to sed `^password=` and `^AuthPass=` -- msmtp's
+  # and an old PHPMailer config's names. WASP's smtp.ini has neither: it holds
+  # `pass_b64 = <base64>`. The sed matched nothing, the file was rewritten
+  # unchanged, and the command printed ✔. The site kept authenticating with
+  # the OLD password, failed every login, and the relay's brute-force guard
+  # banned the whole premises -- every site behind that address lost mail.
+  # The sed replacement was also unsafe on its own terms: `&` and `#` in a
+  # password are special there.
+  #
+  # Now: the value is base64-encoded (so no character in it is special to
+  # anything), the one pass_b64 line is replaced, the result is decoded back
+  # and compared before it is kept, and the old file is restored if not.
+  #
+  # The password may be given as an argument (compatible with earlier
+  # releases) but is better typed at the prompt: an argument is visible in
+  # `ps` while this runs and lands in the shell history.
+  _new="${2:-}"
+  _f="${SECRETS}/smtp.ini"
+  if [ ! -f "$_f" ]; then
+    if [ -f "${SECRETS}/smtp.php" ]; then
+      _bad "This VM still has the legacy smtp.php. Migrate it, which also sets the password:"
+      _note "  wp-mail.sh setup"
+    else
+      _bad "No ${_f} — mail was never configured. Set it up with:"
+      _note "  wp-mail.sh setup"
+    fi
     exit 1
   fi
-  [ -f "${SECRETS}/smtp.ini" ] || { _bad "No ${SECRETS}/smtp.ini"; exit 1; }
+  grep -qE '^[[:space:]]*pass_b64[[:space:]]*=' "$_f" || {
+    _bad "${_f} has no pass_b64 line — it was not written by wp-mail.sh setup."
+    _note "Re-create it (it asks for every value):  wp-mail.sh setup"
+    exit 1; }
+  if [ -z "$_new" ]; then
+    if [ -t 0 ]; then
+      _note "Change it at your mail relay FIRST, then enter the new value here."
+      printf '  New SMTP password for %s: ' \
+        "$(sed -n 's/^[[:space:]]*user[[:space:]]*=[[:space:]]*//p' "$_f" | head -1)"
+      stty -echo 2>/dev/null; IFS= read -r _new; stty echo 2>/dev/null; echo
+      printf '  Again: '
+      stty -echo 2>/dev/null; IFS= read -r _new2; stty echo 2>/dev/null; echo
+      [ "$_new" = "$_new2" ] || { _bad "The two entries differ. Nothing changed."; exit 1; }
+    fi
+    if [ -z "$_new" ]; then
+      _bad "Supply the new password: run this at a terminal and type it when asked."
+      _note "Change it at your mail relay FIRST, then store the new value here."
+      _note "Unlike the database password, this one is owned by the relay, not"
+      _note "by this VM — so it cannot be generated locally."
+      exit 1
+    fi
+  fi
   _ts=$(_snapshot)
-  _tmp=$(mktemp)
-  # msmtp/PHPMailer ini: replace the password line, leave the rest.
-  sed "s#^password=.*#password=${_new}#; s#^AuthPass=.*#AuthPass=${_new}#" \
-    "${SECRETS}/smtp.ini" > "$_tmp" && cat "$_tmp" > "${SECRETS}/smtp.ini" && rm -f "$_tmp"
-  chmod 440 "${SECRETS}/smtp.ini"
-  chown root:33 "${SECRETS}/smtp.ini" 2>/dev/null || chown root:www-data "${SECRETS}/smtp.ini" 2>/dev/null || true
-  _ok "SMTP password updated (snapshot ${_ts})"
-  _note "Verify delivery end to end — a wrong password fails silently:"
+  _b64=$(printf '%s' "$_new" | base64 | tr -d '\n')
+  _tmp=$(mktemp) || exit 1
+  # base64 is [A-Za-z0-9+/=]: nothing in it is special to awk -v.
+  awk -v b="$_b64" '
+    /^[[:space:]]*pass_b64[[:space:]]*=/ { if (!done) { print "pass_b64 = " b; done = 1 }; next }
+    { print }' "$_f" > "$_tmp"
+  _back=$(sed -n 's/^[[:space:]]*pass_b64[[:space:]]*=[[:space:]]*//p' "$_tmp" | head -1 | base64 -d 2>/dev/null)
+  if [ "$_back" != "$_new" ]; then
+    rm -f "$_tmp"
+    _bad "The stored value did not decode back to what you entered. Nothing changed."
+    exit 1
+  fi
+  # In place: smtp.ini is read through a bind mount.
+  cat "$_tmp" > "$_f"; rm -f "$_tmp"
+  chmod 440 "$_f"
+  chown root:33 "$_f" 2>/dev/null || chown root:www-data "$_f" 2>/dev/null || true
+  podman exec wordpress sh -c 'command -v php >/dev/null && php -r "opcache_reset();" 2>/dev/null' >/dev/null 2>&1 || true
+  _ok "SMTP password stored and read back (snapshot ${_ts})"
+  _note "Verify delivery end to end — the relay is the only judge of a password:"
   _note "  wp-mail.sh test you@example.com"
+  _note "A wrong password is a failed login at the relay. Repeated, most relays"
+  _note "ban the sending address — and every site behind it."
   logger -t wasp-rotate "SMTP password rotated"
   ;;
 
@@ -248,7 +304,7 @@ all)
   "$0" db
   echo ""
   _warn "SMTP was NOT rotated — it needs the new value from your relay."
-  _note "  wp-rotate-secrets.sh smtp '<new>'"
+  _note "  wp-rotate-secrets.sh smtp     (prompts for it)"
   _warn "WordPress admin passwords were NOT rotated — do those in wp-admin, or:"
   _note "  wp-forensics.sh admins   # then reset each"
   ;;

@@ -26,10 +26,11 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root (or via doas)" >&2; exit 1
 fi
 
-MAN=/etc/wp-install/MANIFEST.sha256
-SIG=/etc/wp-install/MANIFEST.sha256.minisig
-PUB=/etc/wp-install/release.pub
-SRC=/etc/wp-install
+SRC="${WASP_INSTALL_DIR:-/etc/wp-install}"
+MAN="${SRC}/MANIFEST.sha256"
+SIG="${SRC}/MANIFEST.sha256.minisig"
+PUB="${SRC}/release.pub"
+BIN_DIR="${WASP_BIN_DIR:-/usr/local/bin}"
 
 echo ""
 echo "WASP tooling integrity"
@@ -58,7 +59,7 @@ fi
 # they came from, then that payload against the signed manifest. Both halves
 # matter: an attacker is far more likely to edit the script that actually runs.
 _diff=0
-for f in /usr/local/bin/*.sh; do
+for f in "$BIN_DIR"/*.sh; do
   b=$(basename "$f")
   src="${SRC}/payload/bin/${b}"
   [ -r "$src" ] || continue
@@ -71,12 +72,29 @@ done
 [ "$_diff" -eq 0 ] && echo "  ✔ All installed tools match their staged originals"
 
 echo "  Checking staged payload against the signed manifest…"
-_bad=$(cd "$SRC" 2>/dev/null && sha256sum -c --quiet MANIFEST.sha256 2>&1 | grep -c "FAILED") || _bad=0
-if [ "${_bad:-0}" -eq 0 ]; then
-  echo "  ✔ Staged payload matches the signed manifest"
+# The manifest covers the whole release: install.sh, lib/ and hive/ run on the
+# Proxmox host (or the Hive) and are never copied to this VM, and payload/
+# stages/ is staged as stages/. Checking the manifest as it stands reported
+# every one of those as FAILED on every VM -- a permanent discrepancy, which
+# since 10.16 would have been emailed weekly and then, rightly, ignored. Only
+# what a WordPress VM keeps is checked, under the name it is kept as. The
+# signature above still covers the whole manifest, so a narrowed check cannot
+# be fed a forged list.
+_vm_man=$(mktemp) || exit 1
+awk '{ p = $2; sub(/^\*/, "", p)
+       if (p ~ /^payload\/stages\//) { sub(/^payload\/stages\//, "stages/", p); print $1 "  " p; next }
+       if (p ~ /^payload\/[^\/]+\//) print $1 "  " p }' "$MAN" > "$_vm_man"
+_n=$(grep -c . "$_vm_man") || _n=0
+_res=$(cd "$SRC" 2>/dev/null && sha256sum -c "$_vm_man" 2>&1 | grep -v ': OK$' | grep -i 'FAILED\|No such\|can.t open') || _res=""
+_bad=$(printf '%s\n' "$_res" | grep -ci 'FAILED') || _bad=0
+rm -f "$_vm_man"
+if [ "${_n:-0}" -eq 0 ]; then
+  echo "  ⚠ The manifest lists no payload files; nothing staged was checked."
+elif [ "${_bad:-0}" -eq 0 ]; then
+  echo "  ✔ Staged payload matches the signed manifest (${_n} files)"
 else
   echo "  ✗ ${_bad} staged file(s) do NOT match the signed manifest"
-  (cd "$SRC" && sha256sum -c --quiet MANIFEST.sha256 2>&1 | grep FAILED | sed 's/^/      /')
+  printf '%s\n' "$_res" | grep -i 'FAILED' | sed 's/^/      /'
   _diff=$((_diff+_bad))
 fi
 

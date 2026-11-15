@@ -33,7 +33,7 @@ set -u
 # WASP's own mu-plugins. Anything else at the top of mu-plugins on a WASP VM
 # was put there by someone else. test/test-threats.sh checks this list against
 # payload/mu-plugins/ so the two cannot drift.
-WASP_MU="00-wpvm-login-slug.php 01-wpvm-smtp.php 02-wpvm-login-guard.php 03-wpvm-mfa-enforce.php 05-wasp-contact.php 06-wasp-username-privacy.php"
+WASP_MU="00-wpvm-login-slug.php 01-wpvm-smtp.php 02-wpvm-login-guard.php 03-wpvm-mfa-enforce.php 05-wasp-contact.php 06-wasp-username-privacy.php 07-wasp-alerts.php"
 
 # Extensions that stop PHP running. Kept identical to inspect's listing check.
 RENAMED_RE='\.(php[0-9]?|phtml|phar)(\.(bak|bk|old|orig|save|sav|back|backup|copy|disabled?|off|suspected|quarantined?|infected|hacked|malware|txt|tmp)|~)$'
@@ -107,7 +107,7 @@ suspect-users)
       }
     }' ;;
 
-dump-users|dump-caps)
+dump-users|dump-caps|dump-posts|dump-appwd)
   # Rows out of an SQL dump, without loading it: a small tokenizer for
   # INSERT ... VALUES (...),(...); in either quote style (mysqldump writes
   # single quotes, phpMyAdmin and several backup plugins double) and across
@@ -115,9 +115,11 @@ dump-users|dump-caps)
   # honoured; without one, WordPress's column order is assumed.
   #   dump-users  id<TAB>login<TAB>email<TAB>registered
   #   dump-caps   user_id<TAB>capabilities   (every *capabilities meta row)
+  #   dump-posts  id<TAB>type<TAB>status<TAB>title<TAB>name   (10.18: spam titles and addresses)
+  #   dump-appwd  user_id<TAB>count<TAB>names    (10.18: application passwords, never their hashes)
   # Give the table prefix when it is known; otherwise any table ending in
   # users/usermeta is read, which a plugin's own *_users table could confuse.
-  _mode=users; [ "$1" = dump-caps ] && _mode=caps
+  _mode=${1#dump-}
   _pfx=$(printf '%s' "${2:-}" | tr -cd 'A-Za-z0-9_')
   awk -v mode="$_mode" -v pfx="$_pfx" '
     function emit(   a, b, c, d) {
@@ -125,15 +127,30 @@ dump-users|dump-caps)
         a=f[ci["ID"]]; b=f[ci["user_login"]]; c=f[ci["user_email"]]; d=f[ci["user_registered"]]
         gsub(/[\t\r\n]/, " ", b); gsub(/[\t\r\n]/, " ", c)
         printf "%s\t%s\t%s\t%s\n", a, b, c, d
-      } else if (f[ci["meta_key"]] ~ /capabilities$/) {
+      } else if (mode == "caps" && f[ci["meta_key"]] ~ /capabilities$/) {
         d=f[ci["meta_value"]]; gsub(/[\t\r\n]/, " ", d)
         printf "%s\t%s\n", f[ci["user_id"]], d
+      } else if (mode == "posts") {
+        b=f[ci["post_title"]]; gsub(/[\t\r\n]/, " ", b)
+        printf "%s\t%s\t%s\t%s\t%s\n", f[ci["ID"]], f[ci["post_type"]], f[ci["post_status"]], b, f[ci["post_name"]]
+      } else if (mode == "appwd" && f[ci["meta_key"]] == "_application_passwords") {
+        # A serialized list: a:N:{...}. Its names are labels the owner typed;
+        # the password hashes are never printed.
+        d=f[ci["meta_value"]]; n=0; names=""
+        if (match(d, /^a:[0-9]+:/)) n=substr(d, 3, RLENGTH-3) + 0
+        while (match(d, /s:4:"name";s:[0-9]+:"[^"]*"/)) {
+          x=substr(d, RSTART, RLENGTH); sub(/^s:4:"name";s:[0-9]+:"/, "", x); sub(/"$/, "", x)
+          gsub(/[\t\r\n,]/, " ", x); names=names (names == "" ? "" : ", ") x
+          d=substr(d, RSTART+RLENGTH)
+        }
+        if (n > 0) printf "%s\t%s\t%s\n", f[ci["user_id"]], n, names
       }
     }
     function setcols(list,   n, a, i) {
       split("", ci)
       if (list == "") {
         if (mode == "users") { ci["ID"]=1; ci["user_login"]=2; ci["user_email"]=5; ci["user_registered"]=7 }
+        else if (mode == "posts") { ci["ID"]=1; ci["post_title"]=6; ci["post_status"]=8; ci["post_name"]=12; ci["post_type"]=21 }
         else { ci["user_id"]=2; ci["meta_key"]=3; ci["meta_value"]=4 }
         return
       }
@@ -160,7 +177,7 @@ dump-users|dump-caps)
       if (instr) buf=buf " "
     }
     BEGIN {
-      t = (mode == "users") ? "users" : "usermeta"
+      t = (mode == "users") ? "users" : (mode == "posts") ? "posts" : "usermeta"
       head = "^((INSERT|REPLACE)( IGNORE)? INTO) [`\"]?" (pfx != "" ? pfx : "[A-Za-z0-9_]*") t "[`\"]?"
     }
     active { feed($0); next }

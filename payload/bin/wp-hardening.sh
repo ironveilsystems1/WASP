@@ -98,7 +98,7 @@ show_status() {
   echo ""
   echo "Commands: enable|disable [8g|xmlrpc|uploads-php|debug|author-enum]"
   echo "          egress-list | egress-allow <port> [tcp|udp] | egress-deny <port>"
-  echo "          geoip-test [ip] | proxy-check | nginx-snippet"
+  echo "          geoip-test [ip] | proxy-check | remoteip-fix [--check] | nginx-snippet"
   echo "          exceptions | exceptions-check"
   echo "          admin-rule [show|strict|simple] | security-txt <contact>"
   echo "          web-list | web-allow <ip> | web-deny <ip>"
@@ -800,7 +800,7 @@ SNIPPET
     printf '# REPLACE, not append. $proxy_add_x_forwarded_for appends to\n'
     printf '# whatever the CLIENT sent, so a forged header arrives as\n'
     printf '# "<forged>, <real>". mod_remoteip should still pick the right one,\n'
-    printf '# but only if RemoteIPTrustedProxy is exactly right. Replacing it\n'
+    printf '# but only if RemoteIPInternalProxy is exactly right. Replacing it\n'
     printf '# states the truth and removes the class of bug entirely.\n'
     printf 'proxy_set_header X-Forwarded-For   $remote_addr;\n'
     printf 'proxy_set_header X-Forwarded-Proto $scheme;\n\n'
@@ -855,7 +855,7 @@ SNIPPET
     printf '    #   $proxy_add_x_forwarded_for\n'
     printf '    # which appends to whatever the CLIENT sent, so a forged header\n'
     printf '    # arrives as "<forged>, <real>". mod_remoteip should still pick\n'
-    printf '    # the right one, but only if RemoteIPTrustedProxy is exactly\n'
+    printf '    # the right one, but only if RemoteIPInternalProxy is exactly\n'
     printf '    # right. Replacing it states the truth and removes the class.\n'
     printf '    proxy_set_header X-Forwarded-For   $remote_addr;\n'
     printf '    proxy_set_header X-Forwarded-Proto $scheme;\n'
@@ -1643,6 +1643,142 @@ SNIPPET2
       *) echo "Usage: wp-hardening.sh admin-rule [show|strict|simple]" >&2; exit 1 ;;
     esac ;;
 
+  remoteip-fix)
+    # Repairs a VM provisioned by 10.14 or earlier, whose wp-admin returns
+    # Apache's 403 to an administrator who arrives through the proxy from a
+    # PRIVATE address (LAN, or an overlay such as NetBird masquerading onto it).
+    #
+    # Those versions declared the proxy with RemoteIPTrustedProxy, which
+    # discards private X-Forwarded-For values ("appears to be a private IP or
+    # nonsensical. Ignored"), so Apache kept the proxy as the client and the
+    # `Require not ip <proxy>` guard denied it. They also wrote the same
+    # directive into a SECOND mounted file, mods-enabled/remoteip.conf -- and
+    # mod_remoteip's proxy lists append, so correcting one file alone changed
+    # nothing.
+    #
+    # The repair: wp-security.conf declares RemoteIPInternalProxy <PROXY_IP>
+    # (one literal address -- TRUST-COUNT is unchanged), and the mods-enabled
+    # file becomes a directive-free mask. Both are bind-mounted, so they are
+    # rewritten IN PLACE (`cat tmp > file`): sed -i or mv replaces the inode
+    # and the running container keeps reading the old file.
+    #
+    #   remoteip-fix           repair, configtest, restart, verify
+    #   remoteip-fix --check   report only; exit 1 if a repair is needed
+    _rf_sec="${WASP_RF_SEC:-$APACHE_CONF}"
+    _rf_mask="${WASP_RF_MASK:-/home/wpuser/wp/apache-mods/remoteip.conf}"
+    _rf_check=0; [ "${2:-}" = "--check" ] && _rf_check=1
+    echo ""
+    echo "mod_remoteip declaration"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ -z "${PROXY_IP:-}" ]; then
+      echo "  No PROXY_IP configured — mod_remoteip is not used. Nothing to do."
+      exit 0
+    fi
+    case "$PROXY_IP" in
+      */*|*,*|*[[:space:]]*)
+        echo "  ✗  PROXY_IP is '${PROXY_IP}' — a range or a list. The trusted proxy" >&2
+        echo "     must be ONE literal address; refusing to write it." >&2
+        exit 1 ;;
+    esac
+    echo "$PROXY_IP" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || {
+      echo "  ✗  PROXY_IP is '${PROXY_IP}', not an IPv4 address. Refusing." >&2; exit 1; }
+    [ -f "$_rf_sec" ] || { echo "  ✗  ${_rf_sec} not found." >&2; exit 1; }
+    _rf_re=$(printf '%s' "$PROXY_IP" | sed 's/\./\\./g')
+    _rf_legacy=0; _rf_maskdir=0; _rf_have=0
+    grep -qE '^[[:space:]]*RemoteIPTrustedProxy[[:space:]]' "$_rf_sec" && _rf_legacy=1
+    grep -qE "^[[:space:]]*RemoteIPInternalProxy[[:space:]]+${_rf_re}[[:space:]]*\$" "$_rf_sec" && _rf_have=1
+    [ -f "$_rf_mask" ] && grep -qE '^[[:space:]]*RemoteIP' "$_rf_mask" && _rf_maskdir=1
+    # Anything other than the one expected declaration is not something to
+    # rewrite by guessing: a hand-added range is exactly what TRUST-COUNT
+    # exists to refuse, and silently keeping or dropping it are both wrong.
+    _rf_other=$(grep -E '^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]' "$_rf_sec" \
+      | grep -vE "^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]+${_rf_re}[[:space:]]*\$" || true)
+    if [ -n "$_rf_other" ]; then
+      echo "  ✗  ${_rf_sec} declares a proxy other than ${PROXY_IP}:" >&2
+      printf '       %s\n' "$_rf_other" >&2
+      echo "     The trusted proxy must be one literal address, the one in PROXY_IP." >&2
+      echo "     Correct it by hand, then re-run this." >&2
+      exit 1
+    fi
+    if [ "$_rf_legacy" = 0 ] && [ "$_rf_maskdir" = 0 ] && [ "$_rf_have" = 1 ]; then
+      echo "  ✔  RemoteIPInternalProxy ${PROXY_IP}, declared once. Nothing to repair."
+      exit 0
+    fi
+    if [ "$_rf_legacy" = 0 ] && [ "$_rf_have" = 0 ]; then
+      echo "  ✗  ${_rf_sec} has no mod_remoteip proxy declaration at all." >&2
+      echo "     This is not the 10.14 shape; it was edited or never generated." >&2
+      echo "     Expected the line:  RemoteIPInternalProxy ${PROXY_IP}" >&2
+      exit 1
+    fi
+    [ "$_rf_legacy" = 1 ] && echo "  ⚠  wp-security.conf uses RemoteIPTrustedProxy (discards private client addresses)"
+    [ "$_rf_maskdir" = 1 ] && echo "  ⚠  ${_rf_mask} still configures mod_remoteip (a second declaration)"
+    echo "     Symptom: wp-admin returns Apache's 403 to an administrator arriving"
+    echo "     through ${PROXY_IP} from a LAN or overlay (e.g. NetBird) address."
+    if [ "$_rf_check" = 1 ]; then
+      echo "     Repair:  doas wp-hardening.sh remoteip-fix"
+      exit 1
+    fi
+    _rf_tmp=$(mktemp) || exit 1
+    _rf_bsec=$(mktemp) || exit 1
+    _rf_bmask=$(mktemp) || exit 1
+    cat "$_rf_sec" > "$_rf_bsec"
+    [ -f "$_rf_mask" ] && cat "$_rf_mask" > "$_rf_bmask"
+    _rf_restore() {
+      cat "$_rf_bsec" > "$_rf_sec"
+      [ -f "$_rf_mask" ] && cat "$_rf_bmask" > "$_rf_mask"
+      rm -f "$_rf_tmp" "$_rf_bsec" "$_rf_bmask"
+    }
+    sed "s/^\([[:space:]]*\)RemoteIPTrustedProxy[[:space:]][[:space:]]*${_rf_re}[[:space:]]*\$/\1RemoteIPInternalProxy ${PROXY_IP}/" \
+      "$_rf_sec" > "$_rf_tmp"
+    # In place: these files are bind-mounted into the container.
+    cat "$_rf_tmp" > "$_rf_sec"
+    [ -f "$_rf_mask" ] && \
+      printf '# masked: mod_remoteip is configured in conf-enabled/wp-security.conf\n' > "$_rf_mask"
+    if grep -qE '^[[:space:]]*RemoteIPTrustedProxy[[:space:]]' "$_rf_sec"; then
+      _rf_restore
+      echo "  ✗  RemoteIPTrustedProxy is still present after the rewrite. Restored the" >&2
+      echo "     original files; nothing changed." >&2
+      exit 1
+    fi
+    echo "  ✔  wp-security.conf: RemoteIPInternalProxy ${PROXY_IP}"
+    [ -f "$_rf_mask" ] && echo "  ✔  ${_rf_mask}: masked (no directives)"
+    _rf_ct=$(PRUN exec wordpress apache2ctl configtest 2>&1) || {
+      _rf_restore
+      echo "  ✗  apache2ctl configtest failed. Restored the original files; nothing" >&2
+      echo "     was restarted." >&2
+      printf '%s\n' "$_rf_ct" | sed 's/^/       /' >&2
+      exit 1; }
+    echo "  ✔  apache2ctl configtest: Syntax OK"
+    rm -f "$_rf_tmp" "$_rf_bsec" "$_rf_bmask"
+    PRUN restart wordpress >/dev/null 2>&1 || {
+      echo "  ✗  podman restart wordpress failed. The files are repaired; start the" >&2
+      echo "     container: rc-service wp-container restart" >&2
+      exit 1; }
+    echo "  ✔  WordPress restarted"
+    # Ask the running container what Apache actually reads: the only evidence
+    # that matters, since the 10.14 field fix looked right on disk and did not
+    # take effect.
+    _rf_live=$(PRUN exec wordpress sh -c \
+      "grep -rhE '^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]' /etc/apache2/ 2>/dev/null" \
+      2>/dev/null | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sort -u)
+    if [ "$_rf_live" = "RemoteIPInternalProxy ${PROXY_IP}" ]; then
+      echo "  ✔  Live: Apache reads exactly one declaration, RemoteIPInternalProxy ${PROXY_IP}"
+    else
+      echo "  ⚠  Live declarations in the container:"
+      printf '%s\n' "${_rf_live:-    (none read — the exec failed)}" | sed 's/^/       /'
+      echo "     Expected exactly: RemoteIPInternalProxy ${PROXY_IP}"
+      echo "     Check: podman inspect wordpress --format '{{range .Mounts}}{{.Destination}} {{end}}'"
+      exit 1
+    fi
+    echo ""
+    echo "  Next: open https://<site>/wp-admin/ from your admin path, then"
+    echo "        wp-hardening.sh proxy-check"
+    echo "  If the 403 page is a bare 'Forbidden' with nothing else, the PROXY refused"
+    echo "  you, not Apache: your browser reached it from an address its admin rule"
+    echo "  does not allow (usually public DNS hairpinning through the router)."
+    echo "  See README: 'Reaching wp-admin through the proxy'."
+    ;;
+
   proxy-check)
     # Answers the one question that decides every "works on the LAN IP but
     # not through the domain" report: what address does Apache believe the
@@ -1658,8 +1794,20 @@ SNIPPET2
       echo "  Apache uses the raw connection address as the client IP."
       exit 0
     fi
-    echo "  Trusted proxy (RemoteIPTrustedProxy) : ${PROXY_IP}"
+    echo "  Trusted proxy (RemoteIPInternalProxy): ${PROXY_IP}"
     echo "  wp-admin allowed                     : ${ADMIN_CIDR:-none} ${ALLOWED_ADMIN_IP:-}"
+    # 10.14 and earlier declared the proxy with RemoteIPTrustedProxy, in two
+    # files. Checked first because it decides the commonest report: Apache's
+    # 403 on wp-admin for an administrator on the LAN or an overlay.
+    if grep -qE '^[[:space:]]*RemoteIPTrustedProxy[[:space:]]' "$APACHE_CONF" 2>/dev/null \
+       || grep -qE '^[[:space:]]*RemoteIP' /home/wpuser/wp/apache-mods/remoteip.conf 2>/dev/null; then
+      echo ""
+      echo "  ⚠  Pre-10.15 mod_remoteip declaration (RemoteIPTrustedProxy, or a second"
+      echo "     declaration in apache-mods/remoteip.conf). It discards private client"
+      echo "     addresses, so an administrator arriving from the LAN or over an overlay"
+      echo "     such as NetBird is seen as the proxy and refused at wp-admin."
+      echo "     Repair:  doas wp-hardening.sh remoteip-fix"
+    fi
     echo ""
     if [ ! -s "$DBG" ]; then
       echo "  ${DBG} is empty."

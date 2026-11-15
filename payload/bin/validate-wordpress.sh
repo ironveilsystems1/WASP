@@ -564,6 +564,48 @@ case "$_rim" in
                "podman ps ; podman exec wordpress ls -l /etc/apache2/conf-enabled/remoteip.conf" ;;
 esac
 
+# 10.16: security alerts. Not a failure when absent -- an install without an
+# operator email has nowhere to send them -- but said, because the absence is
+# silent otherwise: nothing arrives, which looks the same as nothing happening.
+if [ -r /home/wpuser/wp/secrets/alerts.ini ] && \
+   grep -qE '^[[:space:]]*to[[:space:]]*=[[:space:]]*[^[:space:]]+@' /home/wpuser/wp/secrets/alerts.ini; then
+  pass "Security alerts set up ($(sed -n 's/^[[:space:]]*to[[:space:]]*=[[:space:]]*//p' /home/wpuser/wp/secrets/alerts.ini | head -1))"
+else
+  warn "Security alerts are not set up — no one is told when an administrator is added" \
+       "WordPress can email you when an administrator is added or signs in from a new address, when passwords, two-factor, plugins or key settings change, and when the site goes down." \
+       "wasp-alerts.sh setup you@example.com"
+fi
+
+# 10.15: the proxy is declared ONCE, as RemoteIPInternalProxy. A VM built by
+# 10.14 or earlier declared it with RemoteIPTrustedProxy (in two files), which
+# discards a private client address -- so an administrator on the LAN or an
+# overlay is seen as the proxy and refused at wp-admin, while every internet
+# visitor is substituted correctly and the site looks healthy. Asked of the
+# running container: the 10.14 hand fix looked right on disk and did not take
+# effect until the second file was masked too. The END marker separates "the
+# exec ran and found nothing" from "the exec failed".
+if [ -n "${PROXY_IP:-}" ]; then
+  _rid_raw=$(podman exec wordpress sh -c \
+    "grep -rhE '^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]' /etc/apache2/ 2>/dev/null; echo END" \
+    2>/dev/null | tr -d '\r') || _rid_raw=""
+  _rid=$(printf '%s\n' "$_rid_raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^END$' | grep -v '^$' | sort -u)
+  if ! printf '%s\n' "$_rid_raw" | grep -q '^END$'; then
+    warn "Could not read the mod_remoteip declaration from the wordpress container" \
+         "Without it this check cannot tell which proxy Apache trusts, so it reports nothing rather than passing." \
+         "wp-hardening.sh proxy-check"
+  elif [ "$_rid" = "RemoteIPInternalProxy ${PROXY_IP}" ]; then
+    pass "mod_remoteip: one declaration, RemoteIPInternalProxy ${PROXY_IP}"
+  elif printf '%s\n' "$_rid" | grep -q '^RemoteIPTrustedProxy'; then
+    fail "mod_remoteip uses the pre-10.15 RemoteIPTrustedProxy declaration" \
+         "It discards private client addresses, so an administrator arriving through ${PROXY_IP} from the LAN or an overlay (NetBird) is seen as the proxy and refused at wp-admin." \
+         "wp-hardening.sh remoteip-fix"
+  else
+    fail "mod_remoteip does not declare exactly the one proxy address" \
+         "Apache reads: $(printf '%s' "${_rid:-nothing}" | tr '\n' ';'). The trusted proxy must be ${PROXY_IP}, once; a range lets any host inside it forge the client address, and none means every visitor looks like the proxy." \
+         "wp-hardening.sh remoteip-fix"
+  fi
+fi
+
 # The daily vulnerability scan alerts when it fails, but only if it can tell, and
 # a VM with no source at all has nothing to fail. Read from the scan's own record.
 _vsc=/etc/wp-install/vuln-sources.conf

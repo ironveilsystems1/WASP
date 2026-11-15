@@ -146,6 +146,21 @@ fi
 
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-vuln-cron.sh" /usr/local/bin/wp-vuln-cron.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wp-notify.sh" /usr/local/bin/wp-notify.sh
+# Security alerts: settings, test, and the host-side watches (site down,
+# administrators in the database, modified files). setup --quiet writes
+# alerts.ini from the operator email given at install; with none given it logs
+# that and leaves alerts off rather than guessing an address.
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-alerts.sh" /usr/local/bin/wasp-alerts.sh
+# Content spam and broken links (10.17). The content scanner it runs is
+# php-tools/wasp-content-scan.php, read from the staged payload and piped into
+# the wordpress container: nothing is added to the site itself.
+install -m 0755 "${PAYLOAD_DIR}/bin/wp-links.sh" /usr/local/bin/wp-links.sh
+# Upgrades to later releases (10.18): verified against the key pinned on this
+# VM, planned, backed up, applied from payload/upgrade/files.map, rolled back
+# on request. Replaces the per-release blocks of commands pasted by hand.
+install -m 0755 "${PAYLOAD_DIR}/bin/wasp-upgrade.sh" /usr/local/bin/wasp-upgrade.sh
+mkdir -p /var/lib/wasp-upgrade && chmod 0700 /var/lib/wasp-upgrade
+/usr/local/bin/wasp-alerts.sh setup --quiet || true
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-selftest.sh" /usr/local/bin/wasp-selftest.sh
 install -m 0755 "${PAYLOAD_DIR}/bin/wasp-verify-integrity.sh" /usr/local/bin/wasp-verify-integrity.sh
 [ -f "${PAYLOAD_DIR}/bin/wasp-testreport.sh" ] && \

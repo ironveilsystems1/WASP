@@ -1,0 +1,36 @@
+# files.map — what wasp-upgrade.sh may change on a WordPress VM, and how.
+#
+# Read from the NEW release, so a release that adds a file says where it goes.
+# One entry per line:  kind  source-under-payload/  destination  mode  owner
+#
+#   tool   replaced. Refused (unless --force) when the installed copy differs
+#          from the staged copy it was installed from: an edited tool that runs
+#          as root on a schedule is evidence, not something to overwrite.
+#          A tool the new release no longer ships is removed, on the same terms.
+#   file   replaced when the installed copy still matches the staged original,
+#          installed when missing; a copy changed on this VM is kept and named.
+#   mu     a WordPress must-use plugin. Rendered with the values this VM already
+#          runs with (login slug, two-factor enforcement and grace), checked by
+#          PHP inside the wordpress container, then replaced. 00-wpvm-login-slug
+#          only where a custom login slug is in use.
+#   cron   lines reconciled into /etc/crontabs/root: added when missing, removed
+#          when an earlier release shipped them and this one does not (or they
+#          are listed in cron-retired.txt). A line whose schedule was changed
+#          on this VM is left alone and named. "if-present" files are only
+#          reconciled where one of their lines is already installed.
+#
+# Everything else under payload/ (Apache, PHP, MariaDB, CrowdSec, Squid, init
+# scripts, sysctl, templates) was written at build time, often with this VM's
+# own values substituted in. Those are staged with the release and REPORTED
+# when they change, never replaced: the CHANGELOG says whether one needs action.
+# test/check-upgrade-map.py fails when a stage installs a payload file that is
+# neither listed here nor one of those build-time directories.
+
+tool  bin/*.sh                        /usr/local/bin/                               0755  0:0
+file  malware/wp-malware.yar          /etc/wp-install/malware/wp-malware.yar        0644  0:0
+file  malware/wp-malware-uploads.yar  /etc/wp-install/malware/wp-malware-uploads.yar 0644 0:0
+file  lib/wasp-wpress-reader.php      /usr/local/lib/wasp/wasp-wpress-reader.php    0644  0:0
+file  etc/logrotate.d/wordpress-vm    /etc/logrotate.d/wordpress-vm                 0644  0:0
+mu    mu-plugins/*.php                /home/wpuser/wp/html/wp-content/mu-plugins/   0644  33:33
+cron  cron/wordpress-vm.cron          always
+cron  cron/lynis-audit.cron           if-present

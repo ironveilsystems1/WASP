@@ -164,7 +164,7 @@ send_mail() {
             --user="$_user" --from="$_from" \
             --passwordeval="$_pwcmd" \
             --read-envelope-from=off \
-            "$_to" 2>"$STATE/last-error" \
+            $(printf '%s' "$_to" | tr ',' ' ') 2>"$STATE/last-error" \
     && { logger -t wp-notify "sent: ${_subject} -> ${_to}"; return 0; } \
     || { logger -t wp-notify "SEND FAILED: ${_subject} ($(head -1 "$STATE/last-error" 2>/dev/null))"; return 1; }
 }

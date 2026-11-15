@@ -251,7 +251,7 @@ if [ -n "${WP_DOMAIN:-}" ]; then
     # unconditionally would let a direct caller assert "this was https"
     # and flip FORCE_SSL_ADMIN's protection off for their own session.
     # PROXY_IP is the same trust signal Apache's mod_remoteip already
-    # uses for X-Forwarded-For (see RemoteIPTrustedProxy in the generated
+    # uses for X-Forwarded-For (see RemoteIPInternalProxy in the generated
     # Apache config), so the two stay consistent: header trust is granted
     # in exactly one place, for exactly one configured proxy.
     if [ -n "${PROXY_IP:-}" ]; then
@@ -400,6 +400,13 @@ install -m 0644 "${PAYLOAD_DIR}/mu-plugins/05-wasp-contact.php" \
   "${SMTP_MU_DIR}/05-wasp-contact.php" 2>/dev/null || true
 install -m 0644 "${PAYLOAD_DIR}/mu-plugins/06-wasp-username-privacy.php" \
   "${SMTP_MU_DIR}/06-wasp-username-privacy.php" 2>/dev/null || true
+# Security alerts (10.16): emails the operator when an administrator is
+# added or signs in from a new address, credentials, two-factor, plugins or
+# key settings change. Inert until alerts.ini exists (stage 08 writes it from
+# the operator email given at install), so it costs nothing on a VM without.
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/07-wasp-alerts.php" \
+  "${SMTP_MU_DIR}/07-wasp-alerts.php" 2>/dev/null || true
+chown 33:33 "${SMTP_MU_DIR}/07-wasp-alerts.php" 2>/dev/null || true
 chown 33:33 "${SMTP_MU_DIR}/06-wasp-username-privacy.php" 2>/dev/null || true
 chown 33:33 "${SMTP_MU_DIR}/05-wasp-contact.php" 2>/dev/null || true
 # Login rate-limiting. Unconditional and in the same block as the SMTP
@@ -542,7 +549,9 @@ WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/apache-mods/headers.load:/etc/apa
 # Mount 8G Firewall .htaccess as :rw — WordPress updates permalink rules
 # inside the # BEGIN/END WordPress markers without touching the 8G section above.
 WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/htaccess/.htaccess:/var/www/html/.htaccess:rw"
-# Only mount remoteip.conf if a trusted proxy IP was configured (sets RemoteIPTrustedProxy).
+# Only mount remoteip.conf if a trusted proxy IP was configured. Since 10.15 it
+# is a directive-free MASK over mods-enabled/remoteip.conf; the one live
+# declaration (RemoteIPInternalProxy, one address) is in wp-security.conf.
 if [ -f /home/wpuser/wp/apache-mods/remoteip.conf ]; then
   WP_VOL_ARGS="${WP_VOL_ARGS} -v /home/wpuser/wp/apache-mods/remoteip.conf:/etc/apache2/mods-enabled/remoteip.conf:ro"
 fi
@@ -615,7 +624,7 @@ ok "Container: $(podman ps --filter name='^wordpress$' --format '{{.Status}}' 2>
 #
 # SECURITY: it means Apache accepts X-Forwarded-For from ANY private address,
 # not only the configured proxy -- including 10.89.10.0/24, the container
-# network. RemoteIPTrustedProxy in wp-security.conf is meant to BE the
+# network. RemoteIPInternalProxy in wp-security.conf -- ONE address -- is the
 # allowlist; this silently widens it to every RFC1918 source that can reach
 # port 80. Defence in depth is the point of naming one trusted proxy.
 #
@@ -666,7 +675,7 @@ _verify_remoteip_mask() {
   case "$_rim" in
     masked)
       ok "  Image default remoteip.conf masked (it trusted all of RFC1918)${1:+ — $1}"
-      ok "  RemoteIPTrustedProxy in wp-security.conf is now the only allowlist" ;;
+      ok "  RemoteIPInternalProxy in wp-security.conf is now the only allowlist" ;;
     active)
       warn "  The image's default remoteip.conf is STILL ACTIVE${1:+ — $1}."
       warn "  Apache will accept X-Forwarded-For from any private address, not"

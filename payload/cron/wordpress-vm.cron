@@ -100,7 +100,21 @@
 0 9 * * * /usr/local/bin/wp-hardening.sh tls-check >/dev/null 2>&1
 
 # Weekly file-integrity check: core and plugin files vs WordPress.org
-# checksums. Detects a backdoor injected into an existing plugin, which is how
-# most WordPress compromises persist. Output goes to syslog tagged
-# wasp-integrity in key=value form for a SIEM to decode; a FAIL is auth.crit.
-30 4 * * 1 /usr/local/bin/wp-plugins.sh verify >/dev/null 2>&1
+# checksums, and WASP's own tools vs the signed release. Detects a backdoor
+# injected into an existing plugin, which is how most WordPress compromises
+# persist. Output still goes to syslog tagged wasp-integrity in key=value form
+# for a SIEM (a FAIL is auth.crit); since 10.16 a failure is also EMAILED --
+# until then it waited in the log for someone to look.
+30 4 * * 1 /usr/local/bin/wasp-alerts.sh watch-integrity >/dev/null 2>&1
+
+# Security alerts, host side (10.16). WordPress emails what happens THROUGH it
+# (07-wasp-alerts.php); these cover what it cannot report about itself.
+# Site down: two failed health checks in a row (10 min), then recovery.
+*/5 * * * * /usr/local/bin/wasp-alerts.sh watch-site >/dev/null 2>&1
+# Administrators as the DATABASE lists them -- catches one inserted with SQL,
+# which passes through no WordPress hook. Hourly.
+17 * * * * /usr/local/bin/wasp-alerts.sh watch-admins >/dev/null 2>&1
+# Spam links in the content (10.17), weekly. Injected links are content, not
+# files: no malware scan sees them. Emailed only when found (content_spam in
+# alerts.ini); the same findings are re-sent at most once a day.
+40 4 * * 2 /usr/local/bin/wp-links.sh spam --notify >/dev/null 2>&1

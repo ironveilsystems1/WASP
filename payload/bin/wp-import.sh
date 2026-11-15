@@ -9,6 +9,7 @@
 #   wp-import.sh inspect <file>        what is inside it — NOTHING is extracted
 #   wp-import.sh extract <file>        unpack to staging, outside the docroot
 #   wp-import.sh scan [id]             scan staged files AND the dump
+#   wp-import.sh report [id]           the saved scan report, every file named
 #   wp-import.sh staged                what is currently staged
 #   wp-import.sh apply [id]            normalise, import, re-harden, remediate
 #                [--accept-findings] [--force] [--no-remediate] [--keep-files]
@@ -820,9 +821,13 @@ extract)
   _f=$(_abs "$_f")
   _upx=$(_updraft_prefix "$_f")
   _is_wpress=0
+  # Set for an UpdraftPlus set, whose dump is a known part (-db.gz) copied
+  # into db/ directly. Read by the dump sweep below, which must not run here.
+  _is_updraft=0
 
   if [ -n "$_upx" ]; then
   # ── UpdraftPlus: every part of the set into ONE staging set ──────────────
+  _is_updraft=1
   _updir=$(dirname "$_f")
   echo ""
   _updraft_report "$_updir" "$_upx" || { _bad "This set cannot be imported as it is."; exit 3; }
@@ -1068,10 +1073,13 @@ extract)
   # eighteen months older than the operator believed. Collect them all and,
   # when there is more than one, refuse to guess.
   #
-  # Not for .wpress: its dump is one known member, already in db/. Sweeping the
-  # tree there would pull schema.sql out of any plugin that ships one, breaking
-  # the plugin and tripping the several-dumps refusal below.
-  [ "$_is_wpress" = 1 ] || find "${_st}/files" -maxdepth 8 \
+  # Not for .wpress, and not for an UpdraftPlus set: in both the dump is one
+  # known part, already in db/. Sweeping the tree pulls out any .sql a plugin
+  # ships as data. 10.14 did exactly that to a real UpdraftPlus set: LiteSpeed
+  # Cache's src/data_structure/*.sql (six table definitions) were moved out of
+  # the plugin -- breaking it -- and then the several-dumps refusal below
+  # stopped the import over "7 dumps", six of which were not dumps at all.
+  [ "$_is_wpress" = 1 ] || [ "$_is_updraft" = 1 ] || find "${_st}/files" -maxdepth 8 \
     \( -name '*.sql' -o -name '*.sql.gz' -o -name '*-db.gz' -o -name '*.sql.bz2' \) \
     -exec mv {} "${_st}/db/" \; 2>/dev/null || true
 
@@ -1122,14 +1130,56 @@ extract)
 
 # ── Scan ─────────────────────────────────────────────────────────────────────
 scan)
+  # 10.17: the scan's output is also SAVED, as plain text, beside the staged
+  # set -- meta/scan-report.txt, shown by `wp-import.sh report`. The verdict
+  # used to point at that command, and the command did not exist: the only
+  # copy of a long scan was whatever was left in the terminal's scrollback.
   _id="${2:-}"
   [ -n "$_id" ] || _id=$(cat "${STAGING}/.latest" 2>/dev/null)
   [ -n "$_id" ] || { echo "Usage: wp-import.sh scan <id>   (wp-import.sh staged)" >&2; exit 1; }
   _st="${STAGING}/${_id}"
   [ -d "$_st" ] || { _bad "No staging directory ${_id}"; exit 1; }
+  mkdir -p "${_st}/meta"
+  _rcf=$(mktemp) || exit 3
+  _log=$(mktemp) || exit 3
+  { sh "$0" __scan "$_id"; echo $? > "$_rcf"; } 2>&1 | tee "$_log"
+  _src=$(cat "$_rcf" 2>/dev/null); _src=${_src:-3}
+  _esc=$(printf '\033')
+  { printf 'WASP import scan report\n'
+    printf 'Staged set : %s\n' "$_id"
+    printf 'Scanned    : %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    sed "s/${_esc}\[[0-9;]*m//g" "$_log"
+    if [ -s "${_st}/meta/file-findings.tsv" ]; then
+      printf '\n── Every file finding, full paths\n'
+      sed 's/\t/  |  /g' "${_st}/meta/file-findings.tsv" | sed 's/^/  /'
+    fi; } > "${_st}/meta/scan-report.txt"
+  rm -f "$_rcf" "$_log"
+  exit "$_src"
+  ;;
+
+report)
+  _id="${2:-}"
+  [ -n "$_id" ] || _id=$(cat "${STAGING}/.latest" 2>/dev/null)
+  [ -n "$_id" ] || { echo "Usage: wp-import.sh report <id>   (wp-import.sh staged)" >&2; exit 1; }
+  _r="${STAGING}/${_id}/meta/scan-report.txt"
+  if [ ! -f "$_r" ]; then
+    _bad "No saved scan for ${_id}. Scan it:  wp-import.sh scan ${_id}"
+    exit 1
+  fi
+  if [ -t 1 ] && command -v less >/dev/null 2>&1; then less -R "$_r"; else cat "$_r"; fi
+  ;;
+
+__scan)
+  _id="${2:-}"
+  _st="${STAGING}/${_id}"
+  [ -d "$_st" ] || { _bad "No staging directory ${_id}"; exit 1; }
 
   _hdr "Scanning ${_id}"
-  _crit=0; _high=0
+  _crit=0; _high=0; _susp=0
+  # The verdict at the end is built from these rows: severity, how many, what
+  # it is in plain words, and what happens to it.
+  _vt="${_st}/meta/verdict.tsv"; : > "$_vt"
+  _vadd() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$_vt"; }
 
   # ── Files: reuse the existing scanner against the staged tree ────────────
   # Pointed at the site root, not the top of the staging tree. See _site_root.
@@ -1141,18 +1191,38 @@ scan)
   elif [ "$_scanroot" != "${_st}/files" ]; then
     _note "Site root: ${_scanroot#${_st}/}"
   fi
+  _ff="${_st}/meta/file-findings.tsv"; : > "$_ff"
   if [ -x /usr/local/bin/wp-malware-scan.sh ]; then
     _note "File scan (structural + signatures) …"
     # This said "signatures" for years while running only `structural`.
     for _sc in structural yara; do
       # Both at the site root: it is what apply copies, and the uploads-only
       # YARA rules look for wp-content/uploads beneath --path.
-      _so=$(/usr/local/bin/wp-malware-scan.sh --path "$_scanroot" "$_sc" 2>&1)
-      printf '%s\n' "$_so" | sed 's/^/  /'
-      _mc=$(printf '%s\n' "$_so" | grep -c '\[CRITICAL\]') || _mc=0
-      _mh=$(printf '%s\n' "$_so" | grep -c '\[HIGH\]') || _mh=0
-      _crit=$(( _crit + _mc )); _high=$(( _high + _mh ))
+      _so=$(WASP_FINDINGS_OUT="$_ff" /usr/local/bin/wp-malware-scan.sh --path "$_scanroot" "$_sc" 2>&1)
+      printf '%s\n' "$_so" | grep -v '^── Summary\|critical [0-9]* *high [0-9]* *suspicious\|^$' \
+        | sed '/Action needed\./,$d; /Nothing critical found\./,$d; /Review the HIGH findings/,$d' | sed 's/^/  /'
     done
+    # Counted from the findings record, one row per file. Counting "[CRITICAL]"
+    # lines in the output stopped being a count once findings were grouped.
+    _crit=$(grep -c '^CRITICAL' "$_ff") || _crit=0
+    _high=$(grep -c '^HIGH' "$_ff") || _high=0
+    _susp=$(grep -c '^SUSPICIOUS' "$_ff") || _susp=0
+    # One verdict row per kind of finding: the headline with its path removed.
+    awk -F '\t' '{ k = $2; sub(/: \/.*/, "", k); print $1 "\t" k }' "$_ff" | sort | uniq -c \
+      | while read -r _n _rest; do
+          _sev=$(printf '%s' "$_rest" | cut -f1); _k=$(printf '%s' "$_rest" | cut -f2)
+          case "$_k" in
+            "Executable PHP inside uploads") _w="PHP file(s) where only images and documents belong (uploads)" ;;
+            "Handler override in uploads")   _w="server setting(s) in uploads that would make files run as code" ;;
+            "Unexpected PHP at the top of wp-content") _w="unexpected PHP file(s) beside the content folders" ;;
+            *) _w="$_k: $(/usr/local/bin/wp-malware-scan.sh explain "$_k" 2>/dev/null || echo "$_k")" ;;
+          esac
+          case "$_sev" in
+            CRITICAL)   _vadd CRITICAL "$_n" "$_w" "quarantined at import, not copied into the site" ;;
+            HIGH)       _vadd HIGH "$_n" "$_w" "look at each file before importing (report lists them)" ;;
+            SUSPICIOUS) _vadd REVIEW "$_n" "$_w" "usually harmless; listed in the report" ;;
+          esac
+        done
   else
     _warn "wp-malware-scan.sh not available — file scan skipped"
   fi
@@ -1180,6 +1250,7 @@ scan)
         _bad "${_ao} option row(s) contain code"
         _note "Autoloaded options run on EVERY page load and survive a file clean."
         _crit=$(( _crit + _ao ))
+        _vadd CRITICAL "$_ao" "site setting(s) containing code, which runs on every page" "find them after import: wp-malware-scan.sh db"
       else _ok "No code in option rows"; fi
 
       # Scheduled events. A backdoor here re-creates files after you clean
@@ -1195,6 +1266,7 @@ scan)
         _note "This is the persistence mechanism that makes malware appear to"
         _note "return after cleaning. The cron option is cleared at import."
         _high=$(( _high + 1 ))
+        _vadd HIGH 1 "suspicious scheduled task (how malware comes back after a clean)" "cleared at import"
       else _ok "Scheduled tasks look ordinary"; fi
 
       # Accounts, by name. "17 row(s) mention administrator" is what this used
@@ -1223,18 +1295,120 @@ scan)
           _note "Locked automatically at apply (role removed, password and e-mail replaced),"
           _note "not deleted. Review afterwards: wp-forensics.sh admins"
           _high=$(( _high + $(printf '%s\n' "$_usus" | grep -c .) ))
+          _vadd HIGH "$(printf '%s\n' "$_usus" | grep -c .)" "account(s) that look planted" "locked at import (not deleted); check: wp-forensics.sh admins"
         else
           _ok "No account shows two or more signs of being planted"
         fi
       fi
 
+      # ── Application passwords (10.18) ──
+      # API access that skips the login page and two-factor, and that changing
+      # the account's password does NOT revoke: rotating every password after a
+      # compromise leaves these working. Names and counts only, never hashes.
+      _ap=$(_rd | sh "$THREATS" dump-appwd "$_upfx" 2>/dev/null)
+      if [ -n "$_ap" ]; then
+        _na=$(printf '%s\n' "$_ap" | awk -F '\t' '{ t += $2 } END { print t + 0 }')
+        _warn "${_na} application password(s) come with this site:"
+        printf '%s\n' "$_ap" | while IFS="$(printf '\t')" read -r _apu _apn _apl; do
+          _apl_login=$(printf '%s\n' "$_uu" | awk -F '\t' -v id="$_apu" '$1 == id { print $2 }' | head -1)
+          printf '       %-24s %s: %s\n' "${_apl_login:-user ${_apu}}" "$_apn" "${_apl:-(no names)}"
+        done
+        _note "They reach the site's API without the login page or two-factor, and a password"
+        _note "change does not revoke them. Keep the ones you recognise:  wp-forensics.sh app-passwords"
+        _susp=$(( ${_susp:-0} + 1 ))
+        _vadd REVIEW "$_na" "application password(s): API access past the login page and two-factor, kept through password changes" \
+          "after import: wp-forensics.sh app-passwords; revoke any nobody recognises"
+      else
+        _ok "No application passwords"
+      fi
+
       _sp=$(_rd | grep -ciE "<script[^>]*>(eval|document\.write|atob)") || _sp=0
       [ "${_sp:-0}" -gt 0 ] && { _warn "${_sp} row(s) contain inline script — often injected SEO spam"
-                                 _high=$(( _high + 1 )); } \
+                                 _high=$(( _high + 1 ))
+                                 _vadd HIGH "$_sp" "content row(s) with injected script" "remove after import; wp-links.sh spam helps find them"; } \
                             || _ok "No obvious injected script in content"
 
       _su=$(_rd | grep -oE "'siteurl','[^']*'" | head -1 | sed "s/.*,'//;s/'//")
       [ -n "$_su" ] && _note "Source siteurl: ${_su}  (rewritten at import)"
+
+      # ── Content: spam and injected links (10.17) ─────────────────────────
+      # The import that prompted this carried casino links into three live
+      # pages, a casino advert into a page title, and spam articles that Rank
+      # Math had announced to search engines. Every file and code check above
+      # passed: it is content, typed in through a valid session. Read here as
+      # text, before anything is loaded. JSON and SQL escaping is undone
+      # first, so a link stored inside Elementor's page data reads the same as
+      # one in a post. The patterns are wp-links.sh's (the content scanner's):
+      # test-links.sh holds the two lists together.
+      _spamhost='(casin|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)'
+      _spamslug='(casino|kasino|kasyno|kaszino|cassino|scommess|apuesta|gambling|poker|roulette|blackjack|jackpot|bookmaker|viagra|cialis|levitra|kamagra|porn|payday)'
+      _sh=$(printf '%s' "$_su" | sed -E 's#^[a-zA-Z]+://##; s#[/:].*$##; s#^www\.##' | tr 'A-Z' 'a-z')
+      _cn="${_st}/meta/content.txt"
+      _rd | sed 's#\\*/#/#g; s#\\*"#"#g' > "$_cn"
+      _hdr "Content: spam and injected links"
+      _dom=$(grep -oiE "href=[\"']https?://[^/\"' <>]+" "$_cn" | sed -E "s#^href=[\"']https?://##; s#:[0-9]+\$##; s#^www\.##" \
+             | tr 'A-Z' 'a-z' | grep -viE "^(${_sh:-.none.})\$" | grep -iE "$_spamhost" | sort | uniq -c | sort -rn)
+      _shs=$(grep -o 'data-sheets-root' "$_cn" | wc -l | tr -d ' ')
+      _hid=$(grep -oiE "<[a-z0-9]+[^>]*style=[\"'][^\"']*(display: ?none|visibility: ?hidden|left: ?-[0-9]{3,}px|font-size: ?0(px)?;)[^\"']*[\"'][^>]*>[^<]{0,300}<a " "$_cn" | wc -l | tr -d ' ')
+      _own=""
+      [ -n "$_sh" ] && _own=$(grep -oiE "https?://(www\.)?${_sh}/[^\"' <>]*" "$_cn" | sed 's/[),.;]*$//' \
+                              | grep -iE "/[^/]*${_spamslug}" | sort -u)
+      if [ -n "$_dom" ]; then
+        _nd=$(printf '%s\n' "$_dom" | grep -c .); _nl=$(printf '%s\n' "$_dom" | awk '{ t += $1 } END { print t + 0 }')
+        _bad "${_nl} link(s) to ${_nd} gambling/pharmacy/adult domain(s) in the site's content"
+        printf '%s\n' "$_dom" | head -10 | awk '{ printf "       %-40s %s\n", $2, $1 }'
+        [ "${_shs:-0}" -gt 0 ] && _note "${_shs} block(s) pasted from a Google Sheet: the usual trail of paid link placement."
+        _note "Counts include saved revisions. After import, each page and Elementor widget:"
+        _note "  wp-links.sh spam"
+        _high=$(( _high + 1 ))
+        _vadd HIGH "$_nl" "spam link(s) in page content, to: $(printf '%s\n' "$_dom" | awk '{ print $2 }' | head -3 | tr '\n' ' ')" \
+          "imported as content; remove after import (wp-links.sh spam names each page and widget)"
+      else
+        _ok "No links to gambling, pharmacy or adult sites"
+      fi
+      if [ "${_hid:-0}" -gt 0 ]; then
+        _warn "${_hid} link(s) inside content hidden with CSS — visible to search engines, not to visitors"
+        _high=$(( _high + 1 ))
+        _vadd HIGH "$_hid" "link(s) hidden with CSS" "remove after import (wp-links.sh spam)"
+      fi
+      if [ -n "$_own" ]; then
+        _no=$(printf '%s\n' "$_own" | grep -c .)
+        _bad "${_no} spam page address(es) on the site's own domain (articles, or URLs announced to search engines):"
+        printf '%s\n' "$_own" | head -8 | sed 's/^/       /'
+        [ "$_no" -gt 8 ] && _note "  … and $((_no - 8)) more (full list in the report)"
+        _high=$(( _high + 1 ))
+        _vadd HIGH "$_no" "spam page address(es) on the site's own domain" "delete the articles after import; ask search engines to drop the URLs"
+      elif [ -n "$_sh" ]; then
+        _ok "No spam page addresses on ${_sh}"
+      fi
+      # Titles and addresses from the posts table itself (10.18): an advert
+      # appended to a real page title, and spam articles by their address,
+      # with the post IDs that wp-links.sh clean takes after import.
+      _pr=$(_rd | sh "$THREATS" dump-posts "$_upfx" 2>/dev/null \
+            | awk -F '\t' '$2 != "revision" && $2 != "nav_menu_item" && $3 != "inherit" && $3 != "trash" && $3 != "auto-draft"')
+      # Whole words in titles: the ASCII part of the content scanner's wcs_spam_text_re.
+      _tw='(casino|casinos|kasino|kasinot|kasyno|cassino|scommess[a-z]*|apuestas?|gambling|poker|roulette|blackjack|jackpot|sportsbook|bookmaker|viagra|cialis|levitra|kamagra|sildenafil|tadalafil|porn[a-z]*|payday loans?)'
+      _ptit=$(printf '%s\n' "$_pr" | awk -F '\t' -v w="$_tw" 'NF { t = tolower($4); if (t ~ ("(^|[^a-z])" w "([^a-z]|$)")) print $1 "\t" $2 "\t" $4 }')
+      _pslug=$(printf '%s\n' "$_pr" | awk -F '\t' -v w="$_spamslug" '($2 == "post" || $2 == "page") && tolower($5) ~ w { print $1 "\t" $2 "\t" $5 }')
+      if [ -n "$_ptit" ]; then
+        _nt=$(printf '%s\n' "$_ptit" | grep -c .)
+        _bad "${_nt} title(s) carry spam (an advert added to a real title shows in search results):"
+        printf '%s\n' "$_ptit" | head -8 | awk -F '\t' '{ printf "       %s %s: \"%s\"\n", $2, $1, substr($3, 1, 70) }'
+        _high=$(( _high + 1 ))
+        _vadd HIGH "$_nt" "title(s) carrying spam: post $(printf '%s\n' "$_ptit" | cut -f1 | head -4 | tr '\n' ' ')" \
+          "after import: wp-links.sh clean --title <id>=\"<real title>\""
+      else
+        _ok "No titles carry spam"
+      fi
+      if [ -n "$_pslug" ]; then
+        _ns=$(printf '%s\n' "$_pslug" | grep -c .)
+        _bad "${_ns} post(s) or page(s) whose address is spam:"
+        printf '%s\n' "$_pslug" | head -8 | awk -F '\t' '{ printf "       %s %s: /%s/\n", $2, $1, $3 }'
+        _high=$(( _high + 1 ))
+        _vadd HIGH "$_ns" "spam article(s) by address: post $(printf '%s\n' "$_pslug" | cut -f1 | head -6 | tr '\n' ',' | sed 's/,$//')" \
+          "after import: wp-links.sh clean --trash $(printf '%s\n' "$_pslug" | cut -f1 | tr '\n' ',' | sed 's/,$//')"
+      fi
+      rm -f "$_cn"
     done
   fi
 
@@ -1286,6 +1460,8 @@ scan)
     # through it, and an old site is the normal reason to be importing.
     if [ "${_vh:-0}" -gt 0 ]; then
       _high=$(( _high + _vh ))
+      _vadd HIGH "$_vh" "known vulnerabilit(ies): $(printf '%s\n' "$_vout" | sed -nE 's/^  \[(CRITICAL|HIGH)\] ([^ ]*) .*/\2/p' | sort -u | head -4 | tr '\n' ' ')" \
+        "update those plugins right after import"
       _warn "${_vh} serious known vulnerabilit(ies) in the staged site. Each is also a"
       _note "likely way in, if the source was compromised."
     fi
@@ -1298,31 +1474,60 @@ scan)
   fi
 
   # ── Verdict ──────────────────────────────────────────────────────────────
+  # 10.17: what was found, in words, each with what happens to it, and the
+  # next command. Before, the verdict was two numbers and a pointer to a
+  # report command that did not exist; what the numbers were had to be pieced
+  # together from everything above.
   _hdr "Verdict"
-  printf '  critical %s   high %s\n\n' "$_crit" "$_high"
+  if [ "$_crit" -gt 0 ]; then printf '  \033[1;31mACTION NEEDED\033[0m'
+  elif [ "$_high" -gt 0 ]; then printf '  \033[1;33mREVIEW BEFORE IMPORTING\033[0m'
+  else printf '  \033[1;32mCLEAN\033[0m'; fi
+  printf '   %s critical · %s high · %s to review\n' "$_crit" "$_high" "${_susp:-0}"
+  if [ -s "$_vt" ]; then
+    echo ""
+    for _sv in CRITICAL HIGH REVIEW; do
+      awk -F '\t' -v s="$_sv" '$1 == s' "$_vt" | while IFS="$(printf '\t')" read -r _s _n _w _a; do
+        case "$_s" in
+          CRITICAL) printf '  \033[31m✗ CRITICAL\033[0m  %s × %s\n' "$_n" "$_w" ;;
+          HIGH)     printf '  \033[33m⚠ HIGH\033[0m      %s × %s\n' "$_n" "$_w" ;;
+          *)        printf '  · review    %s × %s\n' "$_n" "$_w" ;;
+        esac
+        printf '              → %s\n' "$_a"
+      done
+    done
+  fi
+  echo ""
+  echo "  Next:"
+  if [ "$_crit" -gt 0 ]; then
+    echo "    1. Treat the source site as compromised: whatever placed these may also"
+    echo "       be in a plugin, a theme, an account or the content."
+    echo "    2. Import it to clean it, knowingly:  wp-import.sh apply ${_id} --force"
+    echo "    3. Afterwards: change every password, then  wp-malware-scan.sh full"
+    awk -F '\t' '$3 ~ /spam/' "$_vt" | grep -q . && echo "       and  wp-links.sh spam  for the content, then  wp-links.sh clean  to remove it."
+    awk -F '\t' '$3 ~ /application password/' "$_vt" | grep -q . && echo "       and  wp-forensics.sh app-passwords  (a password change does not revoke them)."
+  elif [ "$_high" -gt 0 ]; then
+    echo "    1. Read the items above (full detail: wp-import.sh report ${_id})."
+    echo "    2. Import:  wp-import.sh apply ${_id} --accept-findings"
+    awk -F '\t' '$3 ~ /spam/' "$_vt" | grep -q . && echo "    3. Afterwards:  wp-links.sh spam  shows each page and widget;  wp-links.sh clean  removes them."
+    awk -F '\t' '$3 ~ /application password/' "$_vt" | grep -q . && echo "       wp-forensics.sh app-passwords: keep only the ones you recognise."
+  else
+    echo "    Import:  wp-import.sh apply ${_id}"
+    awk -F '\t' '$3 ~ /application password/' "$_vt" | grep -q . && echo "    Afterwards:  wp-forensics.sh app-passwords  — keep only the ones you recognise."
+  fi
+  echo ""
+  echo "  Full report, every file named:  wp-import.sh report ${_id}"
+  echo ""
   {
     printf '%s  id=%s critical=%s high=%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_id" "$_crit" "$_high"
   } >> "${STAGING}/scan-log.txt"
 
-  if [ "$_crit" -gt 0 ]; then
-    _bad "CRITICAL findings. Import would carry a live compromise across."
-    _note "Flagged files are quarantined rather than imported, but the source"
-    _note "site should be treated as compromised: whatever put them there may"
-    _note "also be in a plugin, a theme, or the database."
-    _note ""
-    _note "  wp-import.sh report ${_id}      full detail"
-    _note "  wp-plugins.sh vulns             which plugin was the likely door"
-    exit 2
-  fi
-  if [ "$_high" -gt 0 ]; then
-    _warn "Findings worth reading before importing."
-    exit 1
-  fi
-  _ok "Nothing critical found in the staged content."
+  # The verdict above says it in words; the exit code says it to restore.
+  [ "$_crit" -gt 0 ] && exit 2
+  [ "$_high" -gt 0 ] && exit 1
   [ "${_vuln_unchecked:-0}" = 1 ] && _warn "Known-vulnerability check did not run or did not finish."
-  _note "That is a statement about what the scanners detect, not proof the"
-  _note "site is clean. A backdoored plugin looks like a working plugin."
+  _note "CLEAN means nothing the scanners know was found, not proof: a"
+  _note "backdoored plugin looks like a working plugin."
   ;;
 
 # ── Staged ───────────────────────────────────────────────────────────────────
