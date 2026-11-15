@@ -69,6 +69,13 @@ which does what:
   after signing, unlisted files, `../` paths), the plan, an edited tool
   blocking it, the mu-plugins keeping the VM's own settings, cron reconciled,
   a second run changing nothing, and rollback restoring exactly what was there.
+  `test/test-links-wordpress.sh` runs the scan and `clean --links` against
+  REAL WordPress and MariaDB, seeded the way each builder and theme stores
+  spam (classic, blocks, Divi, WPBakery, Beaver, Elementor, a site-editor
+  footer, the Customizer, a widget, a menu); with `WASP_TEST_ELEMENTOR` it
+  goes through Elementor's own save. It needs `WASP_TEST_WP` (a WordPress
+  checkout) and `WASP_TEST_WPCLI` (wp-cli.phar), and says SKIPPED without them:
+  run it before every release that touches the content tools.
   `test/check-upgrade-map.py` fails when a stage installs a file the upgrade
   map does not cover, or a tool no stage installs.
   The suite finishes with

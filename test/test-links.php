@@ -97,8 +97,75 @@ t(strpos($txt, '(page 327, publish, last saved by designer@example.com 2026-11-1
 t(strpos($txt, 'Elementor widget w1spam1 (text-editor): link to casino-spam.example "slotsbonus"  [pasted from a Google Sheet]') !== false,
   'each link line says where to click and what to delete');
 t(strpos($txt, '103 saved revision(s) also hold spam') !== false, 'revisions holding spam are counted, not listed');
-t(strpos($txt, 'What to do') !== false && strpos($txt, 'Edit with Elementor') !== false, 'ends with what to do, in order');
+t(strpos($txt, 'What to do') !== false && preg_match('/clean --links [a-z0-9.,-]*casino-spam\.example/', $txt) === 1,
+  'ends with what to do: the clean command naming the spam domains', $txt);
 t(preg_match('/casino-spam\.example\s+\d+\s+← spam/', $txt) === 1, 'the outbound list marks spam domains');
+
+echo "\nContent scanner: other builders, themes and templates\n";
+// Gutenberg with a block plugin: the link is in the block's settings and its HTML.
+$gb = "<!-- wp:paragraph -->\n<p>Welcome to our shop.</p>\n<!-- /wp:paragraph -->\n"
+    . "<!-- wp:kadence/advancedbtn {\"url\":\"https://www.betting-bonus.example/go\"} /-->\n";
+// Divi and WPBakery: module settings, WPBakery's URL-encoded.
+$divi = '[et_pb_section][et_pb_row][et_pb_column type="4_4"][et_pb_button button_url="https://pokerroom.example/" button_text="Play"][/et_pb_button][/et_pb_column][/et_pb_row][/et_pb_section]';
+$wpb  = '[vc_row][vc_column][vc_btn title="Bonus" link="url:https%3A%2F%2Fslots-vip.example%2Fjoin|title:Join|target:_blank"][/vc_column][/vc_row]';
+// Beaver Builder: serialized objects; Bricks: arrays; Oxygen: JSON with escaped slashes.
+$fl = array('n1' => (object) array('node' => 'n1', 'type' => 'module', 'settings' => (object) array('text' => '<p>Visit <a href="https://www.cialis-deal.example/">here</a></p>')));
+$bricks = array(array('id' => 'abc', 'name' => 'text', 'settings' => array('text' => 'Bonus', 'link' => array('url' => 'https://roulette-live.example'))));
+$oxy = '{"children":[{"id":1,"options":{"url":"https:\/\/jackpot-city.example\/"}}]}';
+$brizy = base64_encode(str_repeat('<div class="brz">', 20) . '<a href="https://kasyno-online.example/">x</a>' . str_repeat('</div>', 20));
+$m = wcs_analyze(array(
+    'siteurl' => 'https://shop.example',
+    'posts' => array(
+        array(70, 'page', 'publish', 'Blocks', 'blocks', $gb, 'owner', ''),
+        array(71, 'page', 'publish', 'Divi', 'divi', $divi, 'owner', ''),
+        array(72, 'page', 'publish', 'WPBakery', 'wpbakery', $wpb, 'owner', ''),
+        array(73, 'page', 'publish', 'Beaver', 'beaver', '', 'owner', ''),
+        array(74, 'page', 'publish', 'Bricks', 'bricks', '', 'owner', ''),
+        array(75, 'page', 'publish', 'Oxygen', 'oxygen', '', 'owner', ''),
+        array(76, 'page', 'publish', 'Brizy', 'brizy', '', 'owner', ''),
+        array(77, 'wp_template_part', 'publish', 'Footer', 'footer', '<!-- wp:paragraph --><p>Powered by <a href="https://casino-partner.example/">partner</a></p><!-- /wp:paragraph -->', 'owner', ''),
+        array(78, 'page', 'publish', 'Real', 'real', '<p><img src="https://cdn.example/slot-machine.png"> <a href="https://supplier.example/x?casino=no">supplier</a></p>', 'owner', ''),
+        array(79, 'page', 'publish', 'SEO', 'seo', '<p>ok</p>', 'owner', ''),
+    ),
+    'elementor' => array(),
+    'meta' => array(
+        73 => array(array('_fl_builder_data', $fl)),
+        74 => array(array('_bricks_page_content_2', $bricks)),
+        75 => array(array('_ct_builder_json', $oxy)),
+        76 => array(array('brizy', $brizy)),
+        78 => array(array('_thumbnail_id', '12'), array('_edit_lock', 'https://casino-spam.example/')),
+        79 => array(array('rank_math_description', 'Best online casino bonuses in Italy')),
+    ),
+    'options' => array(
+        'theme_mods_astra-child' => array('footer_copyright' => 'Copyright <a href="https://www.casino-footer.example/">x</a>'),
+        'et_divi' => array('divi_footer_credits' => 'Designed by <a href="https://agency.example/">agency</a>'),
+        'blogdescription' => 'Gardens and patios',
+        'my_plugin_note' => 'We do not link to casino sites.',
+        '_transient_feed_x' => 'https://casino-spam.example/',
+    ),
+));
+$mb = array(); foreach ($m['items'] as $it) { $mb[$it['type'] . ':' . $it['id'] . ':' . $it['title']] = $it; }
+$hosts_of = function ($it) { return $it ? array_map(function ($f) { return $f['what'][1] ?? ''; }, $it['findings']) : array(); };
+$where_of = function ($it) { return $it ? array_map(function ($f) { return $f['where']; }, $it['findings']) : array(); };
+t(in_array('betting-bonus.example', $hosts_of($mb['page:70:Blocks'] ?? null), true), 'block editor: a spam link in a block plugin\'s settings (block JSON) is found');
+t(in_array('pokerroom.example', $hosts_of($mb['page:71:Divi'] ?? null), true), 'Divi: a button module\'s button_url is found');
+t(in_array('slots-vip.example', $hosts_of($mb['page:72:WPBakery'] ?? null), true), 'WPBakery: a URL-encoded link="url:..." is found');
+t(in_array('cialis-deal.example', $hosts_of($mb['page:73:Beaver'] ?? null), true) && in_array('Beaver Builder layout', $where_of($mb['page:73:Beaver'] ?? null), true),
+  'Beaver Builder: a link inside its serialized layout objects, labelled as its layout');
+t(in_array('roulette-live.example', $hosts_of($mb['page:74:Bricks'] ?? null), true) && in_array('Bricks layout', $where_of($mb['page:74:Bricks'] ?? null), true), 'Bricks: a link field in its layout');
+t(in_array('jackpot-city.example', $hosts_of($mb['page:75:Oxygen'] ?? null), true), 'Oxygen: JSON with escaped slashes');
+t(in_array('kasyno-online.example', $hosts_of($mb['page:76:Brizy'] ?? null), true), 'Brizy: a link inside base64-encoded content');
+t(isset($mb['site editor template part (header/footer):77:Footer']), 'a site-editor footer (template part) is found and named as one', implode(' | ', array_keys($mb)));
+t(!isset($mb['page:78:Real']), 'an image named slot-machine and a link with casino= in its query are not spam; caches and locks are not searched');
+t(in_array('SEO description (Rank Math)', $where_of($mb['page:79:SEO'] ?? null), true), 'spam wording in an SEO description is found, labelled');
+$tm = $mb['setting:0:theme_mods_astra-child'] ?? null;
+t($tm && $hosts_of($tm) === array('casino-footer.example') && strpos($tm['findings'][0]['where'], 'Appearance → Customize') !== false,
+  'a theme\'s footer text (Customizer) linking to a casino is found, with where to edit it');
+t(!isset($mb['setting:0:et_divi']) && !isset($mb['setting:0:my_plugin_note']) && !isset($mb['setting:0:_transient_feed_x']),
+  'a theme credit to a normal site, spam words in a setting without a link, and caches are not reported');
+$mt = wcs_render_text($m);
+t(strpos($mt, 'Setting theme_mods_astra-child  (theme settings of "astra-child" (Appearance → Customize)') !== false
+  && strpos($mt, 'Footer  (site editor template part (header/footer) 77') !== false, 'the report says where each is edited', $mt);
 
 $clean = wcs_analyze(array('siteurl' => 'https://shop.example', 'posts' => array(array(40, 'page', 'publish', 'Residential', 'residential', '<a href="/contact/">Contact</a>', 'owner', '')), 'elementor' => array()));
 t($clean['items'] === array() && strpos(wcs_render_text($clean), 'No spam links') !== false, 'a clean site says so in one line');

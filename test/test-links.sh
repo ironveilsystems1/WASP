@@ -166,6 +166,10 @@ EOF
     && _p "$L: clean with no names reports, through WP-CLI as an administrator, the tools mounted read-only" || _f "$L: clean report" "$(cat "$W/calls") $out"
   out=$(_c --widgets 'w1;rm'); rc=$?
   [ "$rc" = 1 ] && [ ! -f "$W/calls" ] && _p "$L: a malformed widget list is refused before WordPress is touched" || _f "$L: bad ids" "rc=$rc $out"
+  out=$(_c --links 'Casino-Spam.example,casino-vegas.example')
+  grep -qx 'links=casino-spam.example,casino-vegas.example' "$W/args.1" && _p "$L: --links passes the domains, lower-cased, to the cleaner" || _f "$L: links arg" "$(cat "$W/args.1" 2>/dev/null)"
+  out=$(_c --links 'casino.example;rm -rf /'); rc=$?
+  [ "$rc" = 1 ] && [ ! -f "$W/calls" ] && _p "$L: a malformed --links list is refused before WordPress is touched" || _f "$L: bad links" "rc=$rc $out"
   out=$(_c --title 'x=Foo'); rc=$?
   [ "$rc" = 1 ] && _p "$L: --title needs a post ID" || _f "$L: bad title" "$out"
   out=$(_c --widgets w1spam1,w2spam2 --title '327=Commercial Services & Repairs' --trash 512 --revisions --indexnow)

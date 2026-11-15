@@ -297,6 +297,42 @@ function scenarios() {
             check(strpos($m[0]['body'], 'Done by') !== false, 'who saved it');
             ok('a spam link saved through Elementor is emailed once, naming the page, widgets and the clean command');
         },
+        'content_spam_other_builders' => function () {
+            load(ini());
+            // Beaver Builder saves its layout as objects in post meta; Divi and WPBakery in the content.
+            $GLOBALS['_posts'][61] = new WP_Post(61, 'page', 'publish', 'Beaver', '');
+            do_action('updated_post_meta', 21, 61, '_fl_builder_data', array('n1' => (object) array('settings' => (object) array('text' => '<a href="https://casino-spam.example/">x</a>'))));
+            $GLOBALS['_posts'][62] = new WP_Post(62, 'page', 'publish', 'Divi', '[et_pb_button button_url="https://pokerroom.example/"][/et_pb_button]');
+            do_action('save_post', 62, $GLOBALS['_posts'][62], true);
+            $GLOBALS['_posts'][63] = new WP_Post(63, 'page', 'publish', 'WPBakery', '[vc_btn link="url:https%3A%2F%2Fslots-vip.example%2Fjoin|title:Join"]');
+            do_action('save_post', 63, $GLOBALS['_posts'][63], true);
+            // The theme's Customizer settings (footer text) and a site setting added fresh.
+            do_action('updated_option', 'theme_mods_astra-child', array(), array('footer_copyright' => 'By <a href="https://www.casino-footer.example/">x</a>'));
+            do_action('added_option', 'astra-settings', array('footer-html' => '<a href="https://jackpot-city.example/">x</a>'));
+            request_end();
+            $m = mails(); $all = implode("\n----\n", array_map(function ($x) { return $x['subject'] . "\n" . $x['body']; }, $m));
+            check(count($m) === 1 && strpos($all, '5 security changes') !== false, 'expected one digest of five (Beaver, Divi, WPBakery, theme settings, site setting)' . "\n" . $all);
+            check(strpos($all, 'page data: _fl_builder_data') !== false && strpos($all, 'casino-spam.example') !== false, 'Beaver meta named');
+            check(strpos($all, 'pokerroom.example') !== false && strpos($all, 'slots-vip.example') !== false, 'Divi button and URL-encoded WPBakery link');
+            check(strpos($all, 'Spam link saved in the theme settings') !== false && strpos($all, 'Appearance → Customize') !== false, 'theme settings named');
+            check(strpos($all, 'setting astra-settings') !== false && strpos($all, 'jackpot-city.example') !== false, 'a site setting added fresh');
+            check(strpos($all, 'doas wp-links.sh clean --links casino-footer.example') !== false, 'the --links command for the domain');
+            ok('spam saved by any builder (Beaver meta, Divi, URL-encoded WPBakery) or into the theme settings is emailed, with the --links command');
+        },
+        'content_spam_settings_quiet' => function () {
+            load(ini());
+            do_action('updated_option', '_transient_feed_123', '', 'https://casino-spam.example/');
+            do_action('updated_option', 'cron', array(), array('x' => 'https://casino-spam.example/'));
+            do_action('updated_option', 'blogdescription', '', 'Casino night fundraiser every June');
+            do_action('updated_option', 'theme_mods_astra', array(), array('footer' => 'Supplies by <a href="https://supplier.example/slots">x</a>'));
+            $GLOBALS['_posts'][64] = new WP_Post(64, 'page', 'publish', 'Real', '');
+            do_action('updated_post_meta', 22, 64, '_edit_lock', 'https://casino-spam.example/');
+            do_action('updated_post_meta', 23, 64, '_thumbnail_id', '17');
+            do_action('updated_post_meta', 24, 64, '_fl_builder_data', array('n1' => (object) array('settings' => (object) array('text' => '<img src="https://cdn.example/slot-machine.png">'))));
+            request_end();
+            check(count(mails()) === 0, 'a cache, cron, wording in the tagline, a supplier link with "slots" in its path, an edit lock or an image named slot-machine alerted');
+            ok('caches, plumbing, wording alone and ordinary links in settings and builder data send nothing');
+        },
         'content_spam_quiet' => function () {
             load(ini());
             $GLOBALS['_posts'][40] = new WP_Post(40, 'page', 'publish', 'Residential', '<p>Our slotted posts and <a href="https://supplier.example/">catalog</a>, <a href="https://site.example.com/casino-night/">event</a>. Casino night!</p>');
