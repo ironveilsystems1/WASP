@@ -90,6 +90,7 @@ check was written after a specific defect reached hardware:
 - `test-alerts.sh` / `test-alerts.php` — written with the security alerts, so an alert that silently stops firing, leaks a secret or floods the inbox fails the build
 - `test-links.sh` / `test-links.php` — written after casino links pasted into three live pages passed every scan, and a link checker could not reach the site at all
 - `test-upgrade.sh` / `check-upgrade-map.py` — written when each release's upgrade was a block of commands pasted by hand on every VM, checked by nothing, and growing with every release
+- `test-links-wordpress.sh` — written when the clean-up had to work on sites built with other builders and themes than the one it was written for, where a stand-in for WordPress could not prove the stored data came out the shape each builder reads
 - `test-links-clean.php` — written after the spam an import brought was found, and removing it meant six SQL queries and the editor by hand, page by page
 - `test-verify-integrity.sh` — written before the tooling check's result was emailed, when it turned out every VM reported files it never keeps
 
