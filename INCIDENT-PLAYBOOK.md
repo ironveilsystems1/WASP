@@ -251,9 +251,15 @@ trust: search engines treat a business linking to casinos as a hacked site.
 4. **Preview, then clean.** Name each thing. It is refused unless it also tests
    as spam:
    ```sh
-   doas wp-links.sh clean --widgets <id>,<id> --title <id>="<real title>" \
-                          --trash <post id> --revisions --indexnow
+   doas wp-links.sh clean --links <domain>,<domain> --trash <post id> \
+                          --revisions --indexnow
    doas wp-links.sh clean <the same> --apply
+   ```
+   `--links` works whichever builder or theme holds the links: the block
+   editor, Divi, WPBakery, Beaver Builder, Bricks, Oxygen, Elementor, the
+   Customizer, widgets, menus. Elementor widgets can also go whole by ID
+   (`--widgets <id>`), and a spam title is set with `--title <id>="<real title>"`.
+   ```sh
    ```
    The evidence (the scan, the plan, the IndexNow log) is saved under
    `/var/lib/wasp/evidence/`, and a database backup is taken before anything

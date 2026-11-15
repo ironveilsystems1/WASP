@@ -146,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.18` — and both exist only because the codebase
+same value — currently `10.19` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -790,7 +790,7 @@ Every other alert on this page comes from the host: scans, backups, disk, TLS. T
 | `mfa_change` | two-factor is turned off, set up or changed for an administrator |
 | `code_change` | a plugin or theme is installed, updated, activated, deactivated, deleted or switched, or core is updated |
 | `settings_change` | the site address, admin email, open registration or default role changes. `default_role = administrator` is flagged **DANGER**. |
-| `content_spam` | a page, Elementor widget, menu item or sidebar widget is **saved** with a link to a gambling, pharmacy or adult site (10.18). The email names the page, each widget and the `wp-links.sh clean` command that removes them, and says who saved it. Only links are judged, never wording alone. One email per page per day while the spam stays. The weekly scan (`wp-links.sh spam --notify`) uses the same switch. |
+| `content_spam` | a page, any builder's page data, a theme or Customizer setting, a menu item or a sidebar widget is **saved** with a link to a gambling, pharmacy or adult site (10.18; any builder and theme since 10.19). The email names the page, each Elementor widget or builder's data, and the `wp-links.sh clean --links` command that removes them, and says who saved it. Only links are judged, never wording alone. One email per page per day while the spam stays. The weekly scan (`wp-links.sh spam --notify`) uses the same switch. |
 
 **The VM emails you when:**
 
@@ -3270,8 +3270,9 @@ wp-links.sh spam                 # injected links, spam titles and pages, per pa
 wp-links.sh spam --all-domains   # ...and every other site this one links to
 wp-links.sh broken               # crawl the site; missing pages, images, files, certificate problems
 wp-links.sh clean                # what could be cleaned, with the IDs to name (changes nothing)
-wp-links.sh clean --widgets w1spam1,w2spam2 --title 120="Our services" --trash 214 --revisions --indexnow
+wp-links.sh clean --links casino-site.example,slots-site.example --trash 214 --revisions --indexnow
                                  # a preview of exactly that; then the same with --apply
+wp-links.sh clean --widgets w1spam1 --title 120="Our services"   # Elementor widgets by ID; a title
 ```
 
 **Spam is content, not code.** One real import brought over:
@@ -3282,22 +3283,32 @@ wp-links.sh clean --widgets w1spam1,w2spam2 --title 120="Our services" --trash 2
 Every file and signature check passed, because nothing in it is code. It was pasted into the editor through a valid session. Finding it took six hand-written SQL queries. `wp-links.sh spam` does the same in one pass, from inside the WordPress container:
 
 - **What it reads.** The database directly, read-only, with the container's own credentials. It never loads WordPress, so no plugin code runs and a compromised plugin cannot hide its own content.
-- **Where it looks.** Every post, page, draft and Elementor template, and inside Elementor's page data widget by widget. Also menu items, sidebar widgets, and Rank Math's IndexNow log.
+- **Where it looks**, whichever builder or theme made the site (10.19):
+  - every post, page, draft and template, in its content as stored: classic HTML, the block editor and block plugins (links inside block settings too), and shortcode builders such as Divi, WPBakery and Avada (links inside module settings, URL-encoded or not);
+  - Elementor's page data, widget by widget;
+  - every other builder's page data, kept as post meta: Beaver Builder, Bricks, Oxygen, Breakdance, SiteOrigin, Thrive, Brizy, Themify and Cornerstone (serialized, JSON or base64), plus SEO titles and descriptions;
+  - site-editor templates and template parts (headers, footers), patterns and theme-builder layouts, each named as such;
+  - theme settings (Customizer, Divi, Avada, Astra, GeneratePress …) and any other setting holding a spam link, with where it is edited;
+  - menu items, sidebar widgets, and Rank Math's IndexNow log.
 - **What counts as spam.** Gambling, pharmacy, adult and payday-loan words in link targets, link text, titles and URL slugs, in several languages. The list is deliberately narrow: "slot" counts in a domain but not in text, because an ordinary business site may say "slotted posts".
 - **Reported beside the spam:**
   - links pasted from a Google Sheet (`data-sheets-root`), the usual trail of paid link placement;
   - links hidden with CSS;
   - revisions that still hold spam.
-- **What each finding names.** The page, its ID and status, the account that last saved it, and the **Elementor widget ID** to delete. It ends with what to do, in order, and an inventory of every outside domain the site links to.
+- **What each finding names.** The page, its ID and status, the account that last saved it, and where the link sits (the **Elementor widget ID**, the builder's layout, the theme setting). It ends with the `clean --links` command naming the spam domains, what to do in order, and an inventory of every outside domain the site links to.
 
-It also runs weekly from cron and emails you only when it finds something. Since 10.18 a spam link is also emailed **as it is saved**, naming the page and the widget (`content_spam` in [Security alerts](#security-alerts)).
+It also runs weekly from cron and emails you only when it finds something. Since 10.18 a spam link is also emailed **as it is saved**, naming the page and the widget; since 10.19 whichever builder, theme setting or widget it is saved into (`content_spam` in [Security alerts](#security-alerts)).
 
 ### Cleaning up content spam
 
 `wp-links.sh clean` removes what `spam` found. It goes through WordPress and Elementor's own save, which rebuilds the page's HTML copy and its CSS; a database edit would leave both still holding the spam.
 
-- **Nothing is removed by pattern alone.** A widget, title or post changes only when you **name** it and the scanner's own test also finds spam in it. A mistyped ID, or a real widget named by mistake, is refused and left alone.
+- **Nothing is removed by pattern alone.** A widget, title, post or domain changes only when you **name** it and the scanner's own test also finds spam in it. A mistyped ID, a real widget named by mistake, or a domain that is not spam is refused and left alone.
 - **What it can do:**
+  - `--links <domains>` (10.19): remove every link to those spam domains, **whichever builder or theme stores it**. That covers the content (classic, block editor and block plugins, Divi/WPBakery/Avada shortcodes, URL-encoded or not), every builder's page data in post meta (Beaver Builder, Bricks, Oxygen, Breakdance …), Elementor widgets, theme and Customizer settings and sidebar widgets. A menu item pointing there is deleted.
+    - The smallest unit around a link goes with it, **only when** nothing but spam is left once the link is out: a pasted spreadsheet cell, a paragraph, a block, a shortcode module, an Elementor widget. A real paragraph with a spam link slipped into it keeps its words.
+    - A domain is accepted only when it reads as spam by the scanner's own test and is not the site itself.
+    - Content and builder data are written directly, so no content filter rewrites the rest of the page. Then the caches are cleared: Elementor, Beaver Builder and Divi, plus WP Rocket, W3 Total Cache, WP Super Cache and LiteSpeed when present;
   - remove Elementor widgets by ID;
   - set a page title (`--title <id>="<real title>"`), refused if the old title holds no spam or the new one does;
   - move spam articles to the Trash, where WordPress keeps them 30 days; their addresses answer 404 at once;
@@ -3852,6 +3863,7 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.19 | **Spam in any builder or theme.** The scan, `wp-links.sh clean --links <domains>` and the save-time alert now cover the block editor and block plugins, Divi/WPBakery/Avada shortcodes (URL-encoded links too), Beaver Builder, Bricks, Oxygen, Breakdance and other builders' page data, site-editor headers and footers, patterns, theme and Customizer settings, widgets and menus. The unit around a link goes only when nothing but spam is left. Tested on real WordPress, with and without Elementor |
 | 10.18 | **Upgrades, and cleaning spam up.** `wasp-upgrade.sh` brings a VM to a new release: verified against the key pinned on the VM, planned (tools, mu-plugins, rules, cron, build-time config reported), backed up, applied the same way every time, safe to repeat, and rolled back on request. An edited tool blocks it. `wp-links.sh clean` removes named spam widgets, titles, articles, revisions and IndexNow entries through Elementor's own save, with evidence and a database backup first. Spam links are emailed **as they are saved**. The import scan names spam titles and articles by ID and lists the application passwords a site brings; `wp-forensics.sh app-passwords` reviews and revokes them |
 | 10.17 | **Spam links and broken links.** `wp-links.sh spam` finds injected gambling, pharmacy and adult links, spam titles and articles, Sheets-pasted and hidden links, naming the page and Elementor widget; it also runs weekly. `wp-links.sh broken` crawls the site through the proxy. **Readable scans:** the import scan checks content in the dump and ends with a verdict in words, with what happens to each finding and the next command; `wp-import.sh report` shows the saved scan; signature matches are grouped by rule with plain explanations and short paths |
 | 10.16 | **Security alerts.** WordPress emails the operator when an administrator is added, removed or signs in from a new address, when credentials, two-factor, plugins or key settings change; the VM emails when the site goes down and recovers, when an administrator appears in the database, and when plugin files or WASP's tools are modified (`wasp-alerts.sh`). **Fixes from a real import:** `wp-rotate-secrets.sh smtp` now really changes the password; `wp-mail.sh doctor` names mail-override plugins and no longer reports the SMTP mu-plugin missing; an UpdraftPlus restore leaves plugins' own `.sql` files alone; the scanner stops flagging chance `<?=` bytes in images and core files identical to the pinned image; the on-VM tooling check no longer reports files a VM never keeps |

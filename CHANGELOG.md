@@ -6,6 +6,70 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.19 — Spam in any builder or theme
+
+10.17 and 10.18 found and removed content spam as Elementor stores it. Sites built otherwise kept theirs where the scan never looked:
+- link settings in block JSON and in shortcode attributes (Divi's `button_url`, WPBakery's URL-encoded `link="url:…"`);
+- page data other builders keep in post meta;
+- footers in the site editor;
+- footer text in the Customizer.
+
+### The scan (`wp-links.sh spam`)
+
+- **URLs outside `<a href>`.** It reads links wherever they are stored: block settings, shortcode attributes, builder link fields, bare in the text. JSON-escaped (`https:\/\/`) and URL-encoded (`https%3A%2F%2F`) forms are undone first.
+- **Every builder's page data in post meta.** A cheap SQL pre-filter feeds it Beaver Builder, Bricks, Oxygen, Breakdance, SiteOrigin, Thrive, Brizy (base64), Themify and Cornerstone data, plus SEO titles and descriptions. Each is labelled ("Beaver Builder layout"). Caches, edit locks and oEmbed data are skipped.
+- **Theme settings and other site options.** It reads the Customizer (`theme_mods_*`) and Divi, Avada, Astra, GeneratePress, Kadence and Blocksy options, each with where it is edited. Any other setting is read for links only, never for wording. Transients, cron and rewrite rules are never read.
+- **Named by part.** Site-editor templates and template parts, patterns, and Divi, Beaver, Bricks, Oxygen and Avada theme-builder parts are each named as what they are.
+- **One command at the end.** "What to do" is no longer Elementor-only: it gives the `clean --links` command naming the spam domains found.
+
+### `wp-links.sh clean --links <domains>`
+
+- **Removes every link to those domains**, wherever it is stored:
+  - post content (classic, the block editor and block plugins, Divi/WPBakery/Avada shortcodes);
+  - every builder's post meta (arrays and objects keep their shape; JSON is decoded and re-encoded);
+  - Elementor data (through Elementor's own save);
+  - theme and Customizer settings and sidebar widgets.
+
+  A menu item pointing there is deleted.
+- **The unit around the link goes only when nothing but spam is left** once the link is out: a pasted Sheets cell, a paragraph, list item or heading, a leaf block, a self-closing block whose setting points there, a shortcode module (paired or self-closing), an Elementor widget. A real paragraph with a link slipped into it keeps its words.
+- **Only spam domains are accepted.** A domain must read as spam by the scanner's test and must not be the site itself; anything else is refused.
+- **`report` lists** each spam domain, the places that link to it, and the `--links` command.
+- **Written directly.** Content and builder meta go straight to the database, so no content filter rewrites the rest of the page and no SEO ping fires.
+- **Caches cleared afterwards:** Elementor, Beaver Builder and Divi, plus WP Rocket, W3 Total Cache, WP Super Cache and LiteSpeed when present.
+- **Two fixes, found on real WordPress:**
+  - `--title` now slashes its value for `wp_update_post`;
+  - `--widgets` without Elementor active treats a page's stale HTML copy holding spam *wording* as a problem (exit 1, "click Update"), not only one holding a link.
+
+### The save-time alert
+
+- **More places watched:** any builder's page data saved to post meta, and any setting saved or added (`added_option` too). That covers theme and Customizer settings, not only sidebar widgets.
+- **Links in any form:** JSON-escaped, URL-encoded, serialized arrays and objects.
+- **Kept quiet:** transients, cron and plumbing are never judged.
+- **The email** now gives the `clean --links <domains>` command, and `--widgets` too when the spam was in Elementor widgets.
+
+### Tests
+
+| Test | Cases |
+|---|---|
+| `test/test-links-wordpress.sh` (new) | the scan and the clean-up on **real WordPress 6.8 and MariaDB**, seeded as each builder and theme stores spam: classic, blocks with a block plugin's button, Divi, URL-encoded WPBakery, Beaver Builder objects, Elementor, a site-editor footer, the Customizer, a widget, a menu, an article. 19 with Elementor active, through its own save; 18 without. A preview leaves the tables' checksums unchanged; after `--links` the scan finds nothing; real content, the Beaver objects, other theme settings and the real menu item stay, and the block content still parses. Skips without `WASP_TEST_WP` and `WASP_TEST_WPCLI` |
+| `test-links.php` | +13: each builder, theme setting and template; ordinary images, query strings, caches and theme credits not flagged |
+| `test-links-clean.php` | +20: every removal function per builder, the spam-only rule, refusals, end-to-end through the stand-in |
+| `test-alerts.php` | +2: Beaver meta, Divi, URL-encoded WPBakery, theme and site settings; caches, plumbing, wording and ordinary links stay quiet |
+| `test-links.sh` | +2: `--links` passed and validated |
+
+### Bringing a VM to 10.19
+
+```sh
+doas wasp-upgrade.sh apply /tmp/wasp-10.19-2026-11-14.tar.gz
+```
+
+On a VM older than 10.18, run it from the release once:
+
+```sh
+doas tar xzf /tmp/wasp-10.19-2026-11-14.tar.gz -C /root
+doas sh /root/wasp-10.19/payload/bin/wasp-upgrade.sh apply /root/wasp-10.19
+```
+
 ## 10.18 — Upgrades a VM runs itself, and cleaning spam up
 
 ### `wasp-upgrade.sh` (new): verified, planned, repeatable upgrades with rollback
