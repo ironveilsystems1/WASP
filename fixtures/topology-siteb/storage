@@ -1,0 +1,2 @@
+local-lvm  lvmthin  active  1800000  420000  1380000  23.33%
+local      dir      active   100000   30000    70000  30.00%

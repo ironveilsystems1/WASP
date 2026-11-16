@@ -1,0 +1,3 @@
+cores: 4
+name: nas
+net0: virtio=BC:24:11:DE:AD:01,bridge=vmbr0

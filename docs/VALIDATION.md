@@ -78,6 +78,7 @@ check was written after a specific defect reached hardware:
 - `test-import-findings.sh` — after the first real compromised import cried wolf twice and missed the malware
 - `test-threats.sh` — after that malware turned out to be detectable by shape, and the clean-up worth automating
 - `test-egress-temporary.sh` — after an egress window was found to close only when someone next ran the tool
+- `test-egress-reconcile.sh` — after a field site's licensed Elementor add-on was denied its licence server 134 times in a week, and an upgrade had no way to add it
 - `test-notify.sh` — after every alert e-mail was found to authenticate with an empty password
 - `test-hive-report.sh` — written with WASP Hive; its BusyBox run caught every severity arriving as `[HIGH]` on Alpine
 - `test-hive.py` — written with WASP Hive; caught refused POSTs reaching the client as a connection reset instead of a 401
