@@ -76,6 +76,16 @@ which does what:
   goes through Elementor's own save. It needs `WASP_TEST_WP` (a WordPress
   checkout) and `WASP_TEST_WPCLI` (wp-cli.phar), and says SKIPPED without them:
   run it before every release that touches the content tools.
+  `test/test-links-wordpress.sh` checks that the scan's count of spam revisions
+  equals what `clean --revisions` would delete (they once used two tests).
+  `test/check-subsystem-map.py` fails when a shipped component is in no
+  subsystem of ARCHITECTURE.md's map, in two, or no longer ships.
+  The same suite runs in CI (`.github/workflows/checks.yml`) on every push:
+  on Ubuntu as root with BusyBox, in an Alpine container, and against real
+  WordPress 6.8.3 without Elementor; the Elementor pass stays a manual step.
+  `test/test-remoteip-fix.sh` also covers a VM provisioned before 10.6: the
+  image's own remoteip.conf live and no mask in wp-run-extra.env (found on a
+  10.4 VM upgraded to 10.20).
   `test/check-tool-self-edit.py` fails when a script edits a signed tool in
   place (GeoIP setup's old edit of update.sh blocked every GeoIP VM's upgrade).
   `test/check-upgrade-map.py` fails when a stage installs a file the upgrade

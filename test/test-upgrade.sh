@@ -148,6 +148,7 @@ EOF
   printf '%s' "$out" | grep -A3 'Configuration written' | grep -q 'apache-conf/wp-security-fallback.conf' \
     && _p "$L: ...build-time config that changed upstream is reported, not replaced" || _f "$L: cfg" "$out"
   printf '%s' "$out" | grep -q '10.15 upgrade step' && printf '%s' "$out" | grep -q '10.16 upgrade step' \
+    && printf '%s' "$out" | grep -q '10.21 upgrade step' \
     && _p "$L: ...and the steps for each version passed" || _f "$L: hooks plan" "$out"
   { printf '%s' "$out" | grep -q '~ tool update.sh .*set by GeoIP setup before 10.20' && ! printf '%s' "$out" | grep -q 'update.sh: MODIFIED'; } \
     && _p "$L: update.sh with only GeoIP's old PINNED_WP_VER edit is replaced, not blocked as tampered" || _f "$L: geoip update.sh" "$out"
@@ -192,9 +193,10 @@ EOF
     && [ ! -e "$S/stages" ] && [ -d "$S/upgrade" ]; } \
     && _p "$L: staged payload, manifest and version are the release's; the rest of vars.sh is kept" || _f "$L: staged" ""
   grep -q 'apache-conf' "$W/s0" && ! grep -q 'wp-security.conf' "$W/s0"; # (no installed apache conf in this root)
-  [ "$(grep -c 'remoteip-fix --check' "$W/hooks.log" 2>/dev/null)" = 1 ] && [ "$(grep -c '^wp-hardening.sh remoteip-fix$' "$W/hooks.log")" = 1 ] \
+  # 10.15 and 10.21 both run the remoteip check (and, here, the repair); 10.16 the alerts setup.
+  [ "$(grep -c 'remoteip-fix --check' "$W/hooks.log" 2>/dev/null)" = 2 ] && [ "$(grep -c '^wp-hardening.sh remoteip-fix$' "$W/hooks.log")" = 2 ] \
     && [ "$(grep -c 'wasp-alerts.sh setup --quiet' "$W/hooks.log")" = 1 ] \
-    && _p "$L: the 10.15 and 10.16 steps ran once each" || _f "$L: hooks ran" "$(cat "$W/hooks.log" 2>/dev/null)"
+    && _p "$L: the 10.15, 10.16 and 10.21 steps ran once each" || _f "$L: hooks ran" "$(cat "$W/hooks.log" 2>/dev/null)"
   grep -q "upgrade 10.14 -> $NEWVER ok" "$V/var/lib/wasp-upgrade/history.log" && ls "$V/var/lib/wasp-upgrade/backups/"*-from-10.14.tar.gz >/dev/null 2>&1 \
     && _p "$L: recorded in the history, with a backup" || _f "$L: history" "$(cat "$V/var/lib/wasp-upgrade/history.log" 2>/dev/null)"
   _snap > "$W/s2"

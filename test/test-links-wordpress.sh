@@ -98,6 +98,14 @@ update_post_meta($ids['elementor'], '_elementor_edit_mode', 'builder');
 update_post_meta($ids['elementor'], '_elementor_template_type', 'wp-page');
 $ids['footer'] = $id('Footer', "<!-- wp:paragraph -->\n<p>Powered by casino partner <a href=\"https://{$c}/\">here</a></p>\n<!-- /wp:paragraph -->", 'wp_template_part', 'footer');
 $ids['article'] = $id('Esimerkki', '<p>Pelaajat arvostavat.</p>', 'post', 'kasinon-esimerkki-artikkeli');
+// Revisions. A Home page about "specialists" (which once counted as spam: "cialis"),
+// edited twice, and a page that held a spam link for one save and was then fixed.
+$ids['home'] = $id('Home', '<p>Patio specialists since 1985.</p>');
+wp_update_post(wp_slash(array('ID' => $ids['home'], 'post_content' => '<p>Your patio specialists. Stone from <a href="https://www.stonespecialists.example/">our supplier</a>.</p>')));
+wp_update_post(wp_slash(array('ID' => $ids['home'], 'post_content' => '<p>Your patio specialists since 1985.</p>')));
+$ids['spamrev'] = $id('Decks', '<p>Decks to order.</p>');
+wp_update_post(wp_slash(array('ID' => $ids['spamrev'], 'post_content' => "<p>Decks. Gioca al casino online <a href=\"https://{$c}/\">bonus</a></p>")));
+wp_update_post(wp_slash(array('ID' => $ids['spamrev'], 'post_content' => '<p>Decks to order.</p>')));
 set_theme_mod('footer_text', "Built by us · <a href=\"https://{$v}/\">partner</a>");
 set_theme_mod('accent', '#336699');
 update_option('widget_custom_html', array(3 => array('title' => '', 'content' => "<p>casino bonus <a href=\"https://{$c}/\">x</a></p>"), '_multiwidget' => 1));
@@ -131,6 +139,19 @@ $out"
 printf '%s' "$out" | grep -q 'Menu item "Contact"' && _f "a real menu item was reported" "" || _p "...and not the real menu item"
 printf '%s' "$out" | grep -q 'clean --links casino-spam.example,casino-vegas.example\|clean --links casino-vegas.example,casino-spam.example' \
   && _p "...ending with the clean command that names both domains" || _f "scan next step" "$(printf '%s' "$out" | grep -A3 'What to do')"
+
+# ── revisions: the scan's count and the cleaner's list are one test ──
+# Until 10.23 the scan counted revisions by SQL LIKE '%cialis%': every revision
+# of a page saying "specialists" was spam, while the cleaner (rightly) found none.
+_hr=$(mariadb --no-defaults -S "$T/m.sock" -u root -N -e "SELECT COUNT(*) FROM wp.wp_posts WHERE post_type='revision' AND post_parent=$(_id home)")
+_ns=$(_scan | sed -n 's/^ *\([0-9][0-9]*\) saved revision(s) also hold spam.*/\1/p'); _ns=${_ns:-0}
+_rep=$(_clean report)
+_nc=$(printf '%s\n' "$_rep" | sed -n 's/^ *page [0-9]*: \([0-9][0-9]*\) of its revisions hold spam.*/\1/p' | awk '{ t += $1 } END { print t + 0 }')
+{ [ "${_hr:-0}" -ge 2 ] && [ "$_nc" -ge 1 ] && [ "$_ns" = "$_nc" ] && ! printf '%s' "$_rep" | grep -q "page $(_id home):" \
+  && printf '%s' "$_rep" | grep -q "page $(_id spamrev):"; } \
+  && _p "revisions: the scan counts what the cleaner would delete ($_nc); the specialists page's $_hr are not spam" \
+  || _f "revision count" "home revisions=$_hr scan=$_ns cleaner=$_nc
+$_rep"
 
 # ── --widgets: one Elementor widget by ID ──
 out=$(_clean "widgets=w9spam9" apply); wrc=$?

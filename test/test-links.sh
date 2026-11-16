@@ -40,15 +40,18 @@ _o=$(php "$REPO/test/test-links-clean.php" 2>&1); _rc=$?
 
 # The import scan reads the dump with the same word lists as the content
 # scanner. Two copies of a list drift; this holds them together.
-_php_host=$(sed -n "s/.*return '\/(\(casin[^)]*\))\/i';.*/\1/p" "$REPO/payload/php-tools/wasp-content-scan.php" | head -1)
+_php_host=$(sed -n "/function wcs_spam_host_re/,/^}/s/.*return '\/(\(.*\))\/i';.*/\1/p" "$REPO/payload/php-tools/wasp-content-scan.php" | head -1)
 _imp_host=$(sed -n "s/^ *_spamhost='(\(.*\))'\$/\1/p" "$REPO/payload/bin/wp-import.sh" | head -1)
 _php_slug=$(sed -n "/function wcs_spam_slug_re/,/^}/s/.*return '\/(\(.*\))\/i';.*/\1/p" "$REPO/payload/php-tools/wasp-content-scan.php" | head -1)
 _imp_slug=$(sed -n "s/^ *_spamslug='(\(.*\))'\$/\1/p" "$REPO/payload/bin/wp-import.sh" | head -1)
+# The shell copies spell PCRE's (?![tme]) as ERE's ([^tme]|$): compare in one form.
+_ere() { printf '%s' "$1" | sed -e 's/(?!\[\([a-z]*\)\])/([^\1]|$)/g' -e 's/(?!\([a-z]\))/([^\1]|$)/g'; }
+_php_host=$(_ere "$_php_host"); _php_slug=$(_ere "$_php_slug")
 { [ -n "$_php_host" ] && [ "$_php_host" = "$_imp_host" ] && [ -n "$_php_slug" ] && [ "$_php_slug" = "$_imp_slug" ]; } \
   && _p "the import scan and the content scanner use the same spam word lists" \
   || _f "spam word lists differ" "php host: $_php_host | import: $_imp_host | php slug: $_php_slug | import: $_imp_slug"
 _mu_host=$(sed -n "/function wasp_alerts_spam_host_re/,/^}/s/.*return '\/(\(.*\))\/i';.*/\1/p" "$REPO/payload/mu-plugins/07-wasp-alerts.php" | head -1)
-[ -n "$_mu_host" ] && [ "$_mu_host" = "$_php_host" ] \
+[ -n "$_mu_host" ] && [ "$(_ere "$_mu_host")" = "$_php_host" ] \
   && _p "the save-time alert (07-wasp-alerts.php) uses the same spam host list" \
   || _f "save-time alert host list differs" "mu: $_mu_host | scanner: $_php_host"
 
@@ -65,10 +68,11 @@ switch ($u) {
     $page('<a href="/about/">About</a> <a href="/missing/">gone</a> <a href="contact/">Contact</a>
            <img src="/img/logo.png"> <img src=\'/img/gone.jpg\'> <a href="https://supplier.invalid/catalog">Supplier</a>
            <a href="/wp-admin/">admin</a> <a href="/wp-login.php">login</a> <a href="/lighthouse/">slug</a>
-           <a href="/wp-json/wp/v2/users">api</a> <a href="mailto:x@y.example">mail</a> <a href="#top">top</a>');
+           <a href="/wp-json/wp/v2/users">api</a> <a href="mailto:x@y.example">mail</a> <a href="#top">top</a>
+           <a href="fax:5550100">Fax</a> <a href="tel:5550100">Call</a>');
     return true;
   case '/about/':
-    $page('<a href="/">Home</a> <a href="/missing/">gone again</a> <a href="/about/#team">team</a> <a href="/broken500/">err</a>
+    $page('<a href="/">Home</a> <a href="/missing/">gone again</a> <a href="/about/#team">team</a> <a href="/broken500/">err</a> <a href="fax:5550100">Fax</a>
            <a href="https://supplier.invalid/other">Supplier 2</a> <a href="https://www.facebook.invalid/x">fb</a>');
     return true;
   case '/contact/':  $page('<p>Call us</p> <a href="/?s=services">search</a>'); return true;
@@ -110,6 +114,13 @@ _suite() { # label shell pathprefix
     && _p "$L: other sites' links are listed by domain, never fetched" || _f "$L: externals" "$plain"
   printf '%s' "$plain" | grep -q "header 'User-Agent: Mozilla/5.0 (compatible; WASP-LinkCheck/1.0)'" \
     && _p "$L: and the workstation command to check them is printed" || _f "$L: workstation cmd" ""
+  # A header fax: link (10.21 read it as a relative path: a false 404 per page).
+  ! printf '%s' "$plain" | grep -q 'fax:5550100.*404\|/fax:5550100' \
+    && ! grep -q 'fax:' "$T/site/requests.log" \
+    && _p "$L: a fax: link is not resolved as a page, not requested, not counted broken" || _f "$L: fax as path" "$plain"
+  printf '%s' "$plain" | grep -q 'fax:5550100   on 2 page(s)' && printf '%s' "$plain" | grep -q 'plain text' \
+    && _p "$L: ...it is listed once as a link visitors cannot follow, with the pages it is on" || _f "$L: fax listed" "$plain"
+  ! printf '%s' "$plain" | grep -q 'tel:5550100' && _p "$L: a tel: link is left alone" || _f "$L: tel listed" "$plain"
   out=$(_b --max-pages 1 | sed 's/\x1b\[[0-9;]*m//g')
   printf '%s' "$out" | grep -q 'Stopped at 1 pages' && _p "$L: --max-pages stops and says so" || _f "$L: max" "$out"
   out=$(_b --max-pages x); [ $? = 1 ] && _p "$L: a bad --max-pages is refused" || _f "$L: bad max" ""

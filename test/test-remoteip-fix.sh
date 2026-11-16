@@ -68,25 +68,36 @@ _legacy_mask() { printf 'RemoteIPHeader X-Forwarded-For\nRemoteIPTrustedProxy 10
 _run_suite() { # label, shell, PATH prefix dir
   local L="$1" SH="$2" PP="$3"
   local W="$T/$L"; mkdir -p "$W/bin"
-  # Stand-in podman. configtest obeys $W/ct (ok|fail); the live grep reports
-  # the directives in the files that would be mounted, plus $W/extra.
+  # Stand-in podman. configtest obeys $W/ct (ok|fail); the live check reports
+  # the directives in the files Apache would load: the mounted files, $W/extra,
+  # and $W/img -- the image's own conf-enabled/remoteip.conf, present only
+  # while it is enabled (rm disables it, the a2enconf link puts it back).
   cat > "$W/bin/podman" <<STUB
 #!$SH
 case "\$*" in
   *configtest*) [ "\$(cat "$W/ct")" = ok ] && { echo 'Syntax OK'; exit 0; }
                 echo 'AH00526: Syntax error on line 4'; exit 1 ;;
   'restart wordpress') echo restart >> "$W/restarts"; echo wordpress; exit 0 ;;
+  *'test -s /etc/apache2/conf-enabled/remoteip.conf') [ -s "$W/img" ]; exit \$? ;;
+  *'rm -f /etc/apache2/conf-enabled/remoteip.conf') [ -f "$W/rmfail" ] && exit 1; rm -f "$W/img"; exit 0 ;;
+  *'ln -s ../conf-available/remoteip.conf'*) cp "$W/img.orig" "$W/img"; exit 0 ;;
   *RemoteIP*) grep -hE '^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]' \
-                "$W/wp-security.conf" "$W/remoteip.conf" "$W/extra" 2>/dev/null; exit 0 ;;
+                "$W/wp-security.conf" "$W/remoteip.conf" "$W/extra" "$W/img" 2>/dev/null; exit 0 ;;
 esac
 exit 0
 STUB
   chmod +x "$W/bin/podman"
+  # Default: a VM provisioned from 10.6 -- the image's file masked by a mount
+  # recorded in wp-run-extra.env.
   _reset() { _legacy_sec > "$W/wp-security.conf"; _legacy_mask > "$W/remoteip.conf"
-             echo ok > "$W/ct"; : > "$W/extra"; rm -f "$W/restarts"; }
+             echo ok > "$W/ct"; : > "$W/extra"; rm -f "$W/restarts" "$W/img" "$W/img.orig" "$W/rmfail"
+             : > "$W/imask"
+             printf "WP_EXTRA_VOLS='-v /home/wpuser/wp/secrets:/var/www/private:ro -v %s:/etc/apache2/conf-enabled/remoteip.conf:ro'\n" \
+               "$W/imask" > "$W/env"; }
   _fix() { # args...
     env PATH="$W/bin:$PP" PROXY_IP="${RF_PROXY-10.20.10.10}" \
         WASP_RF_SEC="$W/wp-security.conf" WASP_RF_MASK="$W/remoteip.conf" \
+        WASP_RF_ENV="$W/env" WASP_RF_IMGMASK="$W/imask" \
         "$SH" "$TOOL" remoteip-fix "$@" 2>&1; }
   _restarts() { [ -f "$W/restarts" ] && wc -l < "$W/restarts" | tr -d ' ' || echo 0; }
 
@@ -183,6 +194,86 @@ STUB
   [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'Expected exactly' \
     && _p "$L: a stray live declaration in the container fails the repair" \
     || _f "$L: a stray live declaration was not caught" "rc=$rc out=$out"
+
+  # ── A VM provisioned before 10.6 (found on a 10.4 VM upgraded to 10.20) ──
+  # The two files already in the 10.15 form, but the image's own remoteip.conf
+  # is live and wp-run-extra.env has no mount masking it.
+  _pre106() {
+    _reset
+    sed 's/^RemoteIPTrustedProxy /RemoteIPInternalProxy /' "$W/sec.orig" > "$W/wp-security.conf"
+    printf '# masked: mod_remoteip is configured in conf-enabled/wp-security.conf\n' > "$W/remoteip.conf"
+    printf "WP_EXTRA_VOLS='-v /home/wpuser/wp/secrets:/var/www/private:ro'\n" > "$W/env"
+    rm -f "$W/imask"
+    printf 'RemoteIPHeader X-Forwarded-For\nRemoteIPInternalProxy 10.0.0.0/8\nRemoteIPInternalProxy 172.16.0.0/12\nRemoteIPInternalProxy 192.168.0.0/16\n' > "$W/img"
+    cp "$W/img" "$W/img.orig"; cp "$W/env" "$W/env.orig"
+  }
+  _mlines() { grep -cF "$W/imask:/etc/apache2/conf-enabled/remoteip.conf:ro" "$W/env"; }
+
+  _pre106; out=$(_fix --check); rc=$?
+  [ "$rc" = 1 ] && printf '%s' "$out" | grep -q "image's own" && printf '%s' "$out" | grep -q 'returns on every rebuild' \
+    && _p "$L: pre-10.6: --check reports the image's live remoteip.conf and the missing mount" \
+    || _f "$L: pre-10.6: --check passed a VM Apache still reads 10/8 on" "rc=$rc out=$out"
+  cmp -s "$W/env" "$W/env.orig" && [ -s "$W/img" ] && [ ! -e "$W/imask" ] && [ "$(_restarts)" = 0 ] \
+    && _p "$L: pre-10.6: --check changes nothing" || _f "$L: pre-10.6: --check modified the VM" ""
+
+  _pre106; out=$(_fix); rc=$?
+  [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'exactly one declaration' \
+    && _p "$L: pre-10.6: repair exits 0 and the live check sees one declaration" \
+    || _f "$L: pre-10.6: repair failed" "rc=$rc out=$out"
+  [ ! -e "$W/img" ] && _p "$L: pre-10.6: the image's file is disabled in the running container" \
+    || _f "$L: pre-10.6: the image's file is still live" ""
+  [ "$(_mlines)" = 1 ] && head -1 "$W/env" | cmp -s - "$W/env.orig" \
+    && _p "$L: pre-10.6: the mask mount is recorded once, the install's line kept" \
+    || _f "$L: pre-10.6: wp-run-extra.env wrong" "$(cat "$W/env")"
+  _vols=$(env -i "$SH" -c '. "$1"; printf "%s" "$WP_EXTRA_VOLS"' _ "$W/env")
+  case "$_vols" in
+    *"/var/www/private:ro"*"-v $W/imask:/etc/apache2/conf-enabled/remoteip.conf:ro") _p "$L: pre-10.6: sourcing it gives both mounts" ;;
+    *) _f "$L: pre-10.6: sourced WP_EXTRA_VOLS is wrong" "$_vols" ;;
+  esac
+  [ -f "$W/imask" ] && [ ! -s "$W/imask" ] && _p "$L: pre-10.6: the mask file exists and is empty" \
+    || _f "$L: pre-10.6: no empty mask file" ""
+  [ "$(_restarts)" = 1 ] && _p "$L: pre-10.6: WordPress restarted once" || _f "$L: pre-10.6: restart count $(_restarts)" ""
+
+  rm -f "$W/restarts"; out=$(_fix); rc=$?
+  [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'Nothing to repair' && [ "$(_restarts)" = 0 ] && [ "$(_mlines)" = 1 ] \
+    && _p "$L: pre-10.6: a second run is a no-op (no restart, mount not added twice)" \
+    || _f "$L: pre-10.6: not idempotent" "rc=$rc restarts=$(_restarts) lines=$(_mlines) out=$out"
+
+  # The state the hand fix left on the field VM: mount recorded, image's file
+  # removed in the container. Recognised as done.
+  _reset; sed 's/^RemoteIPTrustedProxy /RemoteIPInternalProxy /' "$W/sec.orig" > "$W/wp-security.conf"
+  printf '# masked: mod_remoteip is configured in conf-enabled/wp-security.conf\n' > "$W/remoteip.conf"
+  printf "WP_EXTRA_VOLS='-v /home/wpuser/wp/secrets:/var/www/private:ro'\n" > "$W/env"
+  printf 'WP_EXTRA_VOLS="${WP_EXTRA_VOLS} -v %s:/etc/apache2/conf-enabled/remoteip.conf:ro"\n' "$W/imask" >> "$W/env"
+  out=$(_fix); rc=$?
+  [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'Nothing to repair' && [ "$(_restarts)" = 0 ] \
+    && _p "$L: pre-10.6: the field hand fix is recognised and left alone" \
+    || _f "$L: pre-10.6: the field hand fix was not recognised" "rc=$rc out=$out"
+
+  _pre106; echo fail > "$W/ct"; out=$(_fix); rc=$?
+  [ "$rc" = 1 ] && cmp -s "$W/env" "$W/env.orig" && cmp -s "$W/img" "$W/img.orig" && [ ! -e "$W/imask" ] \
+    && [ "$(_restarts)" = 0 ] \
+    && _p "$L: pre-10.6: a failed configtest puts back the env file, the image's file, and restarts nothing" \
+    || _f "$L: pre-10.6: a failed configtest left changes" "rc=$rc env=$(cat "$W/env") img=$([ -e "$W/img" ] && echo present || echo gone)"
+
+  _pre106; : > "$W/rmfail"; out=$(_fix); rc=$?
+  [ "$rc" = 1 ] && cmp -s "$W/env" "$W/env.orig" && [ ! -e "$W/imask" ] && [ "$(_restarts)" = 0 ] \
+    && _p "$L: pre-10.6: if the image's file cannot be disabled, everything is put back" \
+    || _f "$L: pre-10.6: a failed disable left changes" "rc=$rc"
+
+  _pre106; rm -f "$W/env"; out=$(_fix); rc=$?
+  [ "$rc" = 1 ] && [ ! -e "$W/env" ] && [ ! -e "$W/img" ] && printf '%s' "$out" | grep -q 'nothing records the mask' \
+    && _p "$L: pre-10.6, no wp-run-extra.env: fixed now, not created blind, reported as not durable" \
+    || _f "$L: pre-10.6, no env file: wrong handling" "rc=$rc out=$out"
+
+  # Both problems at once: the 10.14 files AND the image's file.
+  _reset; printf "WP_EXTRA_VOLS='-v /home/wpuser/wp/secrets:/var/www/private:ro'\n" > "$W/env"; rm -f "$W/imask"
+  printf 'RemoteIPInternalProxy 10.0.0.0/8\n' > "$W/img"; cp "$W/img" "$W/img.orig"
+  out=$(_fix); rc=$?
+  [ "$rc" = 0 ] && grep -qx 'RemoteIPInternalProxy 10.20.10.10' "$W/wp-security.conf" && [ ! -e "$W/img" ] \
+    && [ "$(_mlines)" = 1 ] && [ "$(_restarts)" = 1 ] \
+    && _p "$L: a 10.4-shaped VM (old files and the image's file) is repaired in one run" \
+    || _f "$L: a 10.4-shaped VM was not fully repaired" "rc=$rc out=$out"
 }
 
 _run_suite host /bin/sh "/usr/local/bin:/usr/bin:/bin"

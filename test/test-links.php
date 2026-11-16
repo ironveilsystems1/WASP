@@ -170,5 +170,19 @@ t(strpos($mt, 'Setting theme_mods_astra-child  (theme settings of "astra-child" 
 $clean = wcs_analyze(array('siteurl' => 'https://shop.example', 'posts' => array(array(40, 'page', 'publish', 'Residential', 'residential', '<a href="/contact/">Contact</a>', 'owner', '')), 'elementor' => array()));
 t($clean['items'] === array() && strpos(wcs_render_text($clean), 'No spam links') !== false, 'a clean site says so in one line');
 
+// Substrings that are also ordinary words (10.23, from a field site whose Home
+// page says "specialists": 115 clean revisions were counted as spam).
+$benign = array('stonespecialists.example', 'specialist', 'socialism', 'specialised', 'windowcasing.example', 'door-casing');
+$spammy = array('buycialisonline.example', 'cialis20mg', 'cialis', 'cialis-online', 'casino-royale.example', 'onlinecasinoguide', 'casinos');
+t(!array_filter($benign, function ($w) { return preg_match(wcs_spam_host_re(), $w) || preg_match(wcs_spam_slug_re(), $w); }),
+  'specialist, socialism and window casing are not spam hosts or addresses');
+t(count(array_filter($spammy, function ($w) { return preg_match(wcs_spam_host_re(), $w) && preg_match(wcs_spam_slug_re(), $w); })) === count($spammy),
+  '...while buycialisonline, cialis20mg and casino still are');
+t(!preg_grep('/\(\?/', wcs_spam_terms()), 'the SQL pre-filter terms carry no regex syntax');
+$home = '<h2>Your trusted patio specialists since 1985</h2><p><a href="https://www.stonespecialists.example/">our supplier</a></p>';
+t(wcs_post_is_spam('Home', '', $home, '', array('shop.example')) === '', 'a page about specialists, linking a supplier named so, is not spam');
+t(wcs_post_is_spam('Home', '', '<p><a href="https://buycialisonline.example/">x</a></p>', '', array('shop.example')) === 'content',
+  '...and the same page with a pill-shop link is');
+
 echo "\n  links (php): {$pass} passed, {$fail} failed\n";
 exit($fail ? 1 : 0);

@@ -80,7 +80,11 @@ sed -e '/^if \[ "\$(id -u)" -ne 0 \]; then$/,/^fi$/d' \
     -e "s#/etc/wp-install/pinned.env#$T/etc/pinned.env#g" \
     -e "s#^VULN_CONF=.*#VULN_CONF=\"$T/etc/vuln-sources.conf\"#" \
     -e "s#^VULN_CACHE=.*#VULN_CACHE=\"$T/cache\"#" \
+    -e "s#^\([[:space:]]*\)sleep #\1$T/bin/sleep #" \
     "$REPO/payload/bin/wp-plugins.sh" > "$T/wp-plugins.sh"
+# ^ By path, not through PATH: BusyBox ash (1.36 here) runs sleep as a builtin,
+#   so a stand-in on PATH is never called -- the backoff assertions saw nothing
+#   and the run really slept.
 sed -e "s#/usr/local/bin/wp-plugins.sh#$T/wp-plugins.sh#g" \
     -e "s#/usr/local/bin/wp-notify.sh#$T/notify.sh#g" \
     "$REPO/payload/bin/wp-vuln-cron.sh" > "$T/cron.sh"
