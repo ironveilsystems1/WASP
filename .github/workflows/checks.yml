@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install what the suite uses
         run: |
           sudo apt-get update -qq
@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install PHP and MariaDB
         run: |
           sudo apt-get update -qq
@@ -71,10 +71,15 @@ jobs:
   alpine:
     name: Shell tools on Alpine (BusyBox native)
     runs-on: ubuntu-24.04
-    container: alpine:3.20
+    container:
+      image: alpine:3.20
+      # nft -c checks rulesets through netlink, which needs CAP_NET_ADMIN even
+      # though nothing is loaded. Without it every ruleset "fails" for the wrong reason.
+      options: --cap-add NET_ADMIN
     timeout-minutes: 45
-    # Not yet run anywhere: written in 10.22 without access to an Alpine image.
-    # Remove this line after its first green run, so it gates like the others.
+    # First run (10.23) found three real Alpine bugs, fixed in 10.24, and test
+    # environment gaps. Remove this line after its first green run, so it
+    # gates like the others.
     continue-on-error: true
     steps:
       # actions/checkout needs the runner's glibc node, which an Alpine container
@@ -88,7 +93,7 @@ jobs:
       - name: Install what the suite uses
         run: |
           apk add --no-cache python3 curl jq zip unzip yara nftables \
-            php83 php83-mysqli php83-sqlite3 php83-pdo_sqlite php83-zip php83-mbstring php83-ctype php83-tokenizer
+            php83 php83-curl php83-mysqli php83-sqlite3 php83-pdo_sqlite php83-zip php83-mbstring php83-ctype php83-tokenizer
           ln -sf /usr/bin/php83 /usr/bin/php
       - name: test/run-all-checks.sh
         working-directory: wasp
@@ -102,7 +107,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install minisign
         run: |
           sudo apt-get update -qq
