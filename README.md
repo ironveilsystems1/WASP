@@ -146,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.24` — and both exist only because the codebase
+same value — currently `10.26` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -667,6 +667,8 @@ wasp-egress allow <domain> --for 15     # …for 15
 wasp-egress allow <domain> --permanent  # theme and builder vendors only
                                         # (and the Wordfence plugin's noc1.wordfence.com,
                                         #  where the site runs Wordfence: discovery names it)
+wasp-egress reconcile [--check]         # add what WordPress and the commercial plugins
+                                        # installed here need, if missing (every upgrade runs it)
 wasp-egress fileshare open dropbox      # a file-sharing service, 60 minutes at most
 wasp-egress temporary                   # everything open temporarily, and for how long
 wasp-egress close <domain> | --all      # close temporary entries now
@@ -726,6 +728,29 @@ wasp-egress discovery     # what this site actually tried to reach
 ```
 
 Denied destinations are **never promoted automatically**. Classify each as REQUIRED, MAINTENANCE, UNNECESSARY or SUSPICIOUS — a destination you cannot account for is a finding, not an allowlist entry. An allowlist grown by accepting whatever asked is not an allowlist.
+
+### Egress the VM needs
+
+A VM upgraded from an older release, or a site that gained a commercial plugin after it was built, can lack an entry it needs, and nothing says so: the plugin installs, then silently never updates or checks its licence. On one field site Ultimate Addons for Elementor was denied `support.brainstormforce.com` 134 times in a week.
+
+`wasp-egress reconcile` adds what is missing, and only that. `wasp-upgrade.sh apply` runs it every time, and `check` lists what it would add. It adds:
+
+- WordPress's own update servers, `.wordpress.org` and `.w.org`;
+- for each commercial plugin or theme **installed** here (its directory exists), the server its licence and updates come from:
+
+| Installed | Allowed |
+|---|---|
+| Elementor Pro (`elementor-pro`) | `.elementor.com` |
+| Ultimate Addons for Elementor (`ultimate-elementor`), Astra Pro (`astra-addon`) | `support.brainstormforce.com` |
+| Wordfence (`wordfence`) | `noc1.wordfence.com` |
+| WPVulnerability (`wpvulnerability`) | `www.wpvulnerability.net` |
+| Divi, Extra, Divi Builder | `.elegantthemes.com` |
+| WPBakery (`js_composer`) | `.wpbakery.com` |
+| Beaver Builder (`bb-plugin`, `bb-theme`) | `.beaverbuilder.com` |
+| Kadence Pro (`kadence-pro`, `kadence-blocks-pro`) | `.kadencewp.com` |
+| GeneratePress Premium (`gp-premium`) | `.generatepress.com` |
+
+It never removes anything. It never puts back an entry you took out with `wasp-egress deny`; `allow --permanent` restores one. It does not list a parent such as `.wordpress.org` beside narrower entries such as `api.wordpress.org`, which Squid refuses as a whole file; it says so instead. Each addition goes into the file with the date and the plugin that needs it, and `discovery` names a denied host an installed plugin needs, with the command. Free plugins and themes update from wordpress.org and need nothing more; WASP's own tools (vulnerability feeds, CrowdSec, GeoIP, packages) run on the host, not through this proxy.
 
 ### Maintenance windows, not an open mode
 
@@ -1499,6 +1524,7 @@ the egress proxy. To add another later:
 doas wasp-egress.sh allow .elegantthemes.com --permanent    # Divi
 doas wasp-egress.sh allow .elementor.com --permanent        # Elementor
 doas wasp-egress.sh discovery                               # what the site actually reaches
+doas wasp-egress.sh reconcile                               # what the plugins installed here need
 ```
 
 Without `--permanent` an `allow` closes again within the hour, which is right
@@ -3242,11 +3268,14 @@ Runs weekly (Sunday 05:30 UTC) and emails **only on failure** — a guarantee th
 ## Upgrading WASP on a VM
 
 ```sh
-wasp-upgrade.sh check wasp-10.18-2026-11-14.tar.gz    # verify it, show what would change
-wasp-upgrade.sh apply wasp-10.18-2026-11-14.tar.gz    # back up, change, check
+wasp-upgrade.sh check                                  # fetch the newest release, verify it, show what would change
+wasp-upgrade.sh apply                                  # the same, then back up, change, check
+wasp-upgrade.sh check wasp-10.18-2026-11-14.tar.gz    # or a release already on the VM
 wasp-upgrade.sh status                                 # version, history, backups
 wasp-upgrade.sh rollback                               # undo the last upgrade
 ```
+
+**Where the release comes from.** With no release named, `check` and `apply` download the newest from the project's `main` branch. Set `WASP_RELEASE_URL` in `/etc/wp-install/vars.sh` to use another https source, such as your own mirror. Where it came from decides nothing: a downloaded release is verified exactly like a file you copied over, against the key pinned on the VM, and refused the same way. `apply` downloads again and shows its plan before the `UPGRADE` prompt, so what you confirm is what gets applied. To apply exactly the release you checked, name the file `check` saved: `/var/lib/wasp-upgrade/fetched/latest.tar.gz`.
 
 A VM does not update its own tooling: a new release reaches it only when you bring it. Until 10.18 each release's CHANGELOG carried a block of commands to paste, and every release added to it. Pasted by hand across a fleet, that drifts: a step skipped on one VM, a cron line appended twice on another. Nothing checked that the release being pasted was the one that was signed. `wasp-upgrade.sh` does the same work the same way every time.
 
@@ -3254,11 +3283,12 @@ A VM does not update its own tooling: a new release reaches it only when you bri
 - **Planned before anything changes.** `check` lists:
   - which tools, WordPress mu-plugins, rules and cron lines change, with line counts (`--diff` shows the lines);
   - each version's upgrade steps (for example the 10.15 proxy repair) that will run;
+  - egress this VM needs and lacks: WordPress's update servers, and the licence server of each commercial plugin or theme installed here (`+ egress support.brainstormforce.com  (Ultimate Addons for Elementor …)`). `apply` adds them with `wasp-egress reconcile`; see [Egress the VM needs](#egress-the-vm-needs);
   - build-time configuration that changed upstream: Apache, PHP, MariaDB, CrowdSec, Squid, init scripts. Those hold this VM's own values, so they are reported and **never replaced**; the CHANGELOG says whether one needs action.
 - **An edited tool stops it.** A tool or mu-plugin that differs from what was installed blocks the upgrade. A script that runs as root on a schedule and was changed on the VM is evidence, not something to overwrite; look at it, then `--force` if you choose to.
 - **Your settings are kept.** The mu-plugins are rendered with the values this VM already runs with: its login slug, and its two-factor enforcement and grace period. Each is checked by PHP inside the wordpress container before it is installed. A cron job you moved to another time is left where you put it, and so are lines you added yourself.
 - **Safe to repeat.** A second `apply` changes nothing.
-- **Reversible.** Everything it touches is backed up first, to `/var/lib/wasp-upgrade/backups/`; the newest five are kept. `rollback` restores the last one exactly and removes what the upgrade added. Every upgrade and rollback is recorded (`status`).
+- **Reversible.** Everything it touches is backed up first, to `/var/lib/wasp-upgrade/backups/`; the newest five are kept. `rollback` restores the last one exactly and removes what the upgrade added, except egress entries: those stay (the allowlist is read by Squid through its inode, and a rollback does not narrow what the site needs), and rollback lists them with how to remove one. Every upgrade and rollback is recorded (`status`).
 
 **What it does not do:** rebuild the VM, change containers or images (`update.sh` does that), or rewrite configuration that holds this VM's own values. What it may change is listed in `payload/upgrade/files.map`, read from the new release. `test/check-upgrade-map.py` fails if a stage installs a file that the map does not cover.
 
@@ -3270,7 +3300,7 @@ doas tar xzf /tmp/wasp-10.18-2026-11-14.tar.gz -C /root
 doas sh /root/wasp-10.18/payload/bin/wasp-upgrade.sh apply /tmp/wasp-10.18-2026-11-14.tar.gz
 ```
 
-If the VM has no `minisign`, it is installed with `apk add minisign`. Menu: Updates → 23–26.
+If the VM has no `minisign`, it is installed with `apk add minisign`. Menu: Updates → 23–26; at 23 and 24 press Enter for the newest release.
 
 ## Spam links and broken links
 
@@ -3872,6 +3902,8 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.26 | **Upgrades add the egress a VM needs.** `wasp-upgrade.sh apply` adds WordPress's update servers and the licence server of each commercial plugin or theme installed on the VM when the allowlist lacks them (`wasp-egress reconcile`), only adding, never re-adding what `deny` removed; `check` lists them. One spam word in ordinary writing (an article naming a casino once) is no longer spam; short, hidden or Sheets-pasted wording still is |
+| 10.25 | **One-step upgrades.** `wasp-upgrade.sh check` and `apply` download the newest release themselves when none is named (or `WASP_RELEASE_URL`), and verify it against the VM's pinned key exactly like a copied file; the menu's 23 and 24 need only Enter. The weekly report says what it is waiting for instead of sitting silent |
 | 10.24 | **Alpine-only bugs, found by CI on Alpine.** BusyBox `date` has no relative dates and musl refuses regex repeat counts over 255; four tools fell back silently: vulnerability exceptions expired the day they were granted, "expiring soon" never fired, `security.txt` was written already expired, and the import scan's hidden-link check counted nothing. All fixed; `check-busybox-compat.py` refuses those forms |
 | 10.23 | **No false spam from ordinary words.** The spam domain and address tests matched "cialis" inside *specialist* and "casin" inside *casing*, so a supplier named for its specialists read as a spam domain that `clean --links` would accept, and the scan counted every revision of a page about specialists as spam. Both fixed in the scanner, the save-time alert and the import scan; the scan's revision count now uses the cleaner's own test |
 | 10.22 | **Readable status, CI, cleaner crawls.** `TODO.md` sorts every capability by its evidence (proven on hardware, in automated tests, or per client), its history archived; `ARCHITECTURE.md` maps every component to one of five subsystems, held by a check; a GitHub Actions workflow runs the full suite, real WordPress and Alpine, and verifies the release signature without ever holding the key. `wp-links.sh broken` lists `fax:` and other non-web links as links visitors cannot follow instead of 404s; typed confirmations ignore a pasted space |

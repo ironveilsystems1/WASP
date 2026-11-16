@@ -1,6 +1,6 @@
 # WASP — status and open work
 
-*As of 10.24 (2026-11-16).*
+*As of 10.26 (2026-11-16).*
 
 Everything WASP claims sits in one of three evidence categories. They are kept
 apart because they are different promises: a mechanism proven once on hardware
@@ -42,6 +42,7 @@ What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
 | CrowdSec AppSec request inspection (10.13) | `test/test-appsec.sh` | `wasp-appsec.sh on` and `test` on a real VM; its memory recorded over a week; the upstream-LAPI key path, which has never run |
 | WASP Hive installer and install.sh's Hive role | `test/test-hive.py`, `test/test-hive-role.sh` | `install-hive.sh` on a real Alpine VM (community packages resolve, `supervise-daemon` restarts, 443 redirect answers); the Hive role on a real Proxmox host; the Wazuh connector against a real manager |
 | `.wpress` archives in the 7.x format | `test/test-wpress-reader.php` (the plugin's 4.5 archiver and a third-party 7.x builder) | A real 7.x export |
+| `wasp-egress reconcile` adding a VM's missing egress on upgrade (10.26) | `test/test-egress-reconcile.sh`, `test/test-upgrade.sh` | The next upgrade of a field VM running Ultimate Addons for Elementor: `support.brainstormforce.com` added, its denials stop |
 | `remoteip-fix` repairing a VM provisioned before 10.6 (10.21) | `test/test-remoteip-fix.sh` | The same repair ran by hand on a field VM; the tool's own run waits for the next such VM |
 | A failed second factor with a correct password reaches CrowdSec | None: needs a real Two Factor plugin | Fail a second factor on a VM and look for the event |
 | CI on Alpine (BusyBox native) | `.github/workflows/checks.yml`. Its first run (10.23) found four Alpine-only bugs, fixed in 10.24 | Its first green run; then drop its `continue-on-error` |
@@ -67,6 +68,8 @@ ticked once.
 
 | Item | Why it matters | State |
 |---|---|---|
+| Mark a reviewed file in the malware scan | A plugin's own PHP cache in uploads (MetForm's icon cache, on a field site) is reported CRITICAL every day after it has been reviewed | Planned: `wp-malware-scan.sh accept <file>`, by checksum and reason; reported again if one byte changes |
+| Offsite backups made at the hypervisor | A fleet backed up by Proxmox off-host gets "Off-VM backup is not configured" after every backup | Planned: record that offsite copies are the hypervisor's, so the warning stops and the weekly report says so |
 | TLS certificates are not monitored | TLS ends at the proxy, so nothing on the VM sees a certificate. A missing `www` name on a client site's certificate was found on 2026-11-15 by `wp-links.sh broken`, not by monitoring | A check against the public endpoint is cheap and not yet written |
 | Boot ordering says "started", not "ready" | After a reboot WordPress can show "Error establishing a database connection" for 20–60 s while MariaDB starts | Deferred; the completion banner and support notes say it is expected. Fix: a readiness wait in `wp-container` using `mariadb-health-check.sh` |
 | Candidate update code still reads live data | The SELECT-only account stops writes, not reads | Design work |

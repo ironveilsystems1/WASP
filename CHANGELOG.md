@@ -6,6 +6,69 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.26 — Upgrades add the egress a VM needs
+
+A field site running Ultimate Addons for Elementor was denied `support.brainstormforce.com` 134 times in a week. The plugin had installed fine and then could not reach its licence and update server, and nothing said so except the proxy log. The same scan reported a tax article as spam because it named a casino among the workplaces where tips are earned.
+
+- **`wasp-egress reconcile`** adds what this VM needs and the allowlist lacks:
+  - WordPress's own update servers, `.wordpress.org` and `.w.org`;
+  - for each commercial plugin or theme **installed** on the VM (its directory exists), the server its licence and updates come from: Elementor Pro, Ultimate Addons for Elementor and Astra Pro (`support.brainstormforce.com`), the Wordfence plugin (`noc1.wordfence.com`), WPVulnerability, Divi and Extra, WPBakery, Beaver Builder, Kadence Pro and GeneratePress Premium. README, "Egress the VM needs", has the table.
+
+  It only adds. It never re-adds an entry removed with `wasp-egress deny` (which now records the removal); `allow --permanent` restores one. It does not add a parent such as `.wordpress.org` beside narrower entries, which Squid refuses as a whole file, and says so. It writes in place, so Squid keeps reading the same file, and puts the previous list back if Squid rejects the new one. `--check` prints the plan and changes nothing.
+- **`wasp-upgrade.sh`.** `check` lists the egress it would add (`+ egress <host>  (<why>)`). `apply` adds it after the files and upgrade steps, on every upgrade, including one that changes nothing else. `rollback` leaves egress entries in place and lists them with how to remove one: the allowlist is read by Squid through its inode, and a rollback should not narrow what the site needs.
+- **`wasp-egress discovery`** names a denied host an installed plugin needs, with `reconcile` as the fix. It also recognises `support.brainstormforce.com` and `www.wpvulnerability.net`, and labels the probes `wasp-egress test` makes (`example.com`, `1.1.1.1`, `169.254.169.254`) as its own.
+- **What it does not add.** WASP's own host tools (vulnerability feeds, CrowdSec, GeoIP, packages) run on the host, not through this proxy, and need nothing here. A single `www.wpvulnerability.net` denial comes from a plugin inside WordPress, not from WASP. Free plugins and themes update from wordpress.org.
+- **Spam wording without a link.** One spam word in ordinary writing is no longer spam. Wording with no spam link is reported when it is:
+  - dense: one spam word in every 40 words or fewer ("Best online casino bonuses in Italy");
+  - hidden by its styling;
+  - pasted from a Google Sheet.
+
+  Spam with a link is still reported by its link, and a spam title by the title test. The scan's count, the cleaner and the import scan share the one test (`wcs_post_is_spam`), so the article's 34 revisions are no longer counted either.
+- **Tests.**
+  - `test-egress-reconcile.sh` (new, 41 cases, host shell and BusyBox): additions with their reasons; nothing for free or uninstalled plugins; in-place writes; idempotence; deny respected and restored; narrower entries; a refused list restored; discovery hints.
+  - `test-upgrade.sh`, 82 cases: the plan lists the missing entry and not the present ones; apply adds it and reloads Squid; rollback keeps it and says so.
+  - `test-links.php`, 47 cases: a long article mentioning a casino once is not spam, nor the Elementor widget holding it; a short blurb, hidden wording and Sheets-pasted wording still are.
+
+### Bringing a VM to 10.26
+
+A VM on 10.25 runs menu 24 and Enter, or:
+
+```sh
+doas wasp-upgrade.sh apply
+```
+
+A VM older than 10.25 needs the one manual fetch shown under 10.25 below. Either way the plan lists any egress it will add, before the `UPGRADE` prompt.
+
+## 10.25 — One-step upgrades
+
+Upgrading a VM meant downloading a release, unpacking it, and typing its path at the menu prompt. An operator stopped at that prompt, unsure what to type. The tool now gets the release itself.
+
+- **`wasp-upgrade.sh check` and `apply` with no release** download the newest from the project's `main` branch, or from `WASP_RELEASE_URL` in `vars.sh` (https only). The download gets the same checks as a copied file:
+  - its signature against the key pinned on the VM, then every file against the manifest, with unlisted files refused;
+  - the archive itself: absolute or `../` paths and links are refused.
+
+  Fetching changes nothing on the VM. A failed download says why and how to name a release instead.
+- **`apply` downloads again and shows the plan before the `UPGRADE` prompt,** so what is confirmed is what gets applied. `check` says so, and names the file it saved for anyone who wants exactly the release they checked.
+- **The menu.** Options 23 and 24 now read "the newest release" and need only Enter. A path still works for a release already on the VM.
+- **The weekly report says what it is waiting for.** On a terminal it prints that it is checking every component and that this can take minutes. An operator took the silence for a hang. Cron mail is unchanged.
+- **Tests.** `test-upgrade.sh` has 76 cases under the host shell and BusyBox. The new ones fetch and check without a release named, confirm fetching changes nothing, refuse a hostile fetched archive, report a failed download, and refuse a plain-http URL.
+
+### Bringing a VM to 10.25
+
+The tools installed on a VM before 10.25 cannot fetch, so this one upgrade is still done by hand:
+
+```sh
+doas sh -c 'rm -rf /root/wasp-up && mkdir -p /root/wasp-up && cd /root/wasp-up && wget -qO- https://github.com/ironveilsystems1/WASP/archive/refs/heads/main.tar.gz | tar xz'
+doas sh /root/wasp-up/WASP-main/payload/bin/wasp-upgrade.sh apply /root/wasp-up/WASP-main
+```
+
+From 10.25 on, every later upgrade is menu 24 and Enter, or:
+
+```sh
+doas wasp-upgrade.sh check
+doas wasp-upgrade.sh apply
+```
+
 ## 10.24 — Alpine-only bugs, found by CI on Alpine
 
 The CI workflow added in 10.22 ran on real Alpine for the first time and found four bugs that had shipped for many releases. Each fails silently, and only on Alpine, which is what every VM runs. The check suite's BusyBox pass never saw them: the build host's BusyBox is linked against glibc, so it borrows glibc's `date` parsing and regex engine. Alpine's BusyBox uses musl.
