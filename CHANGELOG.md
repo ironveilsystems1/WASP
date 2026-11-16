@@ -6,6 +6,29 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.20 — GeoIP VMs upgrade cleanly
+
+Found by the first fleet upgrade to 10.19: `wasp-upgrade.sh check` reported `update.sh: MODIFIED since it was installed` on the two VMs with GeoIP filtering, and refused to go on. Nobody had tampered with them. WASP had made the change itself.
+
+- **The cause.** `wp-geoip-setup.sh` ran `sed -i` on `/usr/local/bin/update.sh` to rewrite its `PINNED_WP_VER` line. It does this when GeoIP is set up and again every time `update.sh` rebuilds GeoIP after a WordPress update. That line is only `update.sh`'s fallback: `/etc/wp-install/pinned.env` holds the pin. But the edit left the installed tool different from its signed copy:
+  - `wasp-verify-integrity.sh` reported it on every GeoIP VM;
+  - the weekly `watch-integrity` alert would have emailed it every week;
+  - `wasp-upgrade.sh` blocked as it should for an edited root tool.
+- **Fixed.** GeoIP setup no longer touches `update.sh`.
+- **For VMs already edited.** `wasp-upgrade.sh` recognises a difference confined to `update.sh`'s `PINNED_WP_VER` line as WASP's own old edit. It says so in the plan and replaces the tool. Any other difference still blocks.
+- **New check.** `test/check-tool-self-edit.py` fails when any script writes, `sed -i`s or `tee`s a signed tool outside the stages and the upgrader. A tool's bytes stay the bytes that were signed; state goes in a state file.
+- **Plan fix.** A retired cron line is listed once. It appeared twice when Lynis's cron file was installed. Removing it was already correct; only the listing doubled.
+- **Tests.** `test-upgrade.sh` gains a VM with GeoIP's old `update.sh` edit and an installed Lynis cron line (64 cases, host shell and BusyBox).
+
+### Bringing a VM to 10.20
+
+On a VM that was blocked on `update.sh` by 10.19's check, nothing is needed beyond running 10.20's `wasp-upgrade.sh`, from the release as before:
+
+```sh
+doas sh /root/wasp-10.20/payload/bin/wasp-upgrade.sh check /root/wasp-10.20
+doas sh /root/wasp-10.20/payload/bin/wasp-upgrade.sh apply /root/wasp-10.20
+```
+
 ## 10.19 — Spam in any builder or theme
 
 10.17 and 10.18 found and removed content spam as Elementor stores it. Sites built otherwise kept theirs where the scan never looked:

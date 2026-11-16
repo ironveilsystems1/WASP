@@ -146,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.19` — and both exist only because the codebase
+same value — currently `10.20` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -3863,6 +3863,7 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.20 | **GeoIP VMs upgrade cleanly.** `wp-geoip-setup.sh` no longer rewrites a line of the installed `update.sh`, which made every GeoIP VM fail the integrity check and blocked its upgrades as "modified"; `wasp-upgrade.sh` recognises that old edit and replaces it; a new check stops any script editing a signed tool again |
 | 10.19 | **Spam in any builder or theme.** The scan, `wp-links.sh clean --links <domains>` and the save-time alert now cover the block editor and block plugins, Divi/WPBakery/Avada shortcodes (URL-encoded links too), Beaver Builder, Bricks, Oxygen, Breakdance and other builders' page data, site-editor headers and footers, patterns, theme and Customizer settings, widgets and menus. The unit around a link goes only when nothing but spam is left. Tested on real WordPress, with and without Elementor |
 | 10.18 | **Upgrades, and cleaning spam up.** `wasp-upgrade.sh` brings a VM to a new release: verified against the key pinned on the VM, planned (tools, mu-plugins, rules, cron, build-time config reported), backed up, applied the same way every time, safe to repeat, and rolled back on request. An edited tool blocks it. `wp-links.sh clean` removes named spam widgets, titles, articles, revisions and IndexNow entries through Elementor's own save, with evidence and a database backup first. Spam links are emailed **as they are saved**. The import scan names spam titles and articles by ID and lists the application passwords a site brings; `wp-forensics.sh app-passwords` reviews and revokes them |
 | 10.17 | **Spam links and broken links.** `wp-links.sh spam` finds injected gambling, pharmacy and adult links, spam titles and articles, Sheets-pasted and hidden links, naming the page and Elementor widget; it also runs weekly. `wp-links.sh broken` crawls the site through the proxy. **Readable scans:** the import scan checks content in the dump and ends with a verdict in words, with what happens to each finding and the next command; `wp-import.sh report` shows the saved scan; signature matches are grouped by rule with plain explanations and short paths |
