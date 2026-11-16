@@ -8,6 +8,31 @@ prose, since that one is a sequence of decisions rather than a shape.
 
 ---
 
+## Subsystems
+
+WASP ships as one signed release, but it is five subsystems with separate
+jobs. They are a way to read the tree and to review a change, not a file
+layout: every VM installs its tools at fixed paths (`/usr/local/bin/…`) that
+the upgrade map and each VM's integrity check depend on, so nothing moves
+on disk. `test/check-subsystem-map.py` fails when a shipped component is in
+no row below, or in two.
+
+| Subsystem | Responsibility | Components |
+|---|---|---|
+| **WASP Core** | Provisioning and lifecycle: build the VM, run it, update it, upgrade its tooling, check it is healthy | `install.sh`, `lib/00-preflight.sh`, `lib/01-interactive-setup.sh`, `lib/02-image-and-disk.sh`, `lib/03-dynamic-configs.sh`, `lib/04-nbd-mount-and-chroot.sh`, `lib/05-ssh-and-network-inject.sh`, `lib/06-vars-and-payload-inject.sh`, `lib/07-vm-create-and-start.sh`, `payload/install-wordpress.sh`, `stages/01-health-checks.sh`, `stages/02-kernel-and-runtime.sh`, `stages/03-wordpress-user-and-secrets.sh`, `stages/05-logging.sh`, `stages/06-containers-mariadb-wordpress.sh`, `stages/07-openrc-services.sh`, `stages/08-update-tooling.sh`, `update.sh`, `wasp-upgrade.sh`, `wasp-menu.sh`, `wp-cron-run.sh`, `wp-health-check.sh`, `mariadb-health-check.sh`, `validate-wordpress.sh`, `wasp-testreport.sh`, `wasp-capture.sh`, `wasp-triage.sh`, `wp-mail.sh`, `wp-notify.sh`, `01-wpvm-smtp.php`, `05-wasp-contact.php` |
+| **WASP Security** | Hardening, detection and remediation: keep attackers out, contain a compromised site, notice change, clean up | `stages/04-apache-hardening.sh`, `stages/09-crowdsec-and-backup.sh`, `stages/10-security-tooling-and-validation.sh`, `wp-hardening.sh`, `wasp-egress.sh`, `wasp-fw-rule.sh`, `wasp-appsec.sh`, `wp-geoip-setup.sh`, `wp-plugins.sh`, `wp-vuln-cron.sh`, `wp-malware-scan.sh`, `wasp-threats.sh`, `wasp-alerts.sh`, `wasp-temp-access.sh`, `wasp-mfa-deferred.sh`, `wp-rotate-secrets.sh`, `wp-links.sh`, `wp-forensics.sh`, `00-wpvm-login-slug.php`, `02-wpvm-login-guard.php`, `03-wpvm-mfa-enforce.php`, `06-wasp-username-privacy.php`, `07-wasp-alerts.php`, `wasp-content-scan.php`, `wasp-content-clean.php` |
+| **WASP Recovery** | Backup, restore and integrity: copies that restore, proven by drills, and tooling that is what was signed | `wp-db-backup.sh`, `wasp-offsite-backup.sh`, `wasp-selftest.sh`, `wasp-verify-integrity.sh` |
+| **WASP Import** | Site migration and inspection: get another site's backup in, and say what is in it before it goes live | `wp-import.sh`, `wasp-wpress-reader.php` |
+| **WASP Hive** | Fleet monitoring and reporting: one read-only view of every VM | `hive/install-hive.sh`, `hive/hive_server.py`, `hive/hive_admin.py`, `wasp-hive-report.sh` |
+
+Two edges cross subsystems on purpose. Stage 09 installs CrowdSec
+(Security) and the backup schedule (Recovery) in one pass, because both need
+the same cron and log plumbing; it is listed once, under Security. The
+content scanner (`wasp-content-scan.php`) is Security's, and Import calls it
+to check a site's content before it goes live.
+
+---
+
 ## 1. Components and trust boundaries
 
 The important structural fact is that **MariaDB has no route to the
@@ -536,7 +561,7 @@ on purpose, and each bound is a failure it would otherwise cause:
   touched. Remediation removes what was found; finding the way in is
   `wp-forensics.sh entry-class`, and skipping it means doing this again.
 
-What is still open is in [TODO.md](TODO.md#import-pipeline--open-after-the-first-real-import).
+What is still open is in [TODO.md](TODO.md#open); how the import pipeline got here is in [docs/history/TODO-HISTORY.md](docs/history/TODO-HISTORY.md#import-pipeline--open-after-the-first-real-import).
 
 **Nothing is reachable by the web server, or executed by anything, until it
 has been scanned.** The natural implementation — extract into the document

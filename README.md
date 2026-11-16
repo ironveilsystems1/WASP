@@ -146,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.20` — and both exist only because the codebase
+same value — currently `10.23` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -188,9 +188,11 @@ allowlist, and refuses to complete an install whose signature does not verify.
 Every one of those has a documented toggle and a stated reason. If you want a
 platform that gets out of your way, this is the wrong one.
 
-**Read `TODO.md` before deciding.** It lists what is not done, including things
-that will be visible to you — a brief database error on the first reboot, for
-one. Nothing there is hidden, and a stale entry claiming a gap that is actually
+**Read `TODO.md` before deciding.** It sorts every capability by the evidence
+behind it: proven on hardware, proven in automated tests only, or proven as a
+mechanism that each deployment must show again with its own keys. Then it lists
+what is not done, including things that will be visible to you — a brief
+database error on the first reboot, for one. Nothing there is hidden, and a stale entry claiming a gap that is actually
 closed is treated as a defect in its own right.
 
 **No support commitment.** It is MIT-licensed and public because it may be
@@ -663,6 +665,8 @@ wasp-egress discovery                   # what got blocked, for classification
 wasp-egress allow <domain>              # open for 60 minutes, then closed automatically
 wasp-egress allow <domain> --for 15     # …for 15
 wasp-egress allow <domain> --permanent  # theme and builder vendors only
+                                        # (and the Wordfence plugin's noc1.wordfence.com,
+                                        #  where the site runs Wordfence: discovery names it)
 wasp-egress fileshare open dropbox      # a file-sharing service, 60 minutes at most
 wasp-egress temporary                   # everything open temporarily, and for how long
 wasp-egress close <domain> | --all      # close temporary entries now
@@ -1796,11 +1800,13 @@ and skips that step. Either way this is what actually gets used:
 ├── test/
 │   ├── test-wordpress-vm.sh     # integration test harness (see test/README.md)
 │   └── README.md
-├── ARCHITECTURE.md             # Mermaid diagrams: components, request flow, install, updates
+├── .github/workflows/checks.yml # CI: the full suite, real WordPress, Alpine, the release signature (never signs)
+├── ARCHITECTURE.md             # the five subsystems; Mermaid diagrams: components, request flow, install, updates
 ├── INCIDENT-PLAYBOOK.md        # what to do when a scan finds something; RACI
 ├── MSP-RUNBOOK.md              # SLA, RTO/RPO, change control, decommissioning
 ├── CHANGELOG.md                # what changed and why, including this restructuring
-├── TODO.md                     # currently open items and why they're deferred
+├── TODO.md                     # status by evidence: proven on hardware, in tests, per client; open; not planned
+├── docs/history/TODO-HISTORY.md # the TODO through 10.21: reviews, field findings, decisions, in order
 ├── LICENSE                     # MIT
 └── README.md                   # this file
 ```
@@ -2537,7 +2543,10 @@ refuses a declaration anywhere but `lib/03`.
 `/etc/apache2/conf-enabled/remoteip.conf` declaring every RFC1918 range as
 `RemoteIPInternalProxy`. That widens XFF trust to all private space. The
 danger is the ranges, not the directive. WASP masks that file at install, and
-the static check refuses any declaration that is not a single variable.
+the static check refuses any declaration that is not a single variable. A VM
+provisioned before 10.6 was built without the mask; `remoteip-fix` (below, and
+the 10.21 upgrade step) records it in `wp-run-extra.env` and disables the file
+in the running container until the next rebuild applies the mount.
 
 **A VM built by 10.14 or earlier** has the old declaration. Repair it on the VM:
 
@@ -3863,6 +3872,9 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.23 | **No false spam from ordinary words.** The spam domain and address tests matched "cialis" inside *specialist* and "casin" inside *casing*, so a supplier named for its specialists read as a spam domain that `clean --links` would accept, and the scan counted every revision of a page about specialists as spam. Both fixed in the scanner, the save-time alert and the import scan; the scan's revision count now uses the cleaner's own test |
+| 10.22 | **Readable status, CI, cleaner crawls.** `TODO.md` sorts every capability by its evidence (proven on hardware, in automated tests, or per client), its history archived; `ARCHITECTURE.md` maps every component to one of five subsystems, held by a check; a GitHub Actions workflow runs the full suite, real WordPress and Alpine, and verifies the release signature without ever holding the key. `wp-links.sh broken` lists `fax:` and other non-web links as links visitors cannot follow instead of 404s; typed confirmations ignore a pasted space |
+| 10.21 | **Older VMs trust only their proxy.** A VM provisioned before 10.6 still read the WordPress image's own `remoteip.conf`, which declares every private range a proxy, so Apache took `X-Forwarded-For` from any private address. `wp-hardening.sh remoteip-fix` (run by the 10.21 upgrade step) records the mask in `wp-run-extra.env`, disables the file in the running container, and verifies against the files Apache actually loads. `wasp-egress discovery report` names common denials (the Wordfence plugin's `noc1.wordfence.com`, IndexNow, Google Fonts, Gravatar, GitHub) and when each is needed |
 | 10.20 | **GeoIP VMs upgrade cleanly.** `wp-geoip-setup.sh` no longer rewrites a line of the installed `update.sh`, which made every GeoIP VM fail the integrity check and blocked its upgrades as "modified"; `wasp-upgrade.sh` recognises that old edit and replaces it; a new check stops any script editing a signed tool again |
 | 10.19 | **Spam in any builder or theme.** The scan, `wp-links.sh clean --links <domains>` and the save-time alert now cover the block editor and block plugins, Divi/WPBakery/Avada shortcodes (URL-encoded links too), Beaver Builder, Bricks, Oxygen, Breakdance and other builders' page data, site-editor headers and footers, patterns, theme and Customizer settings, widgets and menus. The unit around a link goes only when nothing but spam is left. Tested on real WordPress, with and without Elementor |
 | 10.18 | **Upgrades, and cleaning spam up.** `wasp-upgrade.sh` brings a VM to a new release: verified against the key pinned on the VM, planned (tools, mu-plugins, rules, cron, build-time config reported), backed up, applied the same way every time, safe to repeat, and rolled back on request. An edited tool blocks it. `wp-links.sh clean` removes named spam widgets, titles, articles, revisions and IndexNow entries through Elementor's own save, with evidence and a database backup first. Spam links are emailed **as they are saved**. The import scan names spam titles and articles by ID and lists the application passwords a site brings; `wp-forensics.sh app-passwords` reviews and revokes them |

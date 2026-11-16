@@ -1,781 +1,95 @@
-# WordPress VM Script — Remaining TODO
+# WASP — status and open work
 
-*Updated for v8-1. This round works through a static forensic review of v8 (and of the test harness and its README). Every fix below was confirmed against the actual code before changing, and the changed logic was mock-tested; the deferrals are listed with their reasons rather than silently dropped. The build now has two static gates — dash+bash syntax on all nine generated scripts and the heredoc scanner — so what remains is the runtime-only class, which is what the integration harness is for.*
+*As of 10.23 (2026-11-15).*
 
-## What v8-1 fixed
+Everything WASP claims sits in one of three evidence categories. They are kept
+apart because they are different promises: a mechanism proven once on hardware
+is not proof that a given client's copy works, and a feature that passes its
+tests has not yet met a real VM.
 
-| **Fix (source finding)** | **Status** | **What changed** |
-| --- | --- | --- |
-| Validator HTTP probe (16) | Done | validate-wordpress.sh dropped the BusyBox-incompatible wget for the same PHP-from-container probe the health check uses — no more false HTTP/security failures on Alpine |
-| Guided-upgrade exit status (10) | Done | update.sh upgrade now aggregates per-component results, prints a summary, and returns non-zero if any accepted upgrade failed — cron/monitoring no longer see success on a partial failure |
-| MariaDB LTS allowlist + EOL (7,8) | Done | Explicit supported/EOL allowlists replace the 'every future major.3 is LTS' guess; 10.6 is now flagged END-OF-LIFE and never offered |
-| MariaDB documented upgrade path (9) | Done | The guided upgrade offers only a documented single LTS step (10.6→10.11→11.4→11.8→12.3) and refuses to infer one from a rolling source |
-| Backup atomic publish (19) | Done | The scheduled backup stages to a hidden temp file and publishes with an atomic rename; both dumps gained --quick --hex-blob |
-| Heredoc scanner (22) | Done | scan-heredocs.py ships as a companion: a real pre-provision check for unsafe substitutions in unquoted heredocs |
-| Test-harness hardening | Done | 15 fixes incl. exit-status-aware assertions (no more false passes), cleanup traps, exact firewall-rule checks, atomic JSON + metadata, input validation |
+| Category | Means |
+|---|---|
+| **Proven on hardware** | Run on real Proxmox hosts and VMs, with the result recorded |
+| **Proven in automated tests** | Passes `test/run-all-checks.sh` (host shell and BusyBox), not yet run on a real VM |
+| **Awaiting client-environment validation** | Proven as a mechanism; each deployment must show it works with its own keys, network and accounts, and keep showing it |
 
-**Validator HTTP probe. **This was the highest-value find: validate-wordpress.sh still ran 'wget -S -O /dev/null --max-redirect=0 --tries=1 --timeout=8' — the exact GNU option set that BusyBox wget on Alpine rejects, and the exact bug already fixed in wp-health-check.sh but missed in the standalone validator. On a real VM it produced false 'no HTTP response' and 'login not blocked' results while the health checker passed. It now uses the identical PHP-from-container probe (follow_location=0, ignore_errors=true). The validator's existing source-IP awareness is preserved — when both login paths return 403 because this host isn't in ADMIN_CIDR, it still says 'cannot verify from this host' rather than failing.
+Then what is open, and what was decided against, with the reason. The history
+behind every entry (the reviews, field findings and decisions, in order) is
+kept unchanged in [`docs/history/TODO-HISTORY.md`](docs/history/TODO-HISTORY.md).
+What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
 
-**Guided-upgrade exit status. **update.sh upgrade called each component as 'do_..._update || echo warning', so a failure was swallowed and the function fell through returning its last command's status — usually zero. A monitoring wrapper or cron could therefore record a guided upgrade as fully successful when a component had actually failed and rolled back. It now tracks each result, prints an upgrade summary, and returns non-zero if any accepted component failed — the same discipline 'all' and 'digest-check' already had. Mock-tested both ways: a WordPress-fails run returns 1 with an 'Overall: FAILED' summary; an all-succeed run returns 0.
+## Proven on hardware
 
-**MariaDB LTS logic. **Two problems in one function. It classified every future major.3 branch (13.3, 14.3, …) as LTS by pattern — predicting release policy from a number, so an unannounced or preview .3 tag would be offered as a production upgrade the moment it appeared. And it still listed 10.6 as LTS after its community maintenance ended on 6 July 2026. Both are now explicit, maintained allowlists with a supported/EOL split: discovery shows 'LTS, supported' / 'LTS, END OF LIFE' / 'NOT an LTS line', and when the pinned line is EOL it prints a prominent migrate-now warning instead of implying the install is current. The guided upgrade additionally offers only a documented single LTS step and refuses to infer a jump from a rolling or unrecognized source.
+| Capability | Evidence |
+|---|---|
+| Signed releases: the signature is checked before any file is read, then every file against the signed manifest | In production since August 2026. A correct release verifies; a release with a file altered after signing is refused, naming the file. The 10.20 fleet upgrade (2026-11-15) verified on three VMs against each VM's pinned key |
+| Encrypted offsite backup restores on another machine | `remote-restore-drill`, 2026-08-20: object pulled from Cloudflare R2, decrypted with the operator's age key, restored into a throwaway MariaDB, 12 tables verified, RTO 33 s for a 977 KB archive. Proves the mechanism; see the per-client drill below |
+| WordPress image update: candidate, cutover, rollback | Cutover in both directions (6.9.4-php8.3 ↔ php8.4); rollback by fault injection (`test/vm-rollback-test.sh`): forced post-cutover failure, automatic restore, site healthy, nothing left behind |
+| Tooling upgrade (`wasp-upgrade.sh`) | 2026-11-15: three VMs at 10.4, 10.10 and 10.14 brought to 10.20, each verified, planned, backed up, hooks run, tools matching the manifest after |
+| wp-admin through the reverse proxy from LAN and overlay addresses (`RemoteIPInternalProxy`, 10.15) | Fixed by hand on two field VMs before 10.15 shipped; on a third, provisioned at 10.4, the image's own `remoteip.conf` was masked by hand on 2026-11-15 and Apache confirmed loading one declaration (`apache2ctl -D DUMP_INCLUDES`) |
+| Site import of a real compromised site | First real import in 10.11; what it found was fixed and is in `CHANGELOG.md` 10.11. The UpdraftPlus restore fixes in 10.16 came from a real import |
+| Content spam found and removed with evidence | 2026-11-15, a client site: 8 links in 3 pages and 4 Elementor widgets removed by `wp-links.sh clean --links`, a spam title restored, 104 spam revisions and 6 IndexNow entries removed, evidence and a database backup saved first each time. The same run exposed the false spam count fixed in 10.23 |
+| Login events reach CrowdSec | Field fault found 2026-08-20 (acquisition watched the wrong log file), fixed; `crowdsec-doctor` checks the file PHP writes is acquired |
+| PHP patched against CVE-2026-109618 / 109619 | 2026-11-15: all three production VMs on PHP 8.4.27 with `session.upload_progress` off; `validate-wordpress.sh` checks both |
 
-**Backup atomic publication. **The scheduled backup gzipped straight to its final wp-db-*.sql.gz name, so a crash during gzip could leave a truncated archive under a normal-looking filename for an operator or an external sync to pick up before the next run. It now compresses to a hidden .part file, integrity-checks it, and publishes with a single same-filesystem rename — the archive appears complete only once it is. Both the scheduled and the pre-update rollback dumps also gained --quick (row-by-row streaming for large tables) and --hex-blob (safe binary encoding).
+## Proven in automated tests, not yet on hardware
 
-## The integration harness now exists — and was hardened in the same pass
-
-The previous TODO named the integration-test harness as the explicit prerequisite for candidate database isolation. It exists now (test-wordpress-vm.sh), and the review of it surfaced a flaw worth calling out: its assertion helpers judged output without checking whether the guest command actually succeeded, so a command that failed to run — a missing script, a permission error, no guest-agent response — produced empty output and PASSED a negative assertion. A green result that could be built on a broken command undermines the entire point of the harness.
-
-That is fixed: every normal assertion now requires the command to succeed before its output is judged, with a dedicated helper for the expected-failure cases (the rollback test). Fifteen fixes landed in all — exit-status-aware assertions, signal-safe cleanup traps so an interrupted run can't orphan a test VM, four-specific-rule firewall checks instead of counting text, a health check gated on its exit status, a comment-free answers template, SSH host-key verification, input validation, and atomic JSON output with a build-metadata block. The assertion logic was mock-validated (a failed command with empty output now fails; grep -c's legitimate zero-count still passes), and the whole harness runs end-to-end under a mock Proxmox agent without error.
-
-## What's still open, and why
-
-| **Still open (source finding)** | **Status** | **Why it's deferred** |
-| --- | --- | --- |
-| Candidate DB isolation (17) | **DONE (light form)** — candidate runs under a temporary SELECT-only account, dropped on every exit path; `wasp-selftest.sh candidate-isolation` proves the grant refuses writes. Does NOT test migrations — see below | The harness this was gated on now exists, but the read-only-DB-account step still needs real-hardware validation before it ships |
-| Production findings approval (14) — CLOSED | **DONE** — the y/N override is now a recorded, digest-scoped, expiring exception with a written justification, emailed to a governance address chosen at install | Replacing the HIGH/CRITICAL override prompt with a root-owned, digest-scoped approval file adds an interactive flow that can't be tested without real hardware |
-| Off-VM backup gate (18) | **DONE** — optional at install (scp / rsync / rclone), pushed after each verified backup, size-confirmed remotely, and checked weekly by `wasp-selftest.sh`. Append-only destination is prompted for and reported honestly rather than assumed | Requiring/verifying a remote backup before a major DB upgrade is environment-specific (backup system, storage, job IDs) |
-| Egress restriction (20) — DESTINATION-AWARE, see Squid section | **DONE as an opt-in** (install prompt + `wp-hardening.sh egress-allow`); still not a default, for the reason below | Host-level egress rules are brittle against legitimate update paths; the network edge (OPNsense/Proxmox FW) is the right layer |
-| Trivy installer checksum (15) | **DONE** — pinned to v0.72.0 with the release checksums file anchored by SHA-256, plus a denylist refusing the known-compromised 0.69.4/0.69.5/0.69.6 builds regardless of install path | A pinned SHA-256 needs to be fetched and maintained per installer revision; shipping a wrong/placeholder hash would break installs |
-| CrowdSec key in argv (21) | Deferred | Eliminating the brief argv exposure depends on whether the installed cscli supports a stdin/fd interface |
-| Backup restoration proof | **DONE** — `wasp-selftest.sh restore-test` restores the newest archive into a throwaway isolated MariaDB and verifies schema, siteurl, users and row counts against production. Weekly | Confirming a scheduled backup archive is *structurally valid* (already done, atomically) is a different, much smaller claim than confirming it *restores clean* — the latter needs a throwaway MariaDB, a real restore, and a data-integrity check, with the same real-hardware-validation bar as candidate DB isolation above. Tracked separately rather than folded in, since it's a distinct piece of work even though both touch backups |
-| Full candidate/cutover/rollback harness coverage | **DONE** — cutover proven both directions (6.9.4-php8.3 ↔ php8.4), and rollback proven by fault injection (`test/vm-rollback-test.sh`): forced post-cutover failure, automatic restore to the original image, site healthy, no leftover container | test-wordpress-vm.sh exercises the rollback trigger (section 8) and the backup script (section 7), but not a full "bad candidate → automatic rollback → verified-healthy old version" run end to end. Real hardware and a deliberately-broken candidate image are both needed to build this safely |
-
-**On candidate DB isolation specifically. **It is no longer blocked on the absence of a harness — it's blocked on real-hardware validation, which is a smaller gap. The two designs from the last round still stand, simpler first: a temporary SELECT-only MariaDB user the candidate points at (reads work, any write-on-init fails harmlessly against production), or a full dump-and-restore into a throwaway container on an isolated network. Both change live container/DB/network orchestration, so both want the harness to prove them end-to-end on real hardware before they ship — the same reasoning that kept them out last time, now one step closer.
-
-**On the production findings override (14). **This is a fair hardening point: a plain yes/no prompt is weak evidence for accepting a known HIGH/CRITICAL vulnerability in production. The intended replacement — a root-owned approval file matching the exact image digest, CVE, approver, and expiry — is deferred rather than half-built because its whole value is in the interactive accept/deny flow, which can't be exercised without a real scan and real hardware. The current behavior is documented, not hidden: production is already fail-closed for a missing or incomplete scan; only a genuine findings result still prompts.
-
-**A note on the version comparator (finding 4). **The reviewer suggested rejecting non-numeric version fields rather than treating them as zero. Left as-is on purpose: the behavior fails SAFE — a malformed field sorts lowest, so it can never be mistaken for the newest release — and the tag-extraction functions already filter registry tags to a strict numeric pattern before the comparator ever sees them, so malformed input doesn't reach it.
-
-## Independent re-audit (post-restructuring)
-
-A second, independent evaluation was run against the split repository (`install.sh` + `lib/` + `payload/`) after the monolith-to-multi-file restructuring. It corroborated four already-tracked items above (candidate DB isolation, off-VM backup gate, Trivy findings override, Trivy installer checksum) without knowing they were already tracked — independent agreement worth noting, not a new signal on its own. It also surfaced genuinely new issues, all now fixed except where noted:
-
-| **Finding** | **Status** | **What changed / why deferred** |
-| --- | --- | --- |
-| Root SSH re-enabled as a fallback when admin-account creation failed | Fixed | Root SSH now stays disabled unconditionally; recovery is `qm terminal <vmid>` (console access, already guaranteed by the unconditional root password) rather than a network-facing fallback |
-| CrowdSec bouncer failure only ever warned, even in `production` | Fixed, then **corrected** in 10.4 | The original fix made `production` refuse to certify a VM whose local bouncer was not running and registered. Right for a directly-reachable VM, and actively wrong behind a reverse proxy: that bouncer bans real client addresses at a firewall no packet from those addresses passes through, so the gate demanded the one configuration that cannot work and read its presence as proof of enforcement. The gate now asks whether enforcement exists on this traffic path — a local bouncer when clients arrive directly, an authenticated upstream LAPI when they arrive via a proxy — and `local` behind a proxy is itself a blocker. See `README.md` → Behind a reverse proxy |
-| CrowdSec bans written on a WASP tenant behind a proxy enforce nothing (B2) | Fixed in 10.4 | Enforcement topology is chosen at install (`upstream` / `detect-only` / `local`) rather than assumed. `upstream` points the agent at a central LAPI and installs no local bouncer — its absence is deliberate, since a bouncer here would fill nftables with addresses that never send this VM a packet and be read later as evidence of blocking. `wp-hardening.sh cs-lapi` moves an existing VM; `cs-doctor` reads the recorded topology and adds a step asking whether a local ban can match real traffic at all |
-| `RemoteIPTrustedProxy` could be given a range (TRUST-COUNT) | Fixed in 10.4 | A CIDR lets any host inside it forge the client address in `X-Forwarded-For`, because `mod_remoteip` pops trusted entries off the right of the header — and that forged address is what CrowdSec bans, what `Require ip` allows for wp-admin, and what the login guard counts against. Refused by `install.sh`'s contract preflight before anything is built, asserted again in `lib/03` and `lib/06` where the directive is written, and held in the tree by `check-trusted-proxy.py`. The image's RFC1918 ranges cannot re-enter the tree: since 10.15 the check accepts only a single-variable `RemoteIPInternalProxy`, declared once |
-| GeoIP setup edited the installed update.sh: integrity check failed and wasp-upgrade.sh blocked on every GeoIP VM | Fixed in 10.20 | The pin stays in pinned.env; the upgrader recognises the old edit; `check-tool-self-edit.py` |
-| Spam detection and clean-up knew Elementor only; other builders, theme settings and site-editor parts went unseen | Fixed in 10.19 | The scan, `clean --links` and the save-time alert read every builder's storage (content, shortcodes, block settings, builder post meta, Customizer and theme settings, widgets, menus); tested on real WordPress |
-| Upgrading a VM meant pasting each release's block of commands by hand; nothing verified the release or checked the result | Added in 10.18 | `wasp-upgrade.sh`: verified against the VM's pinned key, planned, backed up, applied from `files.map`, safe to repeat, rolled back on request; an edited tool blocks it |
-| Removing found spam meant SQL and the Elementor editor by hand, page by page | Added in 10.18 | `wp-links.sh clean`: named widgets, titles, articles, revisions and IndexNow entries, through Elementor's save, evidence and a database backup first |
-| Spam saved into a page was seen only at the next weekly scan | Added in 10.18 | `content_spam` alert as it is saved, naming the page, widget and clean command |
-| Application passwords survive a password change; nothing listed the ones an import brought | Added in 10.18 | The import scan lists them; `wp-forensics.sh app-passwords` reviews and revokes |
-| Spam links pasted into pages passed every scan; finding them took six SQL queries | Added in 10.17 | `wp-links.sh spam` reads the content (and the import scan the dump) for injected links, spam titles and articles, and names the page and Elementor widget |
-| A link checker could not reach the site; checking meant a workstation and a hand-built command | Added in 10.17 | `wp-links.sh broken` crawls from the VM through the proxy, as a visitor |
-| Scan output was a wall of identical lines; the verdict was two numbers and a pointer to a command that did not exist | Fixed in 10.17 | Grouped by rule with explanations, relative paths, a verdict in words with next steps, and `wp-import.sh report` |
-| No one was told when an administrator was added, signed in from a new address, or changed credentials, two-factor, plugins or key settings; or when the site went down | Added in 10.16 | `07-wasp-alerts.php` emails WordPress-side events from settings an admin session cannot change; `wasp-alerts.sh` watches the site, the database's administrator list (catches SQL-planted accounts) and file integrity, which only logged before |
-| `wp-rotate-secrets.sh smtp` reported success and changed nothing | Fixed in 10.16 | It edited key names `smtp.ini` does not use; the site kept the old password and the relay banned the premises. Now writes `pass_b64`, reads it back, prompts instead of taking the password as an argument |
-| UpdraftPlus restore moved plugins' own `.sql` files into `db/` | Fixed in 10.16 | Broke LiteSpeed Cache and stopped the import over "7 dumps". The sweep is skipped for UpdraftPlus sets, as for `.wpress` |
-| Scanner noise: verified core files and chance `<?=` in images | Fixed in 10.16 | Core files hashing equal to the pinned image are not reported; `<?=` counts only outside binary media |
-| On-VM tooling check reported files a VM never keeps | Fixed in 10.16 | Checks only `payload/` and `stages/`, as staged; the signature still covers the whole manifest |
-| wp-admin returned Apache's 403 to every LAN/overlay administrator behind the proxy | Fixed in 10.15 | `RemoteIPTrustedProxy` discards private client addresses, so an administrator arriving over NetBird (masqueraded onto the LAN) was seen as the proxy and refused by `Require not ip <proxy>`, while internet visitors were substituted correctly. It was also declared in a second mounted file (`mods-enabled/remoteip.conf`); the lists append, so the first hand fix did nothing. Now one `RemoteIPInternalProxy <address>` in `wp-security.conf`, the second file a mask, `check-trusted-proxy.py` holding both, `validate-wordpress.sh` failing on the old form, and `wp-hardening.sh remoteip-fix` repairing existing VMs in place |
-| `uploads-php` escape hatch had no auto-expiration | Fixed | Opening it now writes a timestamp marker; a new 15-min cron check (`wp-hardening.sh check-expiry`) auto re-blocks after 1 hour |
-| CSP allowed `unsafe-eval` site-wide | Fixed | Scoped to a `<LocationMatch>` for `/wp-admin/` and `/wp-login.php` only (works correctly through the custom-slug rewrite too, since that rewrite resolves to the real paths before Apache serves the request) — the site-wide default no longer carries it |
-| CrowdSec bouncer config internally inconsistent on IPv6 (`disable_ipv6: false` alongside `nftables.ipv6.enabled: false`) | Fixed | This deployment's nftables ruleset has no IPv6 rules at all; the bouncer config now says `disable_ipv6: true` to match reality |
-| Test harness's SSH host-key trust was pure network TOFU | Fixed | Now cross-checks the network-observed key fingerprint against one fetched via the guest agent (a separate channel from the network path an attacker would need); falls back to the original TOFU behavior with a loud warning if the agent doesn't answer |
-| `README.md` referenced a LICENSE file that didn't exist | Fixed | Added |
-| `install-wordpress.sh`'s digest-pinning fail-closed path called a host-side-only function (`msg_error`) that doesn't exist in the VM's own execution context | Fixed | Found independently, not by either audit. `set -e` still caught it (confirmed empirically — it's not a silent bypass), but the operator got a bare "command not found" instead of the actual diagnostic. Added a real VM-side `err()` helper |
-| No signed/checksummed release manifest for repo content sourced or copied as root | Tracked below | Directly relevant to the curl-based installer bootstrap being built now — see that section rather than duplicating the reasoning here |
-| Rootful Podman as a category of risk | Not a bug | Already a documented, deliberate architecture choice (see README's Architecture section) — rootless was tried and removed in v7-6d for reliability reasons. Restated by the audit, not newly found |
-| Unverified Alpine image allowed to continue under `standard` profile | Not a bug | This is the literal, intended difference between `standard` and `production` — `production` already fails closed here. Restated by the audit, not newly found |
-## Third-party file-by-file security evaluation (46 files, hash-verified)
-
-A third independent evaluation reviewed all 46 files individually and published a
-SHA-256 for each. Those hashes were checked against this repository and **matched
-exactly**, so this review was demonstrably run against the current code, not a
-stale copy — which also means its "still open" items are genuinely open after the
-previous round's fixes, and two of them are cases where the earlier fix was real
-but did not go far enough.
-
-Overall verdict, quoted for accuracy rather than paraphrased favorably: *"Strong
-security engineering foundation; not yet ready for an unattended production
-certification gate."* That is a fair summary and worth keeping visible here.
-
-### Fixed in this round
-
-| **Finding** | **What changed** |
-| --- | --- |
-| SSH host-key check only warned on failure and always proceeded | Now a real gate. A guest-agent-verified key gets `StrictHostKeyChecking=yes` bound to a `known_hosts` containing only that verified key — which also closes a narrower TOCTOU window `accept-new` never covered (a MITM appearing between the scan and the connection moments later). An unverified or mismatched key now **skips** the SSH-dependent section rather than trusting it, with `--allow-unverified-sshid` as an explicit, named opt-out for a lab VM on a network path you already trust. This is the evaluator's own remediation ("retrieve the guest key… and *then* use `StrictHostKeyChecking=yes`"), which the previous round only half-implemented |
-| Host-side execution context not established before privileged work | `lib/00-preflight.sh` now fixes `PATH` to the standard system directories (so a hostile `PATH` entry can't substitute a lookalike `qm`/`qemu-nbd`/`curl`), sets `umask 027` as a floor under anything created without an explicit mode, sets `LC_ALL=C` for deterministic string/sort/regex behavior across every later file, and refuses to source or copy from a group/world-writable checkout |
-| Production profile allowed password-only SSH | Production now requires an SSH key and re-prompts until one is supplied, mirroring the existing force-enable pattern for digest pinning directly above it. Standard/lab is unchanged |
-| SSH agent forwarding and user scope | Added `AllowAgentForwarding no` and `AllowUsers <admin>`. Note: the evaluation also flagged TCP forwarding, X11 forwarding, and tunneling, but those three were **already** disabled in the generated config — only these two were genuinely missing |
-| No overlap protection on scheduled jobs | `wp-cron-run.sh` and `wp-db-backup.sh` each take a `mkdir`-based lock (matching `update.sh`'s existing convention rather than introducing a second locking style), detect a stale lock from a crashed run via recorded PID + `kill -0`, and log non-zero exits through `logger` instead of failing silently |
-
-### Still open, with reasoning
-
-**Signed release manifest — CLOSED. In production use since August 2026.**
-
-Releases are signed with minisign, the signature is verified before any file is
-read, and each file is then checked against the signed manifest. Both outcomes
-have been exercised on hardware: signatures validating on a correct release,
-and the manifest check refusing an install where files had been modified after
-signing — reporting correctly that the signature was valid and therefore a
-shipped file had been altered.
-
-The refusal is the more useful of the two. A verification that has only ever
-passed has not been tested.
-
-(original entry below)
-
-**Signed release manifest — MECHANISM NOW IMPLEMENTED, awaiting a key.**
-A maintainer-side tool (not shipped) signs a manifest with minisign; `install.sh`
-verifies signature-then-hashes before sourcing anything;
-`wasp-verify-integrity.sh` re-checks the installed tooling on the VM. What
-remains is a decision only the repository owner can make: generate the key,
-embed the public half in `install.sh`, and publish the fingerprint somewhere
-that is not this repository. Original note follows.
-
-**Signed release manifest (High, raised against four separate files).** This is the
-single most-repeated finding in the evaluation and the most substantial one still
-open. `install.sh` sources every `lib/*.sh` as host root; `lib/06` copies the whole
-payload into the guest; `install-wordpress.sh` executes every stage as guest root.
-Nothing cryptographically proves those files are the ones the project published.
-The permission check added this round narrows the window — it catches "another
-local account could have modified these since you fetched them" — but that is a
-genuinely weaker claim than "these are the published bytes," and should not be
-mistaken for it.
-
-The reason this isn't fixed here rather than deferred: a manifest is only worth
-what its key is worth. Generating a keypair inside a build sandbox and committing
-a "signature" next to the code it signs would produce something that *looks* like
-supply-chain assurance while verifying the repository against itself — which is
-exactly the trust circularity already documented in README's "Verifying what you
-run." Doing this properly needs a signing key held outside the repository, a
-release process that signs tags, and a published fingerprint users can check
-independently. Those are decisions for the repository owner, not something to
-manufacture unilaterally. Concretely, when that key exists: generate
-`MANIFEST.sha256` over `install.sh`, `lib/**`, and `payload/**`; sign it detached;
-have `install.sh` verify signature-then-hashes before sourcing any module; have
-`06-vars-and-payload-inject.sh` copy manifest and signature into the guest; and
-have `install-wordpress.sh` re-verify immediately before Stage 1. Until then, the
-honest posture is the one README already takes: this is the same trust model as
-any `curl | bash` installer, stated plainly rather than papered over.
-
-**Carried forward unchanged**, with reasoning unchanged from the sections above:
-candidate DB isolation (Critical — still the top item), off-VM backup gate,
-Trivy exception governance, Trivy installer checksum, egress restriction,
-backup *restore* proof (as distinct from structural verification), and full
-candidate-failure/rollback integration coverage. This evaluation independently
-reached all seven, which is corroboration of the existing assessment rather than
-new information.
-
-**Deliberately not changed: `allow_url_fopen = On` in `php-conf/security.ini`.**
-The evaluation recommends disabling it unless a verified plugin needs it. That is
-the right default for a locked-down single-purpose host, but this project targets
-real WordPress installs: `allow_url_include` (the directive that actually enables
-remote code inclusion) is already `Off`, while `allow_url_fopen` is used by many
-WooCommerce payment gateways and plugin APIs via `file_get_contents()`. Turning it
-off would silently break those integrations at runtime, which is a worse failure
-mode than the marginal risk it removes given `allow_url_include=Off`. The reasoning
-is already stated inline in the file at the point of use, and the recommended
-tighter control — restricting egress — is tracked separately above as its own item.
-
-**Deliberately not changed:** renaming `standard` to `lab` and making `production`
-the default. The recommendation is defensible, but it silently changes behavior for
-anyone with existing automation or documentation referencing the current names, and
-the profile difference is already stated at the prompt, in the summary, and in
-README. Worth doing at a major version boundary with a migration note — not as an
-unannounced change inside a patch round.
-
-## Planned: safe site import
-
-Importing an existing WordPress site is a stated future direction, and the
-malware scanner was built with it in mind rather than retrofitted later. Two
-design decisions were made now specifically to support it:
-
-- **`--path <dir>`** — every layer scans an arbitrary tree, not a hardcoded
-  `/home/wpuser/wp/html`. An import can therefore be staged somewhere
-  isolated and scanned *before* anything is activated.
-- **`--json <file>`** — machine-readable findings with severity counts, so an
-  import flow can gate on them programmatically instead of parsing console
-  output.
-
-What still needs building for import:
-
-1. **Staging area** — unpack the incoming files and database somewhere the
-   web server cannot reach, so a webshell in the archive is never executable
-   during inspection.
-2. **Database import scanning** — the current `db` layer queries a *live*
-   database. Import needs the same analysis against a dump file before it is
-   loaded, which is a different code path.
-3. **A gate with a defined policy** — what happens on a critical finding.
-   Refusing outright is wrong (people import known-compromised sites
-   deliberately, to clean them); proceeding silently is worse. Probably:
-   refuse by default, allow an explicit acknowledged override, quarantine
-   flagged files rather than importing them.
-4. **Core normalisation** — an imported site's core should be replaced with
-   the pinned image's core rather than trusted, since modified core files are
-   exactly what an attacker leaves behind.
-
-## Note on candidate DB isolation as implemented
-
-The read-only account is the lighter of the two designs discussed, and it is
-worth being precise about what it buys. It prevents the candidate from
-modifying production data, which was the actual risk. It does **not** validate
-that a schema migration will succeed, because a read-only candidate cannot
-run one.
-
-The heavier design — dump, restore into a throwaway instance, run the
-candidate against that copy — would validate migrations too, and remains
-unimplemented for the reason originally given: it adds minutes per gigabyte to
-every image update and introduces its own failure modes. The restore half of
-that work now exists and runs weekly as `wasp-selftest.sh restore-test`, so
-the dump is known to be restorable even though the candidate does not use it.
-
-An operator whose compliance regime requires full isolation can compose the
-two: restore into a scratch instance with `restore-test`, then point a
-candidate at it. The pieces are there; wiring them into every update by
-default is the part that is not worth the cost.
-
-## Vulnerability exception governance — final shape
-
-No approval workflow is implemented, and that is a decision rather than a gap.
-Request-and-approve belongs in whatever process the operator already runs;
-a half-built version inside an installer would add ceremony without adding
-oversight, and would be trusted as though it were real.
-
-What is implemented is everything that makes an out-of-band approval
-*reviewable* afterwards:
-
-- a written justification, minimum length enforced
-- scoped to the exact image digest, so it cannot silently cover a later image
-- the accepted CVEs recorded, so a reviewer can judge whether the reason holds
-- attributed and dated
-- expiring, with the decision required again rather than renewed by default
-- append-only root-owned log, with the email explicitly a copy of it
-- a reader (`wp-hardening.sh exceptions`) so the log is not write-only
-- a weekly warning 14 days before lapse
-
-The remaining gap is inherent: nothing here can verify that the stated
-justification was actually discussed with anyone. That is a property of the
-process around this system, not of this system.
-
-
----
-
-# Idea list — triage
-
-Positions on the remaining items, so a "no" is a decision with a reason
-rather than something that quietly fell off the list.
-
-## AIDE / Tripwire — NOT PLANNED, largely redundant here
-
-The gap AIDE fills is "has any file on this system changed unexpectedly".
-Most of that is already covered by mechanisms that are stronger *because they
-have an external reference*:
-
-- **WordPress core** is compared against `/usr/src/wordpress` inside the
-  **pinned, digest-verified** image. That is a cryptographically anchored
-  baseline, not a database this host generated about itself.
-- **The tooling** under `/usr/local/bin` is compared against the signed
-  manifest by `wasp-verify-integrity.sh`.
-- **Uploads, plugins and themes** are covered by the structural and YARA
-  layers, and by `wp-forensics.sh since-backup`.
-
-What AIDE would add is `/etc` and `/usr` on the host. Real, but narrower than
-it sounds: those paths change on every `apk upgrade`, which runs nightly, so
-the database needs re-baselining constantly and the signal decays into
-"packages updated again". An AIDE database stored on the host it audits is
-also trivially re-baselined by an attacker with root — the same limitation
-already documented for `wasp-verify-integrity.sh`, but without the signature
-that partially offsets it there.
-
-Reconsider if the VM ever stops auto-upgrading, or if a compliance regime
-requires host-level FIM by name.
-
-## Optional profile flag `lynis_extra=auditd+aide` — NOT PLANNED
-
-The stated motivation was "MSPs who want the score more than simplicity", and
-that is the argument against it. Installing auditd to raise a Lynis number,
-on a VM where nothing reads the audit log, adds a daemon, disk churn and an
-update surface in exchange for a metric. If an MSP needs auditd because a
-client's regime names it, that is a real requirement and belongs in
-`MSP-RUNBOOK.md` as a documented deviation — not a flag that makes a score
-look better.
-
-## LUKS for data volumes — NOT PLANNED as implemented, worth understanding
-
-Encrypting the VM's data volume protects against exactly one thing: someone
-obtaining the disk image without the running system. Against every other
-threat here it does nothing, because the key must be present for the VM to
-boot unattended.
-
-The options and what each actually buys:
-
-| Approach | Protects against | Cost |
+| Capability | Test | What would prove it on hardware |
 |---|---|---|
-| LUKS + passphrase at boot | Stolen disk image | **No unattended reboot.** Every kernel update needs a console |
-| LUKS + keyfile on the same disk | Nothing | The key sits beside the data |
-| LUKS + key from Proxmox host | Guest-only compromise | Hypervisor still reads both |
-| **Proxmox storage-level encryption** | Stolen physical disk | Transparent; no guest change |
-
-For a VM on a hypervisor you control, storage-level encryption is the honest
-answer — it covers the same threat without breaking unattended boot. If the
-threat is a hostile hypervisor operator, no guest-side measure helps.
-
-**What already covers the realistic case:** off-VM backups are `age`-encrypted
-with a public key, so the copies that leave your control are unreadable
-without a key that never touches the VM. That is where the data is genuinely
-exposed.
-
-## Header comments → docs/ — PARTIALLY, carefully
-
-Raised in an evaluation and in the idea list. The observation is fair: some
-headers are design documents.
-
-But the "why" comments have repeatedly been the thing that made a bug
-findable — the container-variable scope note, the fail-open explanation, the
-heredoc-quoting rationale. Moving them wholesale would optimise for a first
-read at the cost of every subsequent debugging session, and this project's
-history says the debugging sessions are what matter.
-
-Proposed compromise, not yet done:
-
-- Keep **decision rationale** inline. "Why this, not the obvious thing" is
-  worth its lines at the point of the decision.
-- Move **historical narrative** — "this failed in the field on date X, here is
-  the whole story" — to `docs/design-notes.md`, leaving a one-line reference.
-- Only touch files whose header exceeds ~60 lines.
-
-## Safe site import — IMPLEMENTED (v1), see docs/IMPORT-DESIGN.md
-
-`where`, `fetch`, `list`, `inspect`, `extract`, `scan`, `staged`, `apply`.
-Untested on real hardware. `.wpress` is read natively since 10.7; it has been
-tested against the plugin's own 4.5 archiver and a third-party builder of the
-7.x format, not yet against a real 7.x export.
-
-
-Full design written after researching the actual backup formats. Three things
-the research changed:
-
-- **All-in-One WP Migration's `.wpress` is a custom binary format**, not an
-  archive — fixed-width headers (255-byte name, 14-byte size, 12-byte mtime,
-  4096-byte path). A reader is needed, and writing one in POSIX shell is
-  unpleasant enough that it may be deferred to v2.
-- **UpdraftPlus splits into several archives** that must all be present. A
-  missing `-plugins.zip` produces a site that half-works confusingly, so the
-  set has to be validated before anything is extracted.
-- **Duplicator ships an `installer.php`** which is a documented site-takeover
-  vector. It is deleted on sight and never executed — a tool that runs one as
-  part of "restore" is doing the attacker's work. (10.11: recognised by the
-  installer *with* its archive, and deleted only outside `wp-content`; the
-  name alone matched Composer and broke plugins.)
-
-The design's central rule: nothing from the archive is reachable by the web
-server, or executed by anything, until it has been scanned. Extract to staging
-outside the docroot, scan there, decide there, move last. The natural
-implementation — extract into the docroot then scan — leaves a webshell live
-and serving for the duration of the scan, on a site being imported *because*
-it is suspected compromised.
-
-Two threats worth naming that most import tooling ignores entirely: the
-serialised `cron` option, where a scheduled task re-infects the filesystem
-after a clean and makes the malware look like it "came back"; and mu-plugins,
-which are active on arrival with no activation step to withhold.
-
-Implementation order is in the document. Steps 1–3 — `inspect`, bounded
-extraction, dump scanning — are worth shipping alone: "tell me what is in this
-backup before I touch it" is a real need, and it is the part with no
-destructive failure mode.
-
-## Original note
-
-Design notes already recorded above. The primitives exist: `--path` scanning,
-`--json` output, quarantine, core comparison against the pinned image. What is
-missing is the staging area, dump-file scanning before load, and a gate
-policy. This is the highest user-facing win and a session of its own.
-
-## Import pipeline — open after the first real import
-
-The first import of a real compromised site (10.11) fixed what it found: two
-false alarms, a prefix repair that could rename keys twice, a `scan` that
-checked nothing on a nested archive, and no check for renamed PHP. Later in
-10.11 all five items below were closed as well, together with automated
-remediation (`wp-malware-scan.sh remediate`, run by `wp-import.sh apply`).
-
-- **CLOSED (10.11) — `scan` does not look at mu-plugins.** `inspect` lists them and catches the
-  renamed case, and `apply` withholds them, but a live obfuscated
-  `mu-plugins/<name>.php` passes every structural check. mu-plugins needs its
-  own structural check: any top-level PHP there that is not WASP's own is a
-  finding. Now: SUSPECT for any foreign mu-plugin, CRITICAL if obfuscated.
-- **CLOSED (10.11) — no YARA rule for escape density.** `wpvm_escape_density`
-  and `wasp-threats.sh obfuscated`, calibrated on ~21,000 real PHP files. The real injector had no literal
-  `eval`, `base64_decode` or `curl_exec` — every name was `\xNN`-escaped and
-  dispatched through a wrapper. A PHP file that is mostly `\xNN`/`\NNN`
-  sequences is not ordinary code, and that generalises better than matching
-  names the author has already hidden.
-- **CLOSED (10.11) — rogue administrators are counted, not named.** Named from
-  the dump at `scan`, and from the live database by `wp-malware-scan.sh db`. The dump scan says
-  "N row(s) mention administrator". Printing login, email and registration
-  time would have shown the backdoor account — a foreign address, a
-  `wpadmin`+random-suffix login, registered at exactly midnight and backdated
-  before the owner's own account — in the first minute, not the fortieth.
-- **CLOSED (10.11) — cPanel account exports are not identified.** Named at
-  `inspect`; `.bash_history` surfaced at `extract`. The archive is reported as
-  `Type: unknown`, and `.bash_history`, `.trash` and the panel's state are not
-  surfaced. On the field test `.bash_history` was the most informative file
-  in the archive: it dated the previous cleanup to the minute.
-- **CLOSED (10.11) — WPVulnerability gives up after one refusal** and marks every remaining
-  component failed. On an unattended `wp-vuln-cron.sh` run a transient rate
-  limit becomes an INCOMPLETE verdict. One short backoff and a retry would
-  close it. Now three tries, honouring Retry-After (capped at 60s), for 429,
-  timeouts and 5xx alike.
-
-
----
-
-# Gap analysis — what is still missing
-
-From a systematic pass over the project rather than a summary of it.
-
-## Closed in this pass
-
-- **Dead container images were never reclaimed.** Every `update.sh` left the
-  superseded image on disk: roughly 700 MB each, so five updates is 3.5 GB on
-  a 20 GB volume. `update.sh` now prunes dangling images *after* the
-  post-cutover health check passes and `wordpress-old` is removed — the old
-  image IS the rollback path until that moment.
-- **Disk usage was reported, never acted on.** `wp-hardening.sh disk` breaks
-  down what is consuming the volume and what can be reclaimed;
-  `disk-check` runs twice daily and emails once above 80%.
-
-  80% rather than 95% is deliberate: MariaDB refuses writes before the disk
-  is actually full, the resulting errors say nothing about disk, and a backup
-  that runs out of space leaves you with neither the space nor the backup.
-
-## Open — real, not yet addressed
-
-### CrowdSec AppSec (10.13): not yet run against a real engine
-
-- **Rule names and the light config.** The light configuration names its
-  rules by the hub's patterns (`crowdsecurity/base-config`,
-  `crowdsecurity/vpatch-*`, `crowdsecurity/generic-*`). If a pattern does not
-  load, `wasp-appsec.sh on` rolls back and prints CrowdSec's log; it cannot
-  leave a broken engine. Run `wasp-appsec.sh on` and `test` on the first
-  real VM, and record the AppSec memory over a week (`status`, and the
-  Hive's sparkline).
-- **The upstream-LAPI key path.** AppSec on an agent-only VM, checking the
-  key against the central LAPI, has not been run.
-- **Remove the watchdog margin when 1.8.3 ships** with the coraza fix for
-  crowdsecurity/crowdsec#4797, and memory over a week shows it holds.
-  Re-measure first.
-- **Captcha and challenge.** A rule asking for either gets a plain 403 on
-  this path. That is acceptable for the light set, which is ban-only.
-
-### WASP Hive: parts not yet run against the real thing (10.12, 10.13)
-
-- **install.sh's Hive role has not run on a real Proxmox host.** lib/03, lib/06
-  and lib/07 are exercised by `test/test-hive-role.sh`; lib/01's prompts are
-  syntax-checked only.
-
-- **`install-hive.sh` has not run on a real Alpine VM.** Its parts were each
-  checked:
-  - the nftables ruleset with `nft -c`;
-  - the self-signed certificate and its SAN;
-  - extraction of the release key from `install.sh`;
-  - a BusyBox parse of the whole script.
-
-  The server it installs ran for real throughout. First real install: confirm
-  `apk add minisign` and `qrencode` resolve from the community repository,
-  that `supervise-daemon` restarts the service, and that the 443 redirect
-  answers from another host.
-- **The Wazuh connector has not met a real manager.** It is written to the
-  documented 4.x API and tested against a stand-in. The dashboard shows its
-  last error verbatim, so the first real run will say what differs.
-- **`/var/log/wasp-hive.log` is not rotated.** It is one line per request,
-  about 1,200 lines a day for 12 VMs plus the dashboard. That is small, but
-  unbounded. Add a weekly truncate or a busybox `logrotate` stanza.
-
-### Boot ordering says "started", not "ready"
-
-`wp-container` declares `need mariadb-container`. OpenRC waits for that
-service to *start*, and `podman start` returns when the container is running —
-not when MariaDB accepts connections, which takes 20–60s. A live VM was
-observed showing `mariadb Up 22 minutes (starting)`.
-
-WordPress reconnects per request so this is usually self-healing, and the
-visible symptom is a brief "Error establishing a database connection" after a
-reboot. Worth fixing with a readiness wait in `wp-container`'s start, using
-the existing `mariadb-health-check.sh`.
-
-**Deferred deliberately, with the reason recorded.** For the author running
-installs by hand across a dozen client VMs, this is recognisable and harmless:
-you know what a cold MariaDB looks like, you wait twenty seconds, you reload.
-
-It is NOT harmless for a stranger who found this on GitHub or Gitea. Their
-first reboot shows "Error establishing a database connection" on a site they
-just built, and the reasonable conclusion is that the project is broken. That
-is the whole first impression, spent on a race condition that resolves itself.
-A public project is judged by its worst thirty seconds.
-
-So the cost of not fixing it is not downtime, it is adoption — and until it IS
-fixed, the honest mitigation is to SAY SO: the completion banner and the Tier 0
-support section now tell the reader that a brief database error after a reboot
-is expected and self-clearing. Cheap, no risk to boot ordering, and it removes
-the "looks broken" failure without pretending the race is gone.
-
-### Nothing knows whether the site is reachable — CLOSED
-
-`wp-notify.sh --heartbeat` and `--heartbeat-url` are implemented and documented,
-and the heartbeat is on the cron schedule. Absence of a ping is the signal,
-which is exactly what an on-box check cannot produce for itself.
-
-This entry stayed open after the work was done. Worth noting as its own small
-lesson: a stale TODO claiming a gap you have already closed is worse than one
-naming a real gap, because an external reviewer reads it and marks you down for
-something that works. Verify before writing "not addressed".
-
-Still true, and the reason the item existed: the heartbeat only helps if the
-URL is actually configured. `validate-wordpress.sh --check` reports when it is
-not.
-
-### (former text) Nothing knows whether the site is reachable
-
-Every check here runs *on* the VM. If it is off, unreachable, or the
-hypervisor is down, nothing reports it — the VM cannot tell you it is gone.
-`MSP-RUNBOOK.md` says to pair this with external monitoring, but the project
-offers no help doing so.
-
-A `wp-notify.sh --heartbeat` writing to an external dead-man's-switch
-(healthchecks.io, Uptime Kuma) would close it cheaply: absence of a heartbeat
-is the signal, and absence is exactly what an on-box check cannot detect.
-
-### No secret rotation — ADDRESSED (in software; not yet hardware-proven)
-
-`wp-rotate-secrets.sh` now rotates salts, the WordPress DB password, the
-MariaDB root password, and the SMTP relay password (individually or `all`),
-in an order that keeps the site up, verifying each change before committing and
-rolling back on failure. It refuses the age backup key, since rotating that
-would orphan every existing encrypted backup. The incident playbook and this
-list previously promised "rotate every credential" with no means; that gap is
-closed. As with everything here, it has run against mocks and the check suite,
-not yet a live VM — the first rotation should be on a throwaway with a snapshot.
-
-### TLS certificates are entirely the proxy's problem
-
-Nothing here monitors expiry. If the proxy's renewal breaks, the first
-indication is a browser warning seen by a visitor. A check against the public
-endpoint would be cheap; a check from inside the VM cannot see the
-certificate at all, since TLS terminates at the proxy.
-
-### Bus factor — ADDRESSED (docs/KEY-CUSTODY.md)
-
-Written up as `docs/KEY-CUSTODY.md`: every secret, where it lives, what breaks
-if it is lost, and blanks to fill in per client.
-
-The point the document makes, and the reason it is worth having at all: every
-other risk on this platform is recoverable. A broken VM rebuilds, a compromised
-site restores, a bad firewall re-runs. **A lost age key is the only failure with
-no remedy** — every encrypted backup becomes permanently unreadable — and it is
-a filing problem, not a technical one. The private key is deliberately not stored
-on the VM (an attacker who reached the VM could otherwise decrypt the backups it
-just made), which is exactly what makes it a custody question.
-
-It ends with the question worth asking out loud: if you were unavailable for a
-month, could a colleague restore a client's site? If the answer depends on
-something only you know, the document is not finished.
-
-### (former) Bus factor
-
-Several things exist only in one place: the minisign secret key, the age
-backup private key, the CTI and Wordfence tokens. Losing the age key makes
-every encrypted backup permanently unreadable. `MSP-RUNBOOK.md` covers
-decommissioning; it does not cover the operator being unavailable.
-
-Worth a documented custody list — what exists, where it is held, and who else
-can reach it — rather than tooling.
-
-### Restore proven end to end — CLOSED 2026-08-20
-
-Proven on hardware. `remote-restore-drill` pulled an encrypted object from
-Cloudflare R2, decrypted it with the operator's age key, restored it into an
-isolated throwaway MariaDB and verified 12 tables — **RTO 33 seconds** for a
-977 KB archive.
-
-That closes the last item in this project that rested on reasoning rather than
-evidence. Everything else had been demonstrated; recovery had only ever been
-argued for.
-
-Still true, and the reason the drill exists rather than a one-off note: this
-proves the MECHANISM. Each deployment's own key, token and destination are
-unproven until the drill runs there. It is a monthly item on the MSP checklist,
-not a box ticked once.
-
-
-`wasp-selftest.sh restore-test` proves the *local* backup restores. The gap was
-that nobody had taken an *encrypted, off-VM* copy, decrypted it elsewhere, and
-restored it — the claim actually promised to a client.
-`wasp-offsite-backup.sh remote-restore-drill` now does exactly that round-trip:
-it pulls the real remote object (never a local shortcut), decrypts with the
-recovery key, restores into a throwaway MariaDB, verifies it is non-empty, and
-records the RTO. The tool exists and is tested in software — but the *run* is
-the point, and it still has to happen on real hardware against the real R2
-bucket. Until it does, offsite recovery is proven-by-construction, not
-proven-in-fact. This remains the single highest-value action on the list.
-
-### Admin MFA — shipped, with two optional follow-ups
-
-Admin two-factor enforcement now ships (Two Factor plugin + the
-`03-wpvm-mfa-enforce.php` enforcement mu-plugin, prompted at install, 21-case
-logic test in the suite). Two things are deliberately left as future options
-rather than built now:
-
-- **WebAuthn / passkeys.** The Two Factor plugin supports hardware keys and
-  passkeys through its companion *Two-Factor Provider: WebAuthn* plugin. The
-  enforcement mu-plugin already treats any configured non-email provider as
-  sufficient, so a passkey would satisfy it with no code change — installing the
-  companion is all that is needed. Not installed by default to keep the surface
-  minimal; add it per-site when a client wants hardware keys.
-- **Runtime re-verification that the plugin is still active.** `validate-
-  wordpress.sh` checks at run time that enforcement is not on with the plugin
-  inactive (the lockout state). It does not continuously watch for the plugin
-  being deactivated later. In practice the mu-plugin fails safe (it shows an
-  admin notice and does not enforce if the plugin vanished), and mu-plugins
-  cannot be switched off from the admin UI, so this is low priority — noted for
-  completeness.
-
-As with the rest of the platform, MFA is validated by the check suite and by
-construction, not yet by a real-hardware run. The first live install should
-deliberately lock out a test admin and confirm the console recovery path brings
-them back — that is the test that matters most, because it is the one whose
-failure is a client locked out of their own site.
-
-### Single generator for the slug rewrite rules — CLOSED 2026.08.13t
-
-Both generators now read payload/templates/slug-rewrite.rules. There is no
-second copy left to drift. check-slug-rewrites.py changed shape with it: it
-used to compare two hand-maintained copies for agreement, which was the best
-guarantee available while they were separate; it now verifies both READ the
-template and fails if a literal RewriteRule reappears in either.
-
-(original entry below)
-
-### Single generator for the slug rewrite rules
-
-The login-slug rewrite is currently produced twice — once into
-`wp-security.conf` by `lib/03-dynamic-configs.sh`, once into `.htaccess` by
-`payload/stages/04-apache-hardening.sh`. They drifted, and the result was a
-redirect loop that no individual check caught (see the 2026.08.11h entry).
-`check-slug-rewrites.py` now fails loudly if they disagree, which makes the
-duplication safe, but the real fix is one function emitting both. Worth doing
-the next time this area is touched.
-
-### CrowdSec does not see failed logins — ROOT CAUSE FOUND 2026-08-20
-
-**The original diagnosis in this entry was wrong**, and it is left below so the
-correction is visible rather than quietly rewritten.
-
-The real cause was not the 2FA hook. It was a filename. CrowdSec's acquisition
-watched `/var/log/wordpress/error.log`, while PHP's `error_log` directive writes
-to `php-errors.log` — so the Login Guard's events never reached CrowdSec at all.
-Not the 2FA ones; NONE of them.
-
-What makes this worth recording: every component was correct. The mu-plugin
-logged in exactly the format the parser expected, the parser's grok matched it,
-the scenario was installed and valid, the bouncer was registered and pulling,
-and the nftables set existed. A complete, healthy chain that could never fire,
-because the first link read the wrong file. The operator saw the application
-layer's 429 and no firewall ban, which is precisely the symptom.
-
-Fixed: the acquisition now watches both files, and `crowdsec-doctor` checks that
-the file PHP actually writes to appears in the acquisition — so a future
-mismatch is reported rather than silently swallowing every event.
-
-Still open, and genuinely separate: whether a failed SECOND FACTOR with a
-correct password produces an event at all. The Two Factor plugin does fire
-`wp_login_failed` (upstream issue #471 concerns it passing the wrong argument
-count), so it may already be covered now that the events are visible. That needs
-testing on hardware rather than reasoning — deliberately not claimed as fixed.
-
-### (original entry, kept for the record) CrowdSec does not see failed 2FA attempts
-
-Found in the field. A login with the CORRECT password and a wrong TOTP code
-fires no `wp_login_failed` event, so CrowdSec's WordPress scenarios never see
-it and no ban is issued. The Two Factor plugin's own rate limiter stops the
-attempt, which is why it looks handled -- but an attacker who already holds a
-valid password can grind second factors indefinitely without ever earning a
-firewall ban.
-
-Two contributing parts, and they need separating before fixing:
-
-  * WordPress emits no standard event for a failed second factor, so there may
-    be nothing in the log for CrowdSec to parse. A custom acquisition rule
-    against the Two Factor plugin's own log lines is the likely shape.
-  * The login guard's 429 may fire early enough that WordPress never records
-    enough failures for a scenario to trigger at all -- a control working so
-    well it starves the one behind it.
-
-Worth doing properly rather than quickly: a scenario that bans too eagerly on
-2FA prompts will lock out the legitimate admin who fat-fingered a code twice,
-which is a worse outcome than the gap.
-
-### Two files held OFFSITE_DEST — CLOSED 2026-08-20
-
-`offsite.conf` is what the tool reads; `vars.sh` held a second copy as the
-install record, and nothing said which won. An operator changed the bucket in
-`vars.sh`, verified the edit three ways, and `status` kept reporting the old
-destination — correctly, because that file is never read.
-
-Closed three ways: `set-destination` writes both and tests the result before
-declaring success, `status` reports a mismatch rather than silently preferring
-one, and the precedence is stated in the code and the README.
-
-The general lesson is worth keeping: a setting stored in two places with no
-stated precedence is not a duplication problem, it is a correctness problem.
-Anyone editing the wrong one gets no error, no warning, and no result.
-
-## From the v9.3 security evaluation (2026-08-20)
-
-15 MAJOR findings. Triaged honestly rather than all claimed as fixed.
-
-**Addressed in 2026.08.13o:**
-
-- *Mail doctor should compare current relay DNS with the active nftables set* —
-  done. SMTP egress is pinned to the addresses the relay resolved to at
-  install; a hosted relay behind a load balancer can move, and when it does
-  mail stops with no error anywhere. `wp-mail.sh doctor` now compares live DNS
-  against the ruleset and names `smtp-repin` when they diverge.
-
-**Accepted as documented trade-offs, not defects:**
-
-- *SMTP destination pinning fails open on DNS resolution failure* — deliberate.
-  Silently breaking a client's password resets to close a theoretical channel
-  is the wrong trade to make on their behalf. The fallback WARNS. Worth
-  revisiting for production specifically, where the calculus differs.
-- *Post-deployment Two Factor loss disables enforcement* — deliberate fail-safe.
-  The alternative locks every administrator out of a working site because a
-  plugin was removed.
-- ~~*This archive is not a signed Minisign release*~~ — **true of the evaluated
-  archive, not of the platform.** Signed releases have been in use since August;
-  what evaluators receive is a development tarball, which is why it verifies as
-  unsigned. A production install refuses an unverified release outright.
-  (original wording below)
-- *This archive is not a signed Minisign release* — correct. It is a development
-  tarball, and production installs refuse unverified releases.
-
-**Genuinely open, and worth doing:**
-
-- ~~*offsite.conf is root-executed shell configuration*~~ — **CLOSED
-  2026.08.13q.** Now parsed line by line against a five-key allowlist, verified
-  against an adversarial config containing $(touch) and backticks. A new check,
-  check-config-sourcing.py, prevents any config file being sourced again and
-  found two further instances on its first run.
-- ~~*The documented Trivy checksum anchor is not enforced*~~ — **CLOSED
-  2026.08.13r.** The anchor was declared and never read. The download now
-  verifies checksums.txt against it, then the binary against checksums.txt.
-  check-unused-security-vars.py prevents a security constant being declared
-  and never used again.
-- ~~*WordPress.org plugin installs are not checksum-verified immediately*~~ —
-  **CLOSED 2026.08.13s.** Both install paths now verify on completion, with
-  mismatch, verified and no-published-checksums reported distinctly. A mismatch
-  does not silently undo the install; it is reported with what to check.
-- *Candidate code still reads live sensitive data* — from an earlier evaluation,
-  still true, still real design work.
-- ~~*Add negative tests for the current fail-open paths*~~ — **CLOSED
-  2026.08.13t.** test/test-fail-closed.sh: 20 cases across six controls, each
-  supplying the failure condition and asserting the control closes, plus
-  structural guards that fail if a block_production call is deleted.
-
+| Credential rotation without downtime (`wp-rotate-secrets.sh`) | Suite, against stand-ins | A first rotation on a throwaway VM with a snapshot |
+| Two-factor enforcement and lockout recovery | `test/test-mfa-enforcement.php` | Lock a test administrator out deliberately and bring them back through the console |
+| Candidate update runs on a SELECT-only database account | `wasp-selftest.sh candidate-isolation` | Run it on a VM and keep the output with the VM's records |
+| CrowdSec AppSec request inspection (10.13) | `test/test-appsec.sh` | `wasp-appsec.sh on` and `test` on a real VM; its memory recorded over a week; the upstream-LAPI key path, which has never run |
+| WASP Hive installer and install.sh's Hive role | `test/test-hive.py`, `test/test-hive-role.sh` | `install-hive.sh` on a real Alpine VM (community packages resolve, `supervise-daemon` restarts, 443 redirect answers); the Hive role on a real Proxmox host; the Wazuh connector against a real manager |
+| `.wpress` archives in the 7.x format | `test/test-wpress-reader.php` (the plugin's 4.5 archiver and a third-party 7.x builder) | A real 7.x export |
+| `remoteip-fix` repairing a VM provisioned before 10.6 (10.21) | `test/test-remoteip-fix.sh` | The same repair ran by hand on a field VM; the tool's own run waits for the next such VM |
+| A failed second factor with a correct password reaches CrowdSec | None: needs a real Two Factor plugin | Fail a second factor on a VM and look for the event |
+| CI on Alpine (BusyBox native) | `.github/workflows/checks.yml`, written in 10.22 without access to an Alpine image | Its first green run; then drop its `continue-on-error` |
+
+## Awaiting client-environment validation
+
+Each of these is proven as a mechanism. What has to be shown again, per client,
+is that it works with that client's keys, accounts and network, so each is a
+recurring item on `docs/WEEKLY-CHECKLIST.md` and the client's record, not a box
+ticked once.
+
+| Check | How | When |
+|---|---|---|
+| This client's offsite backups restore (their key, token and bucket) | `wasp-offsite-backup.sh remote-restore-drill` | Monthly |
+| The newest local backup restores | `wasp-selftest.sh restore-test` | Weekly, from cron |
+| WordPress cannot reach anything not on its allowlist, even round the proxy | `wasp-egress test` | At onboarding and after any allowlist change |
+| Security alerts reach the operator | `wasp-alerts.sh test` | At onboarding and after any mail change |
+| An outside heartbeat is configured, so a dead VM is noticed | `validate-wordpress.sh --check` | At onboarding |
+| Every administrator is enrolled in two-factor | wp-admin → Users, each administrator's two-factor status (`validate-wordpress.sh` checks only that enforcement is on and working) | At onboarding, then monthly |
+| Someone other than the operator could restore this client | `docs/KEY-CUSTODY.md`, filled in | At onboarding, then yearly |
+
+## Open
+
+| Item | Why it matters | State |
+|---|---|---|
+| TLS certificates are not monitored | TLS ends at the proxy, so nothing on the VM sees a certificate. A missing `www` name on a client site's certificate was found on 2026-11-15 by `wp-links.sh broken`, not by monitoring | A check against the public endpoint is cheap and not yet written |
+| Boot ordering says "started", not "ready" | After a reboot WordPress can show "Error establishing a database connection" for 20–60 s while MariaDB starts | Deferred; the completion banner and support notes say it is expected. Fix: a readiness wait in `wp-container` using `mariadb-health-check.sh` |
+| Candidate update code still reads live data | The SELECT-only account stops writes, not reads | Design work |
+| The CrowdSec enrolment key is briefly visible in a process list | A local user could read it during install | Depends on whether the installed `cscli` takes the key on stdin |
+| `/var/log/wasp-hive.log` is not rotated | About 1,200 lines a day for 12 VMs; small, but unbounded | A weekly truncate or a `logrotate` stanza |
+| AppSec watchdog margin | A workaround for crowdsecurity/crowdsec#4797 | Remove when CrowdSec 1.8.3 ships the fix and a week's memory holds |
+| Elementor pass of the real-WordPress test is manual | CI runs `test-links-wordpress.sh` without Elementor (19 cases; 20 with) | Run it with `WASP_TEST_ELEMENTOR` before a release that touches the content tools |
+| Historical narrative in long file headers | Slows a first read | Partly: move field stories from headers over ~60 lines to `docs/design-notes.md`, keep decision rationale inline |
+| Rename the `standard` profile to `lab` and default to `production` | Clearer, but changes behaviour for existing automation | At a major version, with a migration note |
+
+## Not planned
+
+Decided, with the reason, so a "no" stays a decision rather than something that
+fell off the list. The full reasoning for each is in the history file.
+
+| Proposal | Decision |
+|---|---|
+| AIDE or Tripwire file integrity | Redundant here: core is compared with the pinned image, tooling with the signed manifest, content by the scanners. Host `/etc` and `/usr` change on every nightly `apk upgrade`. Reconsider if a client's regime names host FIM |
+| A `lynis_extra=auditd+aide` profile flag | Adds a daemon to raise a score nothing reads. A client regime that names auditd is a documented deviation per client |
+| LUKS inside the guest | Unattended boot needs the key present, so it protects only a stolen disk image. Proxmox storage-level encryption covers that without breaking reboots; offsite backups are already age-encrypted |
+| An approval workflow for vulnerability exceptions | Belongs in the operator's own process. What WASP records makes an approval reviewable: written, digest-scoped, expiring, attributed, in an append-only log |
+| `allow_url_fopen = Off` | Breaks many payment gateways and plugin APIs; `allow_url_include` is already off, and the egress allowlist is the stronger control |
+| A full dump-and-restore copy for every candidate update | Minutes per gigabyte on every update; the pieces exist for an operator whose regime requires it |
+| SMTP pinning that fails closed on DNS failure | Would silently break a client's password resets; it warns instead. Worth revisiting for `production` |
+| Enforcing two-factor after the Two Factor plugin is removed | Would lock every administrator out of a working site; enforcement steps aside and warns |
+| Rootless Podman everywhere | Tried and removed in v7-6d for reliability. A hybrid root and rootless design is being planned separately; this entry changes if it lands |

@@ -6,6 +6,116 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.23 — No false spam from ordinary words
+
+Found the same night 10.22 was built, on the site it was cleaning. After `clean --revisions` deleted every revision holding spam, `wp-links.sh spam` still reported "115 saved revision(s) also hold spam". All 115 belonged to the Home page, and none held spam. The page says the company are *specialists*.
+
+- **Two tests used two definitions of spam.**
+  - **The cleaner** judges each revision with the scanner's real test: links to spam domains, spam wording as whole words, Elementor widgets.
+  - **The scan's revision count** was an SQL `LIKE` on five words anywhere in the text, and "cialis" is inside "spe**cialis**t".
+- **The same flaw in the domain and address tests.** They match word fragments because domains and slugs run words together ("bestcasinoslots"). "cialis" matched *specialist*, *socialism* and *specialised*, and "casin" matched *casing*. Run against 10.22, the new test shows what that did:
+  - a link to a supplier such as `stonespecialists.example` was a spam link;
+  - `clean --links` would have accepted that domain;
+  - `clean --revisions` would have deleted the page revision that held the link.
+- **Fixed.** `cialis` and `casin` no longer match those words: `(?![tme])` and `(?!g)` in PHP, `([^tme]|$)` and `([^g]|$)` in the shell. `buycialisonline`, `cialis20mg` and `casino` still match. The change is made in all four places that carry the lists:
+  - the content scanner;
+  - the save-time alert (`07-wasp-alerts.php`);
+  - the import scan's two shell copies;
+  - the SQL pre-filter, which strips the regex syntax.
+- **One test for posts and revisions.** `wcs_post_is_spam()` is now in the scanner, and the cleaner calls it. The scan's revision count uses SQL only to narrow the candidates, then the same test, so the count is exactly what `clean --revisions` would delete.
+- **Tests.**
+  - `test-links.php`: specialist, socialism and window casing are not spam; pill and casino domains still are; a page about specialists linking a supplier named so is clean (42 cases).
+  - `test-links-wordpress.sh`, on real WordPress: a Home page about specialists with two revisions, plus a page that held a spam link for one save. The scan's count must equal the cleaner's list, and the Home revisions must be in neither (20 cases with Elementor). Against 10.22 this case fails: the scan counted 3 and the cleaner 2, where the right answer is 1.
+  - `test-links.sh` compares the PHP and shell spellings of the lists after translating one into the other.
+
+### Bringing a VM to 10.23
+
+No upgrade step of its own. 10.23 replaces the scanner, the cleaner, `wp-import.sh` and the alert mu-plugin:
+
+```sh
+doas sh /root/wasp-10.23/payload/bin/wasp-upgrade.sh check /root/wasp-10.23
+doas sh /root/wasp-10.23/payload/bin/wasp-upgrade.sh apply /root/wasp-10.23
+```
+
+## 10.22 — Readable status, CI, cleaner crawls
+
+This release changes what the repository says about itself as much as what it does. It acts on three suggestions from a review of the project, plus two fixes from cleaning up a client site.
+
+- **`TODO.md` sorted by evidence.** The old file was 783 lines of history, and it contradicted itself: the offsite restore was CLOSED in one section and still awaiting hardware in another. The new `TODO.md` sorts every capability into three categories:
+  - proven on hardware;
+  - proven in automated tests only;
+  - proven as a mechanism that each client deployment must show again with its own keys.
+
+  Each entry says what backs it. The file then lists what is open and what was decided against, with the reason. The old file is kept unchanged in `docs/history/TODO-HISTORY.md`.
+- **Subsystems.** `ARCHITECTURE.md` maps every shipped component to one of five subsystems:
+  - Core: provisioning and lifecycle;
+  - Security: hardening, detection and remediation;
+  - Recovery: backup, restore and integrity;
+  - Import: migration and inspection;
+  - Hive: fleet monitoring.
+
+  Nothing moves on disk: tool paths on every VM, the upgrade map and the integrity check depend on them. `test/check-subsystem-map.py` fails when a component is in no subsystem or in two, or when the map names something that no longer ships.
+- **CI.** `.github/workflows/checks.yml` runs on every push and pull request:
+  - the full suite on Ubuntu, as root, with BusyBox;
+  - the content tools against real WordPress 6.8.3, with WP-CLI 2.12.0 pinned by checksum; a skipped run fails the job;
+  - the shell suite inside Alpine, with only BusyBox's tools;
+  - on `main` and tags, the release signature and every file against the manifest.
+
+  CI never signs. The key stays offline, because every VM verifies upgrades against it: a key held by CI would let anyone who compromised CI ship a verified release to the fleet. The Alpine job was written without access to an Alpine image. It is marked `continue-on-error` until its first green run.
+- **The link crawler ignores `fax:` links.** `wp-links.sh broken` read `href="fax:…"` as a relative path, so a header fax link showed up as a missing page under every page: 22 false 404s on one site.
+  - **Non-web links:** any link with a scheme other than http or https is no longer treated as a path. Schemes a phone or desktop hands to an app (`tel:`, `sms:`, `geo:` and the like) are skipped.
+  - **Links no browser opens:** `fax:` and other unknown schemes are listed separately, once each, with how many pages carry them. They do not count as broken.
+- **Typed confirmations ignore pasted spaces.** `CLEAN`, `UPGRADE`, `ROLLBACK`, `IMPORT`, `REMEDIATE`, `PURGE` and `REPLACE` now ignore spaces and a stray carriage return. A pasted `CLEAN ` was refused on a client site, and nothing was applied: safe, but confusing.
+- **Tests.**
+  - `test-links.sh` has cases for `fax:` and `tel:` links (72 cases, host shell and BusyBox).
+  - `check-subsystem-map.py` is new.
+  - The CI WordPress step was run locally the way Actions runs it (18 passed, without Elementor).
+
+### Bringing a VM to 10.22
+
+The same as 10.21, with no upgrade step of its own:
+
+```sh
+doas sh /root/wasp-10.22/payload/bin/wasp-upgrade.sh check /root/wasp-10.22
+doas sh /root/wasp-10.22/payload/bin/wasp-upgrade.sh apply /root/wasp-10.22
+```
+
+## 10.21 — Older VMs trust only their proxy
+
+Found while bringing a VM provisioned at 10.4 up to 10.20. The 10.15 upgrade step reported that it could not complete. Apache in that VM still trusted three private ranges as proxies, although both of the files the step repairs were correct.
+
+- **The cause.** The WordPress image ships its own `conf-enabled/remoteip.conf`. It declares 10/8, 172.16/12 and 192.168/16 as internal proxies, so Apache accepts `X-Forwarded-For` from any private address, not only the configured proxy. Any host on a private network that can reach the VM directly could therefore choose the client address Apache logs, CrowdSec bans and the wp-admin rules match. VMs provisioned from 10.6 mount an empty file over it, recorded in `wp-run-extra.env` so that the GeoIP rebuild, the boot service and `update.sh` all keep it. A VM provisioned earlier has neither, and `remoteip-fix` only looked at WASP's two files.
+- **Fixed.** `wp-hardening.sh remoteip-fix` now also finds the image's file when it is live and when the mount is missing from `wp-run-extra.env`.
+  - **The repair.** It records the mount as its own line in `wp-run-extra.env`, keeping what the install recorded. It also disables the image's file in the running container, so the fix takes effect now rather than at the next rebuild.
+  - **A failure puts everything back.** A failed configtest restores the env file and the image's file, and restarts nothing.
+  - **No env file.** A VM without `wp-run-extra.env` gets the immediate fix. The repair reports that the fix will not survive a rebuild, and does not create the file blind, because that file also carries the site address and mail settings.
+- **The live check asks Apache.** It reads the directives from the files `apache2ctl -D DUMP_INCLUDES` lists. It used to search all of `/etc/apache2`, which also found the disabled original in `conf-available`.
+- **New upgrade step.** The 10.21 upgrade step runs the check, and the repair where needed, on every VM. VMs that had already passed 10.15 get it too. VMs provisioned from 10.6, and one fixed by hand, are recognised and left alone.
+- **Egress discovery names what it recognises.** `wasp-egress discovery report` names the Wordfence plugin's servers (`noc1.wordfence.com`), IndexNow, server-side Google Fonts, Gravatar and GitHub, and says when each is needed.
+  - **Why Wordfence matters.** A site running the plugin without access to its servers keeps stale firewall rules and malware signatures without saying so. The `www.wordfence.com` entry on the default list is WASP's own vulnerability feed, not the plugin's.
+  - **`wasp-egress status`** points to the report.
+- **No duplicate module warning.** New builds load `mod_remoteip` in `wp-security.conf` only if nothing else has. This removes `AH01574: module remoteip_module is already loaded` from every Apache start. Existing VMs keep the harmless warning, because that file is build-time configuration.
+- **Tests.** `test-remoteip-fix.sh` adds a VM provisioned before 10.6 and covers:
+  - the check;
+  - the repair, including the mount recorded once and the original line kept;
+  - sourcing the result;
+  - a second run as a no-op;
+  - the field hand fix, recognised;
+  - a failed configtest and a failed disable, both fully put back;
+  - a missing env file;
+  - a VM needing every repair at once.
+
+  It now has 70 cases under the host shell and BusyBox. `test-upgrade.sh` asserts that the 10.21 step runs.
+
+### Bringing a VM to 10.21
+
+```sh
+doas sh /root/wasp-10.21/payload/bin/wasp-upgrade.sh check /root/wasp-10.21
+doas sh /root/wasp-10.21/payload/bin/wasp-upgrade.sh apply /root/wasp-10.21
+```
+
+A VM with WASP's 10.15 remoteip form already restarts nothing for the 10.21 step. A VM that needs the repair restarts WordPress once, for a few seconds.
+
 ## 10.20 — GeoIP VMs upgrade cleanly
 
 Found by the first fleet upgrade to 10.19: `wasp-upgrade.sh check` reported `update.sh: MODIFIED since it was installed` on the two VMs with GeoIP filtering, and refused to go on. Nobody had tampered with them. WASP had made the change itself.
