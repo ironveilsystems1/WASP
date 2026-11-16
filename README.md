@@ -146,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.23` — and both exist only because the codebase
+same value — currently `10.24` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -3872,6 +3872,7 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.24 | **Alpine-only bugs, found by CI on Alpine.** BusyBox `date` has no relative dates and musl refuses regex repeat counts over 255; four tools fell back silently: vulnerability exceptions expired the day they were granted, "expiring soon" never fired, `security.txt` was written already expired, and the import scan's hidden-link check counted nothing. All fixed; `check-busybox-compat.py` refuses those forms |
 | 10.23 | **No false spam from ordinary words.** The spam domain and address tests matched "cialis" inside *specialist* and "casin" inside *casing*, so a supplier named for its specialists read as a spam domain that `clean --links` would accept, and the scan counted every revision of a page about specialists as spam. Both fixed in the scanner, the save-time alert and the import scan; the scan's revision count now uses the cleaner's own test |
 | 10.22 | **Readable status, CI, cleaner crawls.** `TODO.md` sorts every capability by its evidence (proven on hardware, in automated tests, or per client), its history archived; `ARCHITECTURE.md` maps every component to one of five subsystems, held by a check; a GitHub Actions workflow runs the full suite, real WordPress and Alpine, and verifies the release signature without ever holding the key. `wp-links.sh broken` lists `fax:` and other non-web links as links visitors cannot follow instead of 404s; typed confirmations ignore a pasted space |
 | 10.21 | **Older VMs trust only their proxy.** A VM provisioned before 10.6 still read the WordPress image's own `remoteip.conf`, which declares every private range a proxy, so Apache took `X-Forwarded-For` from any private address. `wp-hardening.sh remoteip-fix` (run by the 10.21 upgrade step) records the mask in `wp-run-extra.env`, disables the file in the running container, and verifies against the files Apache actually loads. `wasp-egress discovery report` names common denials (the Wordfence plugin's `noc1.wordfence.com`, IndexNow, Google Fonts, Gravatar, GitHub) and when each is needed |

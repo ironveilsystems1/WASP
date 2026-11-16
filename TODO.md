@@ -1,6 +1,6 @@
 # WASP — status and open work
 
-*As of 10.23 (2026-11-15).*
+*As of 10.24 (2026-11-16).*
 
 Everything WASP claims sits in one of three evidence categories. They are kept
 apart because they are different promises: a mechanism proven once on hardware
@@ -44,7 +44,7 @@ What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
 | `.wpress` archives in the 7.x format | `test/test-wpress-reader.php` (the plugin's 4.5 archiver and a third-party 7.x builder) | A real 7.x export |
 | `remoteip-fix` repairing a VM provisioned before 10.6 (10.21) | `test/test-remoteip-fix.sh` | The same repair ran by hand on a field VM; the tool's own run waits for the next such VM |
 | A failed second factor with a correct password reaches CrowdSec | None: needs a real Two Factor plugin | Fail a second factor on a VM and look for the event |
-| CI on Alpine (BusyBox native) | `.github/workflows/checks.yml`, written in 10.22 without access to an Alpine image | Its first green run; then drop its `continue-on-error` |
+| CI on Alpine (BusyBox native) | `.github/workflows/checks.yml`. Its first run (10.23) found four Alpine-only bugs, fixed in 10.24 | Its first green run; then drop its `continue-on-error` |
 
 ## Awaiting client-environment validation
 

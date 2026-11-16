@@ -6,6 +6,39 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.24 — Alpine-only bugs, found by CI on Alpine
+
+The CI workflow added in 10.22 ran on real Alpine for the first time and found four bugs that had shipped for many releases. Each fails silently, and only on Alpine, which is what every VM runs. The check suite's BusyBox pass never saw them: the build host's BusyBox is linked against glibc, so it borrows glibc's `date` parsing and regex engine. Alpine's BusyBox uses musl.
+
+- **Vulnerability exceptions expired the day they were granted.** `update.sh` computed the expiry with `date -d "+90 days"`. BusyBox `date` has no relative dates, so the fallback gave today's date. An operator who accepted a finding for 90 days was blocked again by the next update.
+- **"Expiring soon" never fired.** `wp-hardening.sh exceptions` and the weekly check computed the warning date with `+14 days` and fell back to today, so no exception was ever reported as about to lapse.
+- **`security.txt` was written already expired.** `wp-hardening.sh security-txt` used `+1 year` and fell back to now. RFC 9116 treats an expired file as stale, so the contact it publishes looked out of date from the moment it was written.
+- **The import scan's hidden-link check never ran.** Its pattern used `[^<]{0,300}`, and musl refuses a repeat count over 255. `grep` failed, the count was empty, and every import scan reported no hidden links.
+- **Fixed.**
+  - Every date is now an epoch offset (`date -d "@$(( $(date +%s) + N * 86400 ))"`), which BusyBox and GNU `date` read the same way. `update.sh` and `security-txt` refuse to record a date they could not work out, where before they recorded a wrong one.
+  - The pattern is `{0,250}`.
+- **New check.** `test/check-busybox-compat.py` fails on a relative `date` or `touch` date, and on a regex repeat count over 255 in a shell script. It finds all seven instances in 10.23.
+- **Tests that only GNU could run.**
+  - Two tests aged files with `touch -d '5 days ago'`; they now use epoch dates.
+  - `test-alerts.sh` counted GNU `diff`'s `<`/`>` lines, which BusyBox `diff` does not print by default.
+  - The nft tests now report when `nft` is present but may not check a ruleset (it needs `CAP_NET_ADMIN`). Before, "a broken ruleset is rejected" passed for the wrong reason in that case.
+- **CI.**
+  - The Alpine container gets `CAP_NET_ADMIN` and PHP's curl extension.
+  - `actions/checkout` is v5, which runs on Node 24; v4 drew the Node 20 deprecation warning.
+  - The Alpine job stays `continue-on-error` until its first green run.
+
+### Bringing a VM to 10.24
+
+No upgrade step. It replaces `update.sh`, `wp-hardening.sh` and `wp-import.sh`.
+
+- **Exceptions already accepted on a VM** carry the wrong expiry date (the day they were granted). List them with `doas wp-hardening.sh exceptions`.
+- **A `security.txt` written before** carries an expired date. Re-run `doas wp-hardening.sh security-txt <contact>`.
+
+```sh
+doas sh /root/wasp-10.24/payload/bin/wasp-upgrade.sh check /root/wasp-10.24
+doas sh /root/wasp-10.24/payload/bin/wasp-upgrade.sh apply /root/wasp-10.24
+```
+
 ## 10.23 — No false spam from ordinary words
 
 Found the same night 10.22 was built, on the site it was cleaning. After `clean --revisions` deleted every revision holding spam, `wp-links.sh spam` still reported "115 saved revision(s) also hold spam". All 115 belonged to the Home page, and none held spam. The page says the company are *specialists*.
