@@ -1,0 +1,121 @@
+# WASP checks: the same suite a release is signed after (docs/SIGNING.md step 2),
+# run on every push and pull request.
+#
+# What this does NOT do: sign. The minisign key stays offline with the release
+# owner (docs/KEY-CUSTODY.md). Every VM verifies upgrades against the key pinned
+# on it at build, so a key held by CI would let anyone who compromised CI ship a
+# "verified" release to the whole fleet. CI only checks a signature that is
+# already there.
+name: checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: Full suite (Ubuntu, with BusyBox)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install what the suite uses
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox yara nftables jq zip unzip \
+            php-cli php-mysql php-sqlite3 php-zip php-mbstring
+      # Root: the repair tests (remoteip-fix and others) refuse to run without it,
+      # exactly as the tools do on a VM.
+      - name: test/run-all-checks.sh
+        run: sudo env BUSYBOX="$(command -v busybox)" bash test/run-all-checks.sh
+
+  wordpress:
+    name: Content tools against real WordPress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PHP and MariaDB
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq php-cli php-mysql php-mbstring mariadb-server
+      # Pinned: the versions the release was tested against. WP-CLI by checksum.
+      - name: WordPress 6.8.3 and WP-CLI 2.12.0
+        run: |
+          git clone --quiet --depth 1 --branch 6.8.3 https://github.com/WordPress/WordPress.git "$RUNNER_TEMP/wp"
+          curl -fsSL -o "$RUNNER_TEMP/wp-cli.phar" \
+            https://github.com/wp-cli/wp-cli/releases/download/v2.12.0/wp-cli-2.12.0.phar
+          echo "ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c  $RUNNER_TEMP/wp-cli.phar" | sha256sum -c -
+      # Without Elementor: 19 cases. The Elementor pass (Document::save) needs a
+      # built Elementor and stays a manual step before a release that touches the
+      # content tools (test/README.md).
+      - name: test/test-links-wordpress.sh
+        run: |
+          # rc captured with ||: Actions runs bash with -e, which would stop at a failing $( ).
+          rc=0
+          out=$(sudo env WASP_TEST_WP="$RUNNER_TEMP/wp" WASP_TEST_WPCLI="$RUNNER_TEMP/wp-cli.phar" \
+                bash test/test-links-wordpress.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          # SKIPPED exits 0: here it would mean nothing ran, so it fails the job.
+          if printf '%s' "$out" | grep -q SKIPPED; then echo "::error::the real-WordPress test skipped"; exit 1; fi
+          exit "$rc"
+
+  alpine:
+    name: Shell tools on Alpine (BusyBox native)
+    runs-on: ubuntu-24.04
+    container: alpine:3.20
+    timeout-minutes: 45
+    # Not yet run anywhere: written in 10.22 without access to an Alpine image.
+    # Remove this line after its first green run, so it gates like the others.
+    continue-on-error: true
+    steps:
+      # actions/checkout needs the runner's glibc node, which an Alpine container
+      # cannot run, so the tree is fetched with git.
+      - name: Fetch the tree
+        run: |
+          apk add --no-cache git bash
+          git clone --quiet "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" wasp
+          git -C wasp checkout --quiet "${GITHUB_SHA}"
+      # No coreutils, grep or sed packages: the tools must work with BusyBox's.
+      - name: Install what the suite uses
+        run: |
+          apk add --no-cache python3 curl jq zip unzip yara nftables \
+            php83 php83-mysqli php83-sqlite3 php83-pdo_sqlite php83-zip php83-mbstring php83-ctype php83-tokenizer
+          ln -sf /usr/bin/php83 /usr/bin/php
+      - name: test/run-all-checks.sh
+        working-directory: wasp
+        run: BUSYBOX=/bin/busybox bash test/run-all-checks.sh
+
+  signature:
+    name: Release signature
+    # Only where a signed release lives. A development branch carries an older
+    # signature in the tree that no longer matches its manifest, by design.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+      # The same three checks a VM runs before it trusts a release (docs/SIGNING.md).
+      - name: Verify MANIFEST.sha256 against the key in install.sh, then every file
+        run: |
+          if [ ! -f MANIFEST.sha256.minisig ]; then
+            echo "::error::no MANIFEST.sha256.minisig: this release is not signed"; exit 1
+          fi
+          # shellcheck disable=SC2016 # the $ is literal: it matches install.sh's text
+          PUB=$(sed -n 's/^WASP_PUBKEY="\${WASP_PUBKEY:-\(RW[^}]*\)}".*/\1/p' install.sh)
+          [ -n "$PUB" ] || { echo "::error::no WASP_PUBKEY in install.sh"; exit 1; }
+          minisign -Vm MANIFEST.sha256 -P "$PUB"
+          sha256sum -c --quiet MANIFEST.sha256
+          echo "Signed, and every file matches the signed manifest."
