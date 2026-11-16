@@ -78,6 +78,10 @@ which does what:
   run it before every release that touches the content tools.
   `test/test-links-wordpress.sh` checks that the scan's count of spam revisions
   equals what `clean --revisions` would delete (they once used two tests).
+  `test/check-busybox-compat.py` fails on GNU-only forms that break quietly on
+  Alpine: relative dates for `date`/`touch`, and regex repeat counts over 255.
+  The local BusyBox pass cannot see these when that BusyBox is built against
+  glibc; the Alpine CI job can.
   `test/check-subsystem-map.py` fails when a shipped component is in no
   subsystem of ARCHITECTURE.md's map, in two, or no longer ships.
   The same suite runs in CI (`.github/workflows/checks.yml`) on every push:

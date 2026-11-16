@@ -93,7 +93,11 @@ EOF
     || _f "$L: setup" "$(cat "$INI"; stat -c %a "$INI")"
   ino=$(ls -i "$INI" | awk '{print $1}'); cp "$INI" "$W/before"
   _a off code_change >/dev/null
-  { grep -qx 'code_change = off' "$INI" && [ "$(diff "$W/before" "$INI" | grep -c '^[<>]')" = 2 ] \
+  # Lines that differ, counted without diff: BusyBox diff prints unified format
+  # by default, so counting GNU diff's "<"/">" lines found nothing there.
+  { grep -qx 'code_change = off' "$INI" \
+    && [ "$(wc -l < "$W/before")" = "$(wc -l < "$INI")" ] \
+    && [ "$(awk 'NR == FNR { a[FNR] = $0; next } a[FNR] != $0' "$W/before" "$INI" | wc -l | tr -d ' ')" = 1 ] \
     && [ "$(ls -i "$INI" | awk '{print $1}')" = "$ino" ]; } \
     && _p "$L: off changes that one key, in place" || _f "$L: off" "$(diff "$W/before" "$INI")"
   _a on code_change >/dev/null; grep -qx 'code_change = on' "$INI" && _p "$L: on turns it back" || _f "$L: on" ""

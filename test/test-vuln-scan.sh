@@ -120,7 +120,7 @@ o=$(_scan); rc=$?
 [ "$rc" = 3 ] && _p "a failed feed download with no cache is incomplete" || _f "failed feed" "exit $rc"
 
 _reset; _conf 'WORDFENCE_API_KEY=t' 'WPVULNERABILITY=0'; wf '{}'; _scan >/dev/null
-touch -d '5 days ago' "$T/cache/wordfence-scanner.json"; rm -f "$T/wf.json"
+touch -d "@$(( $(date +%s) - 5 * 86400 ))" "$T/cache/wordfence-scanner.json"; rm -f "$T/wf.json"
 o=$(_scan); rc=$?
 [ "$rc" = 3 ] && _p "a stale feed that cannot refresh is incomplete" || _f "stale" "exit $rc"
 

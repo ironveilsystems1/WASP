@@ -36,7 +36,14 @@ printf '%s\n' "$_nft" | grep -q 'table inet hive' && ! printf '%s\n' "$_nft" | g
 printf '%s\n' "$_nft" | grep -q 'ip saddr { 10.20.0.0/24, 10.40.0.0/16 } tcp dport 8443 accept' \
   && _p "the service port is limited to the dashboard and WASP VM networks" || _f "service rule" "$(printf '%s' "$_nft" | grep 8443)"
 printf '%s\n' "$_nft" | grep -q 'tcp dport 443 redirect to :8443' && _p "443 is redirected to the unprivileged service" || _f "redirect" ""
-if command -v nft >/dev/null 2>&1; then
+_nft_usable() {   # nft is installed AND may check a ruleset here (needs CAP_NET_ADMIN)
+  command -v nft >/dev/null 2>&1 || return 1
+  _pf=$(mktemp); printf 'table inet wasp_probe {\n}\n' > "$_pf"
+  nft -c -f "$_pf" >/dev/null 2>&1; _pr=$?; rm -f "$_pf"; return "$_pr"
+}
+if command -v nft >/dev/null 2>&1 && ! _nft_usable; then
+  _f "nft is installed but cannot check rulesets here (it needs CAP_NET_ADMIN): the ruleset was not checked" ""
+elif command -v nft >/dev/null 2>&1; then
   printf '%s\n' "$_nft" | sed '/^after-return$/d' > "$T/hive.nft"
   nft -c -f "$T/hive.nft" 2>"$T/nft.err" && _p "nft accepts the ruleset" || _f "nft -c" "$(cat "$T/nft.err")"
 fi

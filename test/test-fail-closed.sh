@@ -358,7 +358,14 @@ echo "── Generated nftables syntax"
 #
 # The install aborted earlier on an unrelated storage typo, so this never
 # reached a running VM. It would have.
-if command -v nft >/dev/null 2>&1; then
+_nft_usable() {   # nft is installed AND may check a ruleset here (needs CAP_NET_ADMIN)
+  command -v nft >/dev/null 2>&1 || return 1
+  _pf=$(mktemp); printf 'table inet wasp_probe {\n}\n' > "$_pf"
+  nft -c -f "$_pf" >/dev/null 2>&1; _pr=$?; rm -f "$_pf"; return "$_pr"
+}
+if command -v nft >/dev/null 2>&1 && ! _nft_usable; then
+  _f "nft is installed but cannot check rulesets here (it needs CAP_NET_ADMIN): the nft cases did not run" ""
+elif command -v nft >/dev/null 2>&1; then
   _nftok() {   # does this saddr value produce a loadable ruleset?
     local v="$1" f; f=$(mktemp)
     printf 'table inet t {\n chain c {\n  type filter hook input priority 0; policy drop;\n  ip saddr { %s } tcp dport 22 accept\n }\n}\n' "$v" > "$f"

@@ -246,7 +246,7 @@ _imp clean "$_id" >/dev/null
 
 # ── clean --stale ───────────────────────────────────────────────────────────
 _reset; _mkset "$T/inbox" "$P"
-touch -d '40 days ago' "$T/inbox/$P"-*.zip
+touch -d "@$(( $(date +%s) - 40 * 86400 ))" "$T/inbox/$P"-*.zip   # epoch: BusyBox touch has no '40 days ago'
 printf 'new\n' > "$T/inbox/new-site.zip"
 _o=$(_imp clean --stale 30 --yes); _rc=$?
 { [ "$_rc" = 0 ] && [ ! -e "$T/inbox/$P-plugins.zip" ] && [ -e "$T/inbox/new-site.zip" ] && [ -e "$T/inbox/$P-db.gz" ]; } \
