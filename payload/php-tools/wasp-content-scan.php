@@ -52,8 +52,13 @@
 // Domains: substring match on the host. "slot" is here and not in the text
 // list: an ordinary site can say "slotted post", but has no reason to link to a
 // host with "slot" in its name.
+// Substrings, because domains and slugs run words together ("bestcasinoslots").
+// Two are also inside ordinary words, found on a field site: "cialis" in
+// speCIALISt / soCIALISm / speCIALISE, and "casin" in CASINg (window and door
+// casing). (?![tme]) and (?!g) keep those out; "buycialisonline", "cialis20mg"
+// and "casino" still match.
 function wcs_spam_host_re() {
-    return '/(casin|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)/i';
+    return '/(casin(?!g)|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis(?![tme])|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)/i';
 }
 // Words in link text, titles and visible text. Whole words, many languages.
 function wcs_spam_text_re() {
@@ -61,7 +66,7 @@ function wcs_spam_text_re() {
 }
 // URL slugs run words together ("onlinecasinoguide"): substring.
 function wcs_spam_slug_re() {
-    return '/(casino|kasino|kasyno|kaszino|cassino|scommess|apuesta|gambling|poker|roulette|blackjack|jackpot|bookmaker|viagra|cialis|levitra|kamagra|porn|payday)/i';
+    return '/(casino|kasino|kasyno|kaszino|cassino|scommess|apuesta|gambling|poker|roulette|blackjack|jackpot|bookmaker|viagra|cialis(?![tme])|levitra|kamagra|porn|payday)/i';
 }
 function wcs_hidden_style_re() {
     return '/(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(px|pt|em|rem)?\s*(;|$)|(left|top|text-indent)\s*:\s*-\d{3,}\s*px|height\s*:\s*0(px)?\s*;\s*overflow\s*:\s*hidden|opacity\s*:\s*0(\.0+)?\s*(;|$))/i';
@@ -86,7 +91,7 @@ function wcs_clip($s, $n = 70) {
 /** The substrings of wcs_spam_host_re(), for a cheap SQL pre-filter (LIKE). */
 function wcs_spam_terms() {
     preg_match('/\((.*)\)/', wcs_spam_host_re(), $m);
-    return explode('|', $m[1]);
+    return array_map(function ($t) { return preg_replace('/\(\?![^)]*\)/', '', $t); }, explode('|', $m[1]));
 }
 
 /**
@@ -197,6 +202,30 @@ function wcs_type_label($type) {
         'vc_grid_item' => 'WPBakery grid template', 'fusion_template' => 'Avada layout', 'fusion_element' => 'Avada library element',
     );
     return $map[$type] ?? $type;
+}
+
+/**
+ * Does a post or revision hold spam? The one test for both the scan's count of
+ * spam revisions and the cleaner's choice of which to delete. Until 10.23 the
+ * scan counted with SQL LIKE '%cialis%' and four other words, so every revision
+ * of a page saying "specialists" was spam: 115 on a clean field site, after the
+ * cleaner (using this test) had rightly deleted the real ones.
+ */
+function wcs_post_is_spam($title, $slug, $content, $edata, array $site_hosts) {
+    $ob = array();
+    if ($title !== '' && preg_match(wcs_spam_text_re(), $title)) { return 'title'; }
+    if ($slug !== '' && preg_match(wcs_spam_slug_re(), $slug)) { return 'address'; }
+    foreach (wcs_html((string) $content, $site_hosts, $ob) as $x) {
+        if ($x[0] === 'spam_link' || $x[0] === 'spam_text') { return 'content'; }
+    }
+    if (is_string($edata) && $edata !== '') {
+        foreach (wcs_elementor($edata, $site_hosts, $ob) as $w) {
+            foreach ($w['findings'] as $x) {
+                if ($x[0] === 'spam_link' || $x[0] === 'spam_text') { return 'Elementor widget ' . $w['widget']; }
+            }
+        }
+    }
+    return '';
 }
 
 function wcs_html(string $html, array $site_hosts, array &$outbound) {
@@ -598,9 +627,21 @@ foreach ($q("SELECT option_name, option_value FROM {$p}options WHERE option_name
 }
 $ix = $opt('rank_math_indexnow_log');
 $ix = $ix !== null ? @unserialize($ix, array('allowed_classes' => false)) : null;
-$rev = $q("SELECT COUNT(*) FROM {$p}posts WHERE post_type = 'revision' AND (post_content LIKE '%casino%'
-             OR post_content LIKE '%kasino%' OR post_content LIKE '%viagra%' OR post_content LIKE '%cialis%'
-             OR post_title LIKE '%casino%')");
+// Revisions: the SQL only narrows the candidates; wcs_post_is_spam() decides,
+// the same test `wp-links.sh clean --revisions` deletes by.
+$rlike = array();
+foreach (array_merge(wcs_spam_terms(), array('casino', 'kasino', 'cialis', 'viagra', 'porn')) as $t) {
+    $e = mysqli_real_escape_string($db, $t);
+    $rlike[] = "r.post_content LIKE '%{$e}%' OR r.post_title LIKE '%{$e}%' OR m.meta_value LIKE '%{$e}%'";
+}
+$rev_hosts = array_values(array_filter(array(wcs_bare(wcs_host($opt('home') ?: $opt('siteurl') ?: '')))));
+$rev_n = 0;
+foreach ($q("SELECT r.post_title, r.post_content, m.meta_value FROM {$p}posts r
+               LEFT JOIN {$p}postmeta m ON m.post_id = r.ID AND m.meta_key = '_elementor_data'
+              WHERE r.post_type = 'revision' AND (" . implode(' OR ', array_unique($rlike)) . ")") as $r) {
+    if (wcs_post_is_spam((string) $r[0], '', (string) $r[1], (string) $r[2], $rev_hosts) !== '') { $rev_n++; }
+}
+$rev = array(array($rev_n));
 $report = wcs_analyze(array(
     'siteurl' => $opt('home') ?: $opt('siteurl'),
     'posts' => $posts, 'elementor' => $el, 'meta' => $meta, 'options' => $options, 'menus' => $menus, 'widgets' => $widgets,

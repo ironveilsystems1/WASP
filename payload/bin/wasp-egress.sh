@@ -297,6 +297,7 @@ status)
   grep -E 'TCP_DENIED|DENIED' "${LOGS}/access.log" 2>/dev/null | tail -8 \
     | awk '{print "    "$4" "$7}' | sort -u || echo "    (none)"
   echo ""
+  _note "What each denial is, and whether it is needed:  wasp-egress discovery report"
   _note "Prove the boundary actually holds:  wasp-egress test"
   ;;
 
@@ -477,6 +478,31 @@ discovery)
   fi
   printf '  %-8s %s\n' "HITS" "DESTINATION"
   printf '%s\n' "$_d" | sed 's/^/  /'
+  # Destinations seen on real sites, named so the operator is not left to
+  # guess. Naming one is not a recommendation to allow it: each line says when
+  # it is needed. Unknown hosts get no hint -- they are the ones to look at.
+  # (www.wordfence.com is WASP's own vulnerability feed and is on the list;
+  # noc1 is the Wordfence PLUGIN's, and a site that runs the plugin without it
+  # silently keeps stale firewall rules and malware signatures.)
+  _known=$(printf '%s\n' "$_d" | awk '{print $2}' | while read -r _h; do
+    case "$_h" in
+      noc[0-9]*.wordfence.com)
+        printf '  %s\n      Wordfence plugin: firewall rules, malware signatures, blocked IPs.\n      REQUIRED if the site runs Wordfence:  wasp-egress allow %s --permanent\n' "$_h" "$_h" ;;
+      *.indexnow.org|indexnow.org)
+        printf '  %s\n      IndexNow: an SEO plugin telling search engines a page changed.\n      UNNECESSARY at runtime. After a spam cleanup, open it briefly if you\n      want pages re-crawled sooner:  wasp-egress allow %s --for 30\n' "$_h" "$_h" ;;
+      fonts.googleapis.com|fonts.gstatic.com)
+        printf '  %s\n      Google Fonts fetched by the server. Usually UNNECESSARY: visitors'"'"'\n      browsers load fonts themselves. A "host fonts locally" option needs it\n      once:  wasp-egress allow %s --for 15\n' "$_h" "$_h" ;;
+      *.gravatar.com|gravatar.com)
+        printf '  %s\n      Gravatar avatars fetched by the server. UNNECESSARY.\n' "$_h" ;;
+      api.github.com|raw.githubusercontent.com|codeload.github.com|objects.githubusercontent.com)
+        printf '  %s\n      A plugin or theme updating from GitHub. MAINTENANCE: open it while\n      updating,  wasp-egress allow %s --for 60\n' "$_h" "$_h" ;;
+    esac
+  done)
+  if [ -n "$_known" ]; then
+    echo ""
+    echo "  Recognised:"
+    printf '%s\n' "$_known"
+  fi
   echo ""
   echo "  Classify each as:"
   echo "    REQUIRED     the site genuinely does not work without it"

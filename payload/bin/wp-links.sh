@@ -145,17 +145,26 @@ broken)
   _slug="${WP_ADMIN_SLUG:-}"
   W=$(mktemp -d) || exit 2
   trap 'rm -rf "$W"' EXIT
-  : > "$W/seen"; : > "$W/queue"; : > "$W/status"; : > "$W/edges"; : > "$W/ext"; : > "$W/assets"
+  : > "$W/seen"; : > "$W/queue"; : > "$W/status"; : > "$W/edges"; : > "$W/ext"; : > "$W/assets"; : > "$W/odd"
 
   # Normalise a link found on page $2 to an absolute URL, or nothing.
+  # A link with any other scheme is not a path. 10.21 and earlier read
+  # href="fax:5550100" as a relative path, so every page "linked to" a
+  # missing /<page>/fax:5550100 -- 22 false 404s on one field site. Schemes
+  # a device hands to an app are skipped; any other goes to $W/odd, reported
+  # as a link visitors cannot follow rather than as a broken page.
   _abs() {
     _l=$(printf '%s' "$1" | sed 's/&amp;/\&/g; s/#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')
     case "$_l" in
-      ''|mailto:*|tel:*|javascript:*|data:*|sms:*|whatsapp:*) return ;;
+      ''|mailto:*|tel:*|javascript:*|data:*|sms:*|whatsapp:*|callto:*|skype:*|geo:*|maps:*|facetime:*|facetime-audio:*|webcal:*|tg:*|viber:*) return ;;
       //*)      printf '%s:%s' "$_scheme" "$_l" ;;
       http://*|https://*) printf '%s' "$_l" ;;
       /*)       printf '%s%s' "$_origin" "$_l" ;;
-      *)        _d=$(printf '%s' "$2" | sed 's#[^/]*$##'); printf '%s%s' "$_d" "$_l" ;;
+      *)        _sch=${_l%%:*}
+                if [ "$_sch" != "$_l" ] && printf '%s' "$_sch" | grep -qE '^[A-Za-z][A-Za-z0-9+.-]*$'; then
+                  printf '%s\t%s\n' "$_l" "$2" >> "$W/odd"; return
+                fi
+                _d=$(printf '%s' "$2" | sed 's#[^/]*$##'); printf '%s%s' "$_d" "$_l" ;;
     esac
   }
   _lhost() { printf '%s' "$1" | sed -E 's#^[a-zA-Z]+://##; s#[/?].*$##; s#:[0-9]+$##' | tr 'A-Z' 'a-z'; }
@@ -269,6 +278,20 @@ broken)
   fi
   [ "$_left" -gt 0 ] && { echo ""; _warn "Stopped at ${_max} pages with ${_left} still queued:  wp-links.sh broken --max-pages $((_max * 2))"; }
 
+  # Links visitors cannot follow: not broken pages, so not in the count above.
+  if [ -s "$W/odd" ]; then
+    echo ""
+    _warn "Links that are not web addresses (most browsers open nothing for these):"
+    cut -f1 "$W/odd" | sort | uniq -c | sort -rn | while read -r _n _l; do
+      _np=$(awk -F '\t' -v l="$_l" '$1 == l { print $2 }' "$W/odd" | sort -u | grep -c .) || _np=0
+      printf '     %s   on %s page(s)\n' "$_l" "$_np"
+      case "$_l" in
+        fax:*) printf '       Show the number as plain text; a fax number cannot be clicked.\n' ;;
+      esac
+    done
+    _note "Usually one link in the header or footer: fix it there once."
+  fi
+
   echo ""
   _ne=$(cut -f1 "$W/ext" | sort -u | grep -c .) || _ne=0
   if [ "$_ne" -gt 0 ]; then
@@ -354,6 +377,9 @@ clean)
   if [ "$_yes" != 1 ]; then
     [ -t 0 ] || { rm -f "$_plan"; _bad "Not a terminal: add --yes to apply without the prompt."; exit 1; }
     printf '  Apply the changes above? Type CLEAN to continue: '; read -r _ans
+    # Spaces and a stray CR from a paste are not part of the word (a field operator's
+    # CLEAN was refused for a trailing space and nothing was applied).
+    _ans=$(printf '%s' "$_ans" | tr -d ' \t\r')
     [ "$_ans" = CLEAN ] || { rm -f "$_plan"; _note "Not applied."; exit 1; }
   fi
   _ev="${EVIDENCE}/content-spam-$(date -u +%Y%m%dT%H%M%SZ)"

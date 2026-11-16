@@ -524,6 +524,7 @@ _confirm() {
   [ -t 0 ] || _die "Not a terminal: re-run with --yes to apply without the prompt." "" 1
   printf '  Apply this upgrade? Type UPGRADE to continue: '
   read -r _ans
+  _ans=$(printf '%s' "$_ans" | tr -d ' \t\r')   # a pasted space is not part of the word
   [ "$_ans" = UPGRADE ] || _die "Not applied." "" 1
 }
 
@@ -611,7 +612,7 @@ rollback)
   _confirm_rb() {
     [ "$_YES" = 1 ] && return 0
     [ -t 0 ] || _die "Not a terminal: re-run with --yes." "" 1
-    printf '  Type ROLLBACK to continue: '; read -r _ans; [ "$_ans" = ROLLBACK ] || _die "Not rolled back." "" 1
+    printf '  Type ROLLBACK to continue: '; read -r _ans; _ans=$(printf '%s' "$_ans" | tr -d ' \t\r'); [ "$_ans" = ROLLBACK ] || _die "Not rolled back." "" 1
   }
   _confirm_rb
   # The staged trees are restored whole, so nothing the upgrade added lingers.

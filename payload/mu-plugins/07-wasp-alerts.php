@@ -537,7 +537,7 @@ unset($wasp_alerts_opt);
 // The word list is the content scanner's (test-links.sh holds the copies
 // together). One email per page per day while the spam stays.
 function wasp_alerts_spam_host_re() {
-    return '/(casin|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)/i';
+    return '/(casin(?!g)|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis(?![tme])|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)/i';
 }
 
 /**

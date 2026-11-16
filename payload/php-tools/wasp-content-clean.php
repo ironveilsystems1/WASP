@@ -80,22 +80,9 @@ function wcc_widgets($data, array $site_hosts) {
     return $out;
 }
 
-/** Does a post (or revision) hold spam by the scanner's test? */
+/** Does a post (or revision) hold spam? The scanner's own test, shared. */
 function wcc_post_is_spam($title, $slug, $content, $edata, array $site_hosts) {
-    $ob = array();
-    if ($title !== '' && preg_match(wcs_spam_text_re(), $title)) { return 'title'; }
-    if ($slug !== '' && preg_match(wcs_spam_slug_re(), $slug)) { return 'address'; }
-    foreach (wcs_html((string) $content, $site_hosts, $ob) as $x) {
-        if ($x[0] === 'spam_link' || $x[0] === 'spam_text') { return 'content'; }
-    }
-    if (is_string($edata) && $edata !== '') {
-        foreach (wcs_elementor($edata, $site_hosts, $ob) as $w) {
-            foreach ($w['findings'] as $x) {
-                if ($x[0] === 'spam_link' || $x[0] === 'spam_text') { return 'Elementor widget ' . $w['widget']; }
-            }
-        }
-    }
-    return '';
+    return wcs_post_is_spam($title, $slug, $content, $edata, $site_hosts);
 }
 
 /** Split an IndexNow log into [kept, dropped]: an entry is spam when its address is. */

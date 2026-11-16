@@ -1662,10 +1662,27 @@ SNIPPET2
     # rewritten IN PLACE (`cat tmp > file`): sed -i or mv replaces the inode
     # and the running container keeps reading the old file.
     #
+    # 10.21: a THIRD source. The WordPress image ships its own
+    # conf-enabled/remoteip.conf declaring 10/8, 172.16/12 and 192.168/16 as
+    # internal proxies -- Apache then takes X-Forwarded-For from ANY private
+    # address, not only PROXY_IP. VMs provisioned from 10.6 mount an empty file
+    # over it, recorded in wp-run-extra.env so every path that recreates the
+    # container keeps it. A VM provisioned earlier has neither, and the two-file
+    # repair above passed on one (a 10.4 VM upgraded to 10.20) while Apache
+    # still read all three ranges. So this now also records the mount, and
+    # disables the image's file in the running container until the next rebuild
+    # applies the mount. The live check asks Apache which files it loads,
+    # instead of searching /etc/apache2, where the disabled original still sits
+    # in conf-available.
+    #
     #   remoteip-fix           repair, configtest, restart, verify
     #   remoteip-fix --check   report only; exit 1 if a repair is needed
     _rf_sec="${WASP_RF_SEC:-$APACHE_CONF}"
     _rf_mask="${WASP_RF_MASK:-/home/wpuser/wp/apache-mods/remoteip.conf}"
+    _rf_env="${WASP_RF_ENV:-/etc/wp-install/wp-run-extra.env}"
+    _rf_imask="${WASP_RF_IMGMASK:-/home/wpuser/wp/apache-conf/remoteip-masked.conf}"
+    _rf_imgc=/etc/apache2/conf-enabled/remoteip.conf
+    _rf_mount="${_rf_imask}:${_rf_imgc}:ro"
     _rf_check=0; [ "${2:-}" = "--check" ] && _rf_check=1
     echo ""
     echo "mod_remoteip declaration"
@@ -1700,8 +1717,21 @@ SNIPPET2
       echo "     Correct it by hand, then re-run this." >&2
       exit 1
     fi
-    if [ "$_rf_legacy" = 0 ] && [ "$_rf_maskdir" = 0 ] && [ "$_rf_have" = 1 ]; then
+    # The image's file: live if the running container reads directives from it
+    # (-s: once masked it is an empty file; once disabled it is gone). An exec
+    # that fails -- container stopped -- reads as "not live", and the env check
+    # below still catches a VM that lacks the mount.
+    _rf_img=0; _rf_envneed=0; _rf_noenv=0
+    PRUN exec wordpress test -s "$_rf_imgc" >/dev/null 2>&1 && _rf_img=1
+    if [ -f "$_rf_env" ]; then
+      grep -qF -- "$_rf_mount" "$_rf_env" || _rf_envneed=1
+    else
+      _rf_noenv=1
+    fi
+    if [ "$_rf_legacy" = 0 ] && [ "$_rf_maskdir" = 0 ] && [ "$_rf_have" = 1 ] \
+       && [ "$_rf_img" = 0 ] && [ "$_rf_envneed" = 0 ]; then
       echo "  ✔  RemoteIPInternalProxy ${PROXY_IP}, declared once. Nothing to repair."
+      [ "$_rf_noenv" = 1 ] && echo "  ⚠  ${_rf_env} is missing: if the image's ${_rf_imgc} returns on a rebuild, nothing masks it."
       exit 0
     fi
     if [ "$_rf_legacy" = 0 ] && [ "$_rf_have" = 0 ]; then
@@ -1712,8 +1742,17 @@ SNIPPET2
     fi
     [ "$_rf_legacy" = 1 ] && echo "  ⚠  wp-security.conf uses RemoteIPTrustedProxy (discards private client addresses)"
     [ "$_rf_maskdir" = 1 ] && echo "  ⚠  ${_rf_mask} still configures mod_remoteip (a second declaration)"
-    echo "     Symptom: wp-admin returns Apache's 403 to an administrator arriving"
-    echo "     through ${PROXY_IP} from a LAN or overlay (e.g. NetBird) address."
+    if [ "$_rf_legacy" = 1 ] || [ "$_rf_maskdir" = 1 ]; then
+      echo "     Symptom: wp-admin returns Apache's 403 to an administrator arriving"
+      echo "     through ${PROXY_IP} from a LAN or overlay (e.g. NetBird) address."
+    fi
+    if [ "$_rf_img" = 1 ]; then
+      echo "  ⚠  The image's own ${_rf_imgc} is live: it declares 10/8, 172.16/12"
+      echo "     and 192.168/16 as proxies, so Apache takes X-Forwarded-For from ANY"
+      echo "     private address, not only ${PROXY_IP}."
+    fi
+    [ "$_rf_envneed" = 1 ] && echo "  ⚠  ${_rf_env} does not mount the mask over it, so it returns on every rebuild"
+    [ "$_rf_noenv" = 1 ] && echo "  ⚠  ${_rf_env} is missing (a VM provisioned before it existed)"
     if [ "$_rf_check" = 1 ]; then
       echo "     Repair:  doas wp-hardening.sh remoteip-fix"
       exit 1
@@ -1721,12 +1760,19 @@ SNIPPET2
     _rf_tmp=$(mktemp) || exit 1
     _rf_bsec=$(mktemp) || exit 1
     _rf_bmask=$(mktemp) || exit 1
+    _rf_benv=$(mktemp) || exit 1
     cat "$_rf_sec" > "$_rf_bsec"
     [ -f "$_rf_mask" ] && cat "$_rf_mask" > "$_rf_bmask"
+    [ -f "$_rf_env" ] && cat "$_rf_env" > "$_rf_benv"
+    _rf_imgrm=0; _rf_imadd=0
     _rf_restore() {
       cat "$_rf_bsec" > "$_rf_sec"
       [ -f "$_rf_mask" ] && cat "$_rf_bmask" > "$_rf_mask"
-      rm -f "$_rf_tmp" "$_rf_bsec" "$_rf_bmask"
+      [ -f "$_rf_env" ] && cat "$_rf_benv" > "$_rf_env"
+      [ "$_rf_imadd" = 1 ] && rm -f "$_rf_imask"
+      # Debian's a2enconf link, as the image ships it.
+      [ "$_rf_imgrm" = 1 ] && PRUN exec wordpress ln -s ../conf-available/remoteip.conf "$_rf_imgc" >/dev/null 2>&1
+      rm -f "$_rf_tmp" "$_rf_bsec" "$_rf_bmask" "$_rf_benv"
     }
     sed "s/^\([[:space:]]*\)RemoteIPTrustedProxy[[:space:]][[:space:]]*${_rf_re}[[:space:]]*\$/\1RemoteIPInternalProxy ${PROXY_IP}/" \
       "$_rf_sec" > "$_rf_tmp"
@@ -1742,6 +1788,27 @@ SNIPPET2
     fi
     echo "  ✔  wp-security.conf: RemoteIPInternalProxy ${PROXY_IP}"
     [ -f "$_rf_mask" ] && echo "  ✔  ${_rf_mask}: masked (no directives)"
+    # The mask over the image's file: recorded once, in the one list the GeoIP
+    # rebuild, the OpenRC service and update.sh all read. Appended as its own
+    # line: the file is sourced, so it extends whatever the install recorded.
+    if [ "$_rf_envneed" = 1 ]; then
+      if [ ! -e "$_rf_imask" ]; then
+        : > "$_rf_imask" && chmod 0644 "$_rf_imask" && _rf_imadd=1
+      fi
+      printf 'WP_EXTRA_VOLS="${WP_EXTRA_VOLS} -v %s"\n' "$_rf_mount" >> "$_rf_env"
+      echo "  ✔  ${_rf_env}: the image's remoteip.conf is masked from the next rebuild on"
+    fi
+    if [ "$_rf_img" = 1 ]; then
+      if PRUN exec wordpress rm -f "$_rf_imgc" >/dev/null 2>&1; then
+        _rf_imgrm=1
+        echo "  ✔  The image's remoteip.conf is disabled in the running container"
+      else
+        _rf_restore
+        echo "  ✗  Could not disable ${_rf_imgc} in the container. Restored the" >&2
+        echo "     original files; nothing was restarted." >&2
+        exit 1
+      fi
+    fi
     _rf_ct=$(PRUN exec wordpress apache2ctl configtest 2>&1) || {
       _rf_restore
       echo "  ✗  apache2ctl configtest failed. Restored the original files; nothing" >&2
@@ -1749,7 +1816,7 @@ SNIPPET2
       printf '%s\n' "$_rf_ct" | sed 's/^/       /' >&2
       exit 1; }
     echo "  ✔  apache2ctl configtest: Syntax OK"
-    rm -f "$_rf_tmp" "$_rf_bsec" "$_rf_bmask"
+    rm -f "$_rf_tmp" "$_rf_bsec" "$_rf_bmask" "$_rf_benv"
     PRUN restart wordpress >/dev/null 2>&1 || {
       echo "  ✗  podman restart wordpress failed. The files are repaired; start the" >&2
       echo "     container: rc-service wp-container restart" >&2
@@ -1757,9 +1824,10 @@ SNIPPET2
     echo "  ✔  WordPress restarted"
     # Ask the running container what Apache actually reads: the only evidence
     # that matters, since the 10.14 field fix looked right on disk and did not
-    # take effect.
+    # take effect. The files Apache loads, from Apache itself -- not a search of
+    # /etc/apache2, which also finds conf-available copies nothing includes.
     _rf_live=$(PRUN exec wordpress sh -c \
-      "grep -rhE '^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]' /etc/apache2/ 2>/dev/null" \
+      'apache2ctl -t -D DUMP_INCLUDES 2>/dev/null | sed -n "s/^[[:space:]]*([0-9*]*)[[:space:]]*//p" | while read -r f; do grep -hE "^[[:space:]]*RemoteIP(Internal|Trusted)Proxy[[:space:]]" "$f" 2>/dev/null; done' \
       2>/dev/null | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sort -u)
     if [ "$_rf_live" = "RemoteIPInternalProxy ${PROXY_IP}" ]; then
       echo "  ✔  Live: Apache reads exactly one declaration, RemoteIPInternalProxy ${PROXY_IP}"
@@ -1768,6 +1836,12 @@ SNIPPET2
       printf '%s\n' "${_rf_live:-    (none read — the exec failed)}" | sed 's/^/       /'
       echo "     Expected exactly: RemoteIPInternalProxy ${PROXY_IP}"
       echo "     Check: podman inspect wordpress --format '{{range .Mounts}}{{.Destination}} {{end}}'"
+      exit 1
+    fi
+    if [ "$_rf_noenv" = 1 ] && [ "$_rf_imgrm" = 1 ]; then
+      echo "  ⚠  Correct now, but ${_rf_env} is missing, so nothing records the mask:"
+      echo "     the image's remoteip.conf returns when the container is next rebuilt."
+      echo "     Add to that container's run command:  -v ${_rf_mount}"
       exit 1
     fi
     echo ""

@@ -524,6 +524,7 @@ do_restore() {
     fi
     printf "  Type REPLACE to load %s into the live database: " "$_file"
     read -r _c
+    _c=$(printf '%s' "$_c" | tr -d ' \t\r')   # a pasted space is not part of the word
     [ "$_c" = "REPLACE" ] || { echo "  Cancelled — nothing changed."; rm -rf "$_work"; return 0; }
     # Expanded inside the container. The variable does not exist on this host, so
     # this used to pass an empty password and the restore could not log in.

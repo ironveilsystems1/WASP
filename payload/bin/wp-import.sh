@@ -1340,8 +1340,10 @@ __scan)
       # first, so a link stored inside Elementor's page data reads the same as
       # one in a post. The patterns are wp-links.sh's (the content scanner's):
       # test-links.sh holds the two lists together.
-      _spamhost='(casin|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)'
-      _spamslug='(casino|kasino|kasyno|kaszino|cassino|scommess|apuesta|gambling|poker|roulette|blackjack|jackpot|bookmaker|viagra|cialis|levitra|kamagra|porn|payday)'
+      # ERE has no lookahead: ([^tme]|$) and ([^g]|$) are the scanner's (?![tme]) and
+      # (?!g), keeping speCIALISt and CASINg out (test-links.sh holds the forms together).
+      _spamhost='(casin([^g]|$)|kasin|kasyn|kaszin|cassin|slot|poker|roulette|blackjack|jackpot|betting|bet365|betway|1xbet|mostbet|melbet|sportsbet|bookmaker|gambl|scommess|apuest|viagra|cialis([^tme]|$)|levitra|kamagra|sildenafil|tadalafil|porn|xxx|escort|payday)'
+      _spamslug='(casino|kasino|kasyno|kaszino|cassino|scommess|apuesta|gambling|poker|roulette|blackjack|jackpot|bookmaker|viagra|cialis([^tme]|$)|levitra|kamagra|porn|payday)'
       _sh=$(printf '%s' "$_su" | sed -E 's#^[a-zA-Z]+://##; s#[/:].*$##; s#^www\.##' | tr 'A-Z' 'a-z')
       _cn="${_st}/meta/content.txt"
       _rd | sed 's#\\*/#/#g; s#\\*"#"#g' > "$_cn"
@@ -1627,6 +1629,7 @@ apply)
     echo "       or the hypervisor's console" >&2
     exit 1
   fi
+  _cf=$(printf '%s' "$_cf" | tr -d ' \t\r')   # a pasted space is not part of the word
   [ "$_cf" = "IMPORT" ] || { echo "  Cancelled — nothing changed."; exit 0; }
 
   # ── Normalise ────────────────────────────────────────────────────────────
@@ -2152,6 +2155,7 @@ clean)
       if [ "$_yes" != 1 ]; then
         printf '\n  Imported sets keep their quarantine and meta (evidence). Type CLEAN to proceed: '
         read -r _cf || { _bad "No input available. Use --yes to clean unattended."; exit 1; }
+        _cf=$(printf '%s' "$_cf" | tr -d ' \t\r')
         [ "$_cf" = CLEAN ] || { echo "  Cancelled — nothing changed."; exit 0; }
       fi
       for _i in $_ids; do _cleanup_set "$_i"; done
