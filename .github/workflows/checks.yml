@@ -77,9 +77,10 @@ jobs:
       # though nothing is loaded. Without it every ruleset "fails" for the wrong reason.
       options: --cap-add NET_ADMIN
     timeout-minutes: 45
-    # First run (10.23) found three real Alpine bugs, fixed in 10.24, and test
-    # environment gaps. Remove this line after its first green run, so it
-    # gates like the others.
+    # First run (10.23) found four real Alpine bugs, fixed in 10.24; the second
+    # (10.24) was clean but for openssl, which the Hive tests need for their
+    # certificates. Remove this line after its first green run, so it gates
+    # like the others.
     continue-on-error: true
     steps:
       # actions/checkout needs the runner's glibc node, which an Alpine container
@@ -92,7 +93,7 @@ jobs:
       # No coreutils, grep or sed packages: the tools must work with BusyBox's.
       - name: Install what the suite uses
         run: |
-          apk add --no-cache python3 curl jq zip unzip yara nftables \
+          apk add --no-cache python3 curl jq openssl zip unzip yara nftables \
             php83 php83-curl php83-mysqli php83-sqlite3 php83-pdo_sqlite php83-zip php83-mbstring php83-ctype php83-tokenizer
           ln -sf /usr/bin/php83 /usr/bin/php
       - name: test/run-all-checks.sh
