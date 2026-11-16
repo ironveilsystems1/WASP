@@ -31,7 +31,7 @@ export LC_ALL=C
 # modified lib/ or payload/ before this ran, that's a real, cheap-to-catch
 # problem given everything below sources these files as root. This is not
 # the same guarantee as verifying the content is the code you expect (a
-# release manifest, still tracked as a bigger open item in TODO.md) -- it
+# signed release manifest, which install.sh checks separately) -- it
 # only catches "something else on this box could have changed these files
 # since you fetched them," which costs nothing to check.
 for _d in "${REPO_DIR}" "${REPO_DIR}/lib" "${REPO_DIR}/payload"; do

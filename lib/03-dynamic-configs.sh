@@ -706,7 +706,12 @@ RIDEBUG
 # InternalProxy (not TrustedProxy) so that a private client address -- an
 # administrator on the LAN or over an overlay network -- is accepted rather
 # than discarded. One literal address; never a range.
-LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so
+# Loaded here only if nothing else has: the image enables the module and lib/06
+# mounts mods-enabled/remoteip.load, so an unconditional LoadModule logged
+# "AH01574: module remoteip_module is already loaded" on every start.
+<IfModule !remoteip_module>
+    LoadModule remoteip_module /usr/lib/apache2/modules/mod_remoteip.so
+</IfModule>
 RemoteIPHeader X-Forwarded-For
 RemoteIPInternalProxy ${PROXY_IP}
 RIBLOCK
