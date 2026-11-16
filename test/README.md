@@ -76,6 +76,8 @@ which does what:
   goes through Elementor's own save. It needs `WASP_TEST_WP` (a WordPress
   checkout) and `WASP_TEST_WPCLI` (wp-cli.phar), and says SKIPPED without them:
   run it before every release that touches the content tools.
+  `test/check-tool-self-edit.py` fails when a script edits a signed tool in
+  place (GeoIP setup's old edit of update.sh blocked every GeoIP VM's upgrade).
   `test/check-upgrade-map.py` fails when a stage installs a file the upgrade
   map does not cover, or a tool no stage installs.
   The suite finishes with

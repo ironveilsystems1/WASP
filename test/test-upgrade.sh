@@ -99,6 +99,10 @@ EOF
   printf "WASP_VERSION='10.14'\nWASP_RELEASE='10.14'\nWASP_VERSION_NOTE='old'\nWP_ADMIN_SLUG='other'\nMFA_ENFORCE='0'\nMFA_GRACE_DAYS='7'\nADMIN_USER='ops'\n" \
     > "$V/etc/wp-install/vars.sh"
   printf '%s\n' "$KEY" > "$V/etc/wp-install/release.pub"
+  # GeoIP setup before 10.20 rewrote one line of the installed update.sh; and Lynis's
+  # cron file is installed, so the retired line is seen through two cron entries.
+  sed -i 's|^PINNED_WP_VER=.*|PINNED_WP_VER="geoip-7.1-php8.4-apache"|' "$V/usr/local/bin/update.sh"
+  grep -v '^#' "$S/cron/lynis-audit.cron" | grep -v '^$' | head -1 >> "$V/etc/crontabs/root"
   cp "$V/etc/crontabs/root" "$W/crontab.before"
 
   _u() { env PATH="$W/bin:$PP" WASP_ROOT="$V" WASP_HOOK_BIN="$W/hookbin" WASP_UPGRADE_LINT="${LINT:-php -l}" \
@@ -145,6 +149,10 @@ EOF
     && _p "$L: ...build-time config that changed upstream is reported, not replaced" || _f "$L: cfg" "$out"
   printf '%s' "$out" | grep -q '10.15 upgrade step' && printf '%s' "$out" | grep -q '10.16 upgrade step' \
     && _p "$L: ...and the steps for each version passed" || _f "$L: hooks plan" "$out"
+  { printf '%s' "$out" | grep -q '~ tool update.sh .*set by GeoIP setup before 10.20' && ! printf '%s' "$out" | grep -q 'update.sh: MODIFIED'; } \
+    && _p "$L: update.sh with only GeoIP's old PINNED_WP_VER edit is replaced, not blocked as tampered" || _f "$L: geoip update.sh" "$out"
+  [ "$(printf '%s' "$out" | grep -c '− cron 30 4 \* \* 1 /usr/local/bin/wp-plugins.sh verify')" = 1 ] \
+    && _p "$L: a retired cron line is listed once, however many cron files are installed" || _f "$L: cron dup" "$out"
   out=$(_u check "$REL" --diff)
   printf '%s' "$out" | grep -q '^-# 10.14' && _p "$L: check --diff shows the changed lines" || _f "$L: diff" "$out"
 
