@@ -718,8 +718,10 @@ case "${1:-status}" in
     # Expires is required by RFC 9116 and is the field everyone forgets. A
     # stale security.txt is worse than none: it tells a researcher the contact
     # is current when it may not be.
-    _exp=$(date -u -d "+1 year" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || \
-      _exp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # An epoch offset: BusyBox date (Alpine) has no "+1 year", and the old
+    # fallback wrote NOW -- a security.txt expired the moment it was written.
+    _exp=$(date -u -d "@$(( $(date +%s) + 365 * 86400 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || \
+      { echo "✗ Could not work out the Expires date; security.txt not written" >&2; exit 1; }
     _dir=/home/wpuser/wp/html/.well-known
     mkdir -p "$_dir"
     {
@@ -1010,7 +1012,9 @@ SNIPPET2
         _st="active"; _act=$((_act+1))
         # 14 days is enough notice to re-argue an exception before the next
         # update run is blocked by it.
-        _warn=$(date -u -d "+14 days" +%Y-%m-%d 2>/dev/null || echo "$_today")
+        # Epoch offset: BusyBox date has no "+14 days", and the fallback (today)
+        # meant no exception was ever shown as expiring soon on Alpine.
+        _warn=$(date -u -d "@$(( $(date +%s) + 14 * 86400 ))" +%Y-%m-%d 2>/dev/null || echo "$_today")
         [ "$_warn" \> "$_unt" ] && { _st="EXPIRING SOON"; _soon=$((_soon+1)); }
       fi
       echo ""
@@ -1040,7 +1044,7 @@ SNIPPET2
     _log=/var/log/wasp-vuln-exceptions.log
     [ -s "$_log" ] || exit 0
     _today=$(date -u +%Y-%m-%d)
-    _warn=$(date -u -d "+14 days" +%Y-%m-%d 2>/dev/null || echo "$_today")
+    _warn=$(date -u -d "@$(( $(date +%s) + 14 * 86400 ))" +%Y-%m-%d 2>/dev/null || echo "$_today")   # epoch: BusyBox-safe
     _due=$(mktemp)
     while IFS= read -r line; do
       [ -n "$line" ] || continue

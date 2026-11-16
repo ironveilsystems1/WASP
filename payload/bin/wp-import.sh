@@ -1351,7 +1351,9 @@ __scan)
       _dom=$(grep -oiE "href=[\"']https?://[^/\"' <>]+" "$_cn" | sed -E "s#^href=[\"']https?://##; s#:[0-9]+\$##; s#^www\.##" \
              | tr 'A-Z' 'a-z' | grep -viE "^(${_sh:-.none.})\$" | grep -iE "$_spamhost" | sort | uniq -c | sort -rn)
       _shs=$(grep -o 'data-sheets-root' "$_cn" | wc -l | tr -d ' ')
-      _hid=$(grep -oiE "<[a-z0-9]+[^>]*style=[\"'][^\"']*(display: ?none|visibility: ?hidden|left: ?-[0-9]{3,}px|font-size: ?0(px)?;)[^\"']*[\"'][^>]*>[^<]{0,300}<a " "$_cn" | wc -l | tr -d ' ')
+      # {0,250}, not {0,300}: musl (Alpine) refuses a repeat count over 255, so
+      # grep failed and this counted nothing on every VM (found by CI on Alpine).
+      _hid=$(grep -oiE "<[a-z0-9]+[^>]*style=[\"'][^\"']*(display: ?none|visibility: ?hidden|left: ?-[0-9]{3,}px|font-size: ?0(px)?;)[^\"']*[\"'][^>]*>[^<]{0,250}<a " "$_cn" | wc -l | tr -d ' ')
       _own=""
       [ -n "$_sh" ] && _own=$(grep -oiE "https?://(www\.)?${_sh}/[^\"' <>]*" "$_cn" | sed 's/[),.;]*$//' \
                               | grep -iE "/[^/]*${_spamslug}" | sort -u)

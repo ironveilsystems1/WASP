@@ -700,7 +700,14 @@ trivy_exception() {
   read -r days
   case "$days" in ''|*[!0-9]*) days=90 ;; esac
   [ "$days" -gt 365 ] && { days=365; echo "  (capped at 365)"; }
-  until=$(date -u -d "+${days} days" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)
+  # BusyBox date (Alpine) has no "+N days": it failed, and the fallback here was
+  # TODAY -- an exception granted for 90 days expired the day it was granted.
+  # An epoch offset is read the same by BusyBox and GNU date.
+  until=$(date -u -d "@$(( $(date +%s) + days * 86400 ))" +%Y-%m-%d 2>/dev/null) || until=""
+  case "$until" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+    *) echo "  ✗ Could not work out the expiry date; nothing recorded." >&2; return 1 ;;
+  esac
 
   who="${SUDO_USER:-${DOAS_USER:-${USER:-unknown}}}"
   printf "  Accepted by [%s]: " "$who"
