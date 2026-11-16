@@ -133,7 +133,7 @@ BUSYBOX=/path/to/busybox test/run-all-checks.sh     # 2.
 { printf '%s\n' install.sh; find lib payload hive -type f ! -path '*/__pycache__/*' | LC_ALL=C sort; } \
   | xargs sha256sum > MANIFEST.sha256   # 4.
 minisign -Sm MANIFEST.sha256 -s ~/.minisign/wasp.key \
-  -t "WASP 10.19 — signed $(date -u +%Y-%m-%dT%H:%M:%SZ) — $(git rev-parse --short HEAD)"   # 5.
+  -t "WASP 10.20 — signed $(date -u +%Y-%m-%dT%H:%M:%SZ) — $(git rev-parse --short HEAD)"   # 5.
 ```
 
 In order, and the order is the point:
