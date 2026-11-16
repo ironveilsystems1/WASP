@@ -184,5 +184,20 @@ t(wcs_post_is_spam('Home', '', $home, '', array('shop.example')) === '', 'a page
 t(wcs_post_is_spam('Home', '', '<p><a href="https://buycialisonline.example/">x</a></p>', '', array('shop.example')) === 'content',
   '...and the same page with a pill-shop link is');
 
+// One spam word in ordinary writing (10.26: a field site's article named a
+// casino once, among other workplaces, and was reported as spam).
+$article = '<p>Our volunteers had a busy year. They staffed the county fair, the charity casino night at the community hall, the golf outing '
+         . 'and the spring pancake breakfast, and they still found time to repaint the library reading room. Thank you to everyone who gave an '
+         . 'afternoon, a tray of cookies or a ride to the hardware store. Next year we hope to add a summer concert in the park.</p>';
+t(wcs_post_is_spam('Tax Tips', '', $article, '', array('shop.example')) === '', 'an article that mentions a casino once is not spam');
+$ed = json_encode(array(array('id' => 'a1', 'elType' => 'widget', 'widgetType' => 'text-editor', 'settings' => array('editor' => $article), 'elements' => array())));
+t(wcs_post_is_spam('Tax Tips', '', '', $ed, array('shop.example')) === '', '...nor the Elementor widget that holds it');
+t(wcs_post_is_spam('Offers', '', '<p>Best online casino bonuses in Italy</p>', '', array('shop.example')) === 'content',
+  'a short casino blurb with no link still is');
+t(wcs_post_is_spam('About', '', $article . '<div style="display:none">online casino bonus</div>', '', array('shop.example')) === 'content',
+  'spam wording hidden inside an ordinary article still is');
+t(wcs_post_is_spam('About', '', '<p><span data-sheets-root="1">' . strip_tags($article) . '</span></p>', '', array('shop.example')) === 'content',
+  'wording pasted from a Google Sheet still is, however long');
+
 echo "\n  links (php): {$pass} passed, {$fail} failed\n";
 exit($fail ? 1 : 0);

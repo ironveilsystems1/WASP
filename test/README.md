@@ -26,6 +26,10 @@ which does what:
   back on failure, and account locking limited to privileged accounts and
   never a batch. `test/test-egress-temporary.sh` proves nothing temporary on
   the egress allowlist outlives an hour, with no one running a command.
+  `test/test-egress-reconcile.sh` proves an upgrade adds the egress WordPress
+  and the commercial plugins installed on the VM need, and only adds: nothing
+  for an uninstalled plugin, never what `deny` removed, never a parent beside
+  a narrower entry, written in place.
   `test/test-notify.sh` runs the real `--passwordeval` command against a real
   `smtp.ini`, so it checks the password the relay would actually receive.
   `test/test-hive.py` tests the WASP Hive server: TOTP, sessions, throttling,

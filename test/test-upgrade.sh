@@ -99,12 +99,17 @@ EOF
   printf "WASP_VERSION='10.14'\nWASP_RELEASE='10.14'\nWASP_VERSION_NOTE='old'\nWP_ADMIN_SLUG='other'\nMFA_ENFORCE='0'\nMFA_GRACE_DAYS='7'\nADMIN_USER='ops'\n" \
     > "$V/etc/wp-install/vars.sh"
   printf '%s\n' "$KEY" > "$V/etc/wp-install/release.pub"
+  # Egress: an allowlist from before 10.26, and a commercial plugin that needs its server.
+  mkdir -p "$V/opt/squid/config" "$V/home/wpuser/wp/html/wp-content/plugins/ultimate-elementor"
+  printf '.wordpress.org\n.w.org\n' > "$V/opt/squid/config/allowlist-runtime.txt"
   # GeoIP setup before 10.20 rewrote one line of the installed update.sh; and Lynis's
   # cron file is installed, so the retired line is seen through two cron entries.
   sed -i 's|^PINNED_WP_VER=.*|PINNED_WP_VER="geoip-7.1-php8.4-apache"|' "$V/usr/local/bin/update.sh"
   grep -v '^#' "$S/cron/lynis-audit.cron" | grep -v '^$' | head -1 >> "$V/etc/crontabs/root"
   cp "$V/etc/crontabs/root" "$W/crontab.before"
 
+  printf '#!%s\ncase "$*" in *"squid -k"*) echo "podman $*" >> "%s/podman.log" ;; esac\nexit 0\n' "$SH" "$W" > "$W/bin/podman"
+  chmod +x "$W/bin/podman"
   _u() { env PATH="$W/bin:$PP" WASP_ROOT="$V" WASP_HOOK_BIN="$W/hookbin" WASP_UPGRADE_LINT="${LINT:-php -l}" \
            "$SH" "$TOOL" "$@" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
   _snap() { ( cd "$V" && find . -path ./var/lib/wasp-upgrade -prune -o -type f -print | LC_ALL=C sort | xargs sha256sum ); }
@@ -131,6 +136,28 @@ EOF
     && [ ! -e "$V/escape" ]; } && _p "$L: a tarball holding a ../ path is refused, nothing written outside" || _f "$L: traversal" "$out"
   _snap > "$W/s1"; cmp -s "$W/s0" "$W/s1" && _p "$L: refused releases changed nothing" || _f "$L: refusal changed files" ""
 
+  # ── no release named: the newest is fetched (file:// here, https on a VM) ──
+  # The menu asked for a path; field operators had none. A fetched release must
+  # get every check a copied one gets, and nothing may be changed by fetching.
+  ln -sf "$(command -v curl)" "$W/bin/curl"
+  out=$(export WASP_RELEASE_URL="file://$T/release.tar.gz"; _u check); rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'Fetching the newest release' && printf '%s' "$out" | grep -q 'Signature valid' \
+    && printf '%s' "$out" | grep -q "Upgrade plan: 10.14 → $NEWVER" && printf '%s' "$out" | grep -q 'fetches the newest again'; } \
+    && _p "$L: check with no release fetches the newest, then verifies and plans it like a copied one" || _f "$L: fetch check" "rc=$rc $out"
+  _snap > "$W/s1"; cmp -s "$W/s0" "$W/s1" && _p "$L: ...and fetching changes nothing on the VM" || _f "$L: fetch changed files" ""
+  out=$(export WASP_RELEASE_URL="file://$T/evil.tar.gz"; _u check); rc=$?
+  # As for a copied tarball: GNU tar lists the ../ member and it is refused before
+  # extracting; BusyBox tar strips it, and the result is refused as not a release.
+  { [ "$rc" != 0 ] && printf '%s' "$out" | grep -qiE 'absolute or ../ path|Expected one top-level' \
+    && [ ! -e "$V/var/lib/escape" ] && [ ! -e "$V/var/lib/wasp-upgrade/escape" ]; } \
+    && _p "$L: a fetched release meets the same refusals (a ../ path), nothing written outside" || _f "$L: fetched evil" "rc=$rc $out"
+  out=$(export WASP_RELEASE_URL="file://$T/no-such-release.tar.gz"; _u check); rc=$?
+  [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'Could not download' && printf '%s' "$out" | grep -q 'name a release you have' \
+    && _p "$L: a failed download says so and how to give a release instead" || _f "$L: fetch fail" "rc=$rc $out"
+  out=$(export WASP_RELEASE_URL="http://releases.example/wasp.tar.gz"; _u check); rc=$?
+  [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'must be https' && _p "$L: a plain-http release URL is refused" || _f "$L: http url" "rc=$rc $out"
+  _snap > "$W/s1"; cmp -s "$W/s0" "$W/s1" && _p "$L: ...none of which changed anything" || _f "$L: refusals changed files" ""
+
   # ── check ──
   out=$(_u check "$T/release.tar.gz"); rc=$?
   _snap > "$W/s1"
@@ -147,6 +174,9 @@ EOF
     && _p "$L: ...cron lines to add and the retired one to remove" || _f "$L: cron plan" "$out"
   printf '%s' "$out" | grep -A3 'Configuration written' | grep -q 'apache-conf/wp-security-fallback.conf' \
     && _p "$L: ...build-time config that changed upstream is reported, not replaced" || _f "$L: cfg" "$out"
+  printf '%s' "$out" | grep -q '+ egress support.brainstormforce.com  (Ultimate Addons for Elementor' \
+    && ! printf '%s' "$out" | grep -q 'egress .wordpress.org' \
+    && _p "$L: ...egress a plugin installed here needs and the VM lacks, and not what it has" || _f "$L: egress plan" "$out"
   printf '%s' "$out" | grep -q '10.15 upgrade step' && printf '%s' "$out" | grep -q '10.16 upgrade step' \
     && printf '%s' "$out" | grep -q '10.21 upgrade step' \
     && _p "$L: ...and the steps for each version passed" || _f "$L: hooks plan" "$out"
@@ -197,6 +227,9 @@ EOF
   [ "$(grep -c 'remoteip-fix --check' "$W/hooks.log" 2>/dev/null)" = 2 ] && [ "$(grep -c '^wp-hardening.sh remoteip-fix$' "$W/hooks.log")" = 2 ] \
     && [ "$(grep -c 'wasp-alerts.sh setup --quiet' "$W/hooks.log")" = 1 ] \
     && _p "$L: the 10.15, 10.16 and 10.21 steps ran once each" || _f "$L: hooks ran" "$(cat "$W/hooks.log" 2>/dev/null)"
+  { grep -qxF support.brainstormforce.com "$V/opt/squid/config/allowlist-runtime.txt" && grep -qxF .wordpress.org "$V/opt/squid/config/allowlist-runtime.txt" \
+    && grep -q 'squid -k reconfigure' "$W/podman.log" 2>/dev/null && printf '%s' "$out" | grep -q 'Allowed: support.brainstormforce.com'; } \
+    && _p "$L: the egress the plugin needs is added, nothing removed, and Squid reloaded" || _f "$L: egress apply" "$(cat "$V/opt/squid/config/allowlist-runtime.txt") $out"
   grep -q "upgrade 10.14 -> $NEWVER ok" "$V/var/lib/wasp-upgrade/history.log" && ls "$V/var/lib/wasp-upgrade/backups/"*-from-10.14.tar.gz >/dev/null 2>&1 \
     && _p "$L: recorded in the history, with a backup" || _f "$L: history" "$(cat "$V/var/lib/wasp-upgrade/history.log" 2>/dev/null)"
   _snap > "$W/s2"
@@ -219,8 +252,13 @@ EOF
   ls "$V/var/lib/wasp-upgrade/backups/" > /dev/null
   sed -i "s/^WASP_VERSION=.*/WASP_VERSION='10.14'/" "$V/etc/wp-install/vars.sh" 2>/dev/null
   _snap > "$W/s4"
-  if [ "$rc" = 0 ] && diff "$W/s0" "$W/s4" >/dev/null; then _p "$L: rollback restores exactly what was there before the upgrade"
+  # The egress allowlist is not the upgrade's to take back (see below); everything else is.
+  if [ "$rc" = 0 ] && diff <(grep -v ' ./opt/squid/' "$W/s0") <(grep -v ' ./opt/squid/' "$W/s4") >/dev/null; then
+    _p "$L: rollback restores exactly what was there before the upgrade"
   else _f "$L: rollback" "rc=$rc $(diff "$W/s0" "$W/s4" | head -8) $out"; fi
+  grep -qxF support.brainstormforce.com "$V/opt/squid/config/allowlist-runtime.txt" \
+    && printf '%s' "$out" | grep -A1 'Egress that upgrade added is still allowed' | grep -q support.brainstormforce.com \
+    && _p "$L: ...and says the egress it added stays, and how to remove it" || _f "$L: rollback egress" "$out"
   [ ! -e "$V/usr/local/bin/wasp-upgrade.sh" ] && grep -q 'wp-plugins.sh verify' "$C" \
     && _p "$L: ...removing what the upgrade added and restoring the old cron" || _f "$L: rollback detail" ""
 

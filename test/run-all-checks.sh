@@ -87,7 +87,7 @@ if command -v python3 >/dev/null 2>&1; then
 else
   echo "  python3 missing: WASP Hive server tests NOT run"; rc=1
 fi
-for _t in test-vuln-scan.sh test-import-source.sh test-import-findings.sh test-egress-temporary.sh test-threats.sh test-notify.sh test-hive-report.sh test-appsec.sh test-hive-role.sh test-updraft-import.sh test-remoteip-fix.sh test-smtp-config.sh test-malware-scan.sh test-alerts.sh test-verify-integrity.sh test-links.sh test-links-wordpress.sh test-upgrade.sh test-busybox-run.sh; do
+for _t in test-vuln-scan.sh test-import-source.sh test-import-findings.sh test-egress-temporary.sh test-egress-reconcile.sh test-threats.sh test-notify.sh test-hive-report.sh test-appsec.sh test-hive-role.sh test-updraft-import.sh test-remoteip-fix.sh test-smtp-config.sh test-malware-scan.sh test-alerts.sh test-verify-integrity.sh test-links.sh test-links-wordpress.sh test-upgrade.sh test-busybox-run.sh; do
   if [ -f "test/${_t}" ]; then
     bash "test/${_t}" || rc=1
   else
