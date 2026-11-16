@@ -246,6 +246,15 @@ _plan() {
         fi
         cmp -s "$_inst" "$_new" && continue
         if [ -e "$_inst" ] && [ -r "$_old" ] && ! cmp -s "$_inst" "$_old"; then
+          # Before 10.20 wp-geoip-setup.sh rewrote update.sh's PINNED_WP_VER line
+          # (only a fallback: pinned.env holds the pin). That one line, and only
+          # it, is WASP's own edit, not a sign of tampering.
+          if [ "$_kind" = tool ] && [ "$_base" = update.sh ] \
+             && [ "$(grep -v '^PINNED_WP_VER=' "$_inst" | cksum)" = "$(grep -v '^PINNED_WP_VER=' "$_old" | cksum)" ]; then
+            _out "  ~ tool update.sh   ($(_stat "$_inst" "$_new"); its PINNED_WP_VER line was set by GeoIP setup before 10.20 — the pin itself is in pinned.env)"
+            printf 'install\t%s\t%s\t%s\t%s\t%s\n' "$_kind" "$_new" "$_d" "$_mode" "$_own" >> "${_WORK}/plan"
+            _n_tool=$((_n_tool+1)); continue
+          fi
           if [ "$_kind" = tool ]; then
             _out "  ✗ tool ${_base}: MODIFIED since it was installed (differs from ${_old})"
             _BLOCKED=1; printf 'blocked\ttool\t%s\t%s\t%s\t%s\n' "$_new" "$_d" "$_mode" "$_own" >> "${_WORK}/plan"
@@ -300,6 +309,8 @@ _plan() {
       done < "${_WORK}/cn" ;;
     esac
   done < "${REL}/payload/upgrade/files.map"
+  # A retired line is listed once, however many cron files named it.
+  sort -u "${_WORK}/cron.del" -o "${_WORK}/cron.del"
 
   # Configuration written at build time: staged, reported, not replaced.
   ( cd "${REL}/payload" && find . -type f ! -path './stages/*' ! -path './upgrade/*' ! -path '*/__pycache__/*' \

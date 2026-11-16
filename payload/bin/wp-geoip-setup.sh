@@ -412,7 +412,13 @@ podman run -d \
   "${GEOIP_IMG_TAG}"
 podman network connect --ip 10.89.20.3 wp-db wordpress
 sed -i "s|WP_IMAGE=.*|WP_IMAGE=\"${GEOIP_IMG_TAG}\"|" /etc/init.d/wp-container 2>/dev/null || true
-sed -i "s|^PINNED_WP_VER=.*|PINNED_WP_VER=\"geoip-$(echo "${GEOIP_IMG_TAG}" | sed 's|.*:||')\"|" /usr/local/bin/update.sh 2>/dev/null || true
+# (10.20) This used to rewrite PINNED_WP_VER inside /usr/local/bin/update.sh.
+# That line is only update.sh's fallback -- pinned.env is authoritative, and
+# update.sh already rebuilds GeoIP after a WordPress update -- while editing an
+# installed tool made it differ from its signed copy: wasp-verify-integrity.sh
+# and the weekly watch-integrity alert reported it, and wasp-upgrade.sh refused
+# to replace it as modified. A tool is never edited in place
+# (test/check-tool-self-edit.py).
 
 sleep 5
 PRUN exec wordpress chown -R www-data:www-data /var/www/html/wp-content >/dev/null 2>&1 || true
