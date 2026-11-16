@@ -2,14 +2,18 @@
 # =============================================================================
 # wasp-upgrade.sh — bring this VM's WASP tooling up to a new release
 # =============================================================================
-#   wasp-upgrade.sh check <release> [--diff]   verify it and show what would change
-#   wasp-upgrade.sh apply <release> [--yes] [--force]
+#   wasp-upgrade.sh check [<release>] [--diff] verify it and show what would change
+#   wasp-upgrade.sh apply [<release>] [--yes] [--force]
 #                                              verify, back up, change, check
 #   wasp-upgrade.sh rollback [backup]          put back what the last upgrade replaced
 #   wasp-upgrade.sh status                     version, upgrade history, backups
 #
-# <release> is the release tarball (wasp-X.tar.gz) or the unpacked directory.
-# A VM that predates this tool runs it from the release itself, once:
+# With no <release>, check and apply download the newest release from the
+# project's main branch (WASP_RELEASE_URL in vars.sh to use another source).
+# Where it comes from decides nothing: it is verified against the key pinned on
+# this VM exactly like a file you copied over, and refused the same way.
+# <release> is otherwise the release tarball (wasp-X.tar.gz) or the unpacked
+# directory. A VM that predates this tool runs it from the release itself, once:
 #   doas sh /root/wasp-X/payload/bin/wasp-upgrade.sh apply /root/wasp-X
 #
 # WHY
@@ -35,8 +39,11 @@
 #   3. Backs up everything it will touch, then applies payload/upgrade/files.map
 #      from the new release. Safe to run twice: a second run changes nothing.
 #   4. Runs the release's upgrade hooks (payload/upgrade/hooks/<version>.sh) for
-#      every version passed, checks each mu-plugin with PHP inside the wordpress
-#      container, the site's health, and the tooling against the manifest.
+#      every version passed; adds the egress this VM needs and lacks (WordPress's
+#      update servers, the licence server of each commercial plugin or theme
+#      installed here: wasp-egress.sh reconcile, add-only); checks each
+#      mu-plugin with PHP inside the wordpress container, the site's health,
+#      and the tooling against the manifest.
 #      A mu-plugin that fails PHP's check after install is put back at once: an
 #      mu-plugin fatal takes the whole site down and cannot be undone from wp-admin.
 #
@@ -63,6 +70,7 @@ BACKUPS="${STATE}/backups"
 HISTORY="${STATE}/history.log"
 CRONTAB="${R}/etc/crontabs/root"
 KEEP_BACKUPS="${WASP_UPGRADE_KEEP:-5}"
+RELEASE_URL_DEFAULT="https://github.com/ironveilsystems1/WASP/archive/refs/heads/main.tar.gz"
 
 _ok()   { printf '  \033[32m✔\033[0m  %s\n' "$1"; }
 _bad()  { printf '  \033[31m✗\033[0m  %s\n' "$1"; }
@@ -109,6 +117,39 @@ _stat() { # file -> "+added −removed" line counts against another file
 }
 
 # ── the release ──────────────────────────────────────────────────────────────
+# No release named: download the newest. Field operators had to download and
+# unpack a release by hand, then type its path at the menu; the menu prompt
+# that asked for one was where they stopped. The download is untrusted exactly
+# like a copied file -- _open_release and _verify below decide, against the
+# key pinned on this VM, and refuse it the same way.
+_fetch_latest() {
+  _url="${WASP_RELEASE_URL:-$(_var WASP_RELEASE_URL 2>/dev/null || true)}"
+  _url="${_url:-$RELEASE_URL_DEFAULT}"
+  case "$_url" in
+    https://*) : ;;
+    file://*) [ -n "${WASP_ROOT:-}" ] || _die "Release URL must be https: ${_url}" ;;   # tests only
+    *) _die "Release URL must be https: ${_url}" ;;
+  esac
+  mkdir -p "${STATE}/fetched" && chmod 700 "${STATE}/fetched" || _die "Cannot create ${STATE}/fetched"
+  _dst="${STATE}/fetched/latest.tar.gz"; rm -f "${_dst}.part"
+  _hdr "Fetching the newest release"
+  _note "$_url"
+  _frc=0
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 300 --max-filesize 209715200 -o "${_dst}.part" "$_url" 2>"${STATE}/fetched/error" || _frc=$?
+  else
+    wget -q -T 300 -O "${_dst}.part" "$_url" 2>"${STATE}/fetched/error" || _frc=$?
+  fi
+  if [ "$_frc" != 0 ] || [ ! -s "${_dst}.part" ]; then
+    rm -f "${_dst}.part"
+    _die "Could not download it ($(head -1 "${STATE}/fetched/error" 2>/dev/null || echo "exit ${_frc}"))." \
+         "Check this VM reaches github.com, or name a release you have:  wasp-upgrade.sh ${_cmd} <wasp-X.tar.gz>"
+  fi
+  mv -f "${_dst}.part" "$_dst"; rm -f "${STATE}/fetched/error"
+  _ok "Downloaded ($(( $(wc -c < "$_dst") / 1024 )) KB). Nothing in it is used until it verifies below."
+  _target="$_dst"; _FETCHED=1
+}
+
 REL=""
 _open_release() {
   _in="${1:-}"
@@ -335,6 +376,16 @@ _plan() {
     printf '%s\t%s\n' "$_hv" "$_h" >> "${_WORK}/hooks"; _n_hooks=$((_n_hooks+1))
   done
   sort -t '	' -k1,1 "${_WORK}/hooks" > "${_WORK}/hooks.s" 2>/dev/null; mv "${_WORK}/hooks.s" "${_WORK}/hooks"
+  # Egress this VM needs and lacks: WordPress's update servers, and the
+  # licence server of each commercial plugin or theme installed here. The
+  # release's own wasp-egress.sh decides (it verified above), reading this
+  # VM's allowlist and plugin directories; nothing is changed until apply.
+  : > "${_WORK}/egress"
+  if [ -f "${REL}/payload/bin/wasp-egress.sh" ] && [ -f "${R}/opt/squid/config/allowlist-runtime.txt" ]; then
+    WASP_SQUID_DIR="${R}/opt/squid" WASP_WP_HTML="${R}/home/wpuser/wp/html" \
+      sh "${REL}/payload/bin/wasp-egress.sh" reconcile --check > "${_WORK}/egress" 2>/dev/null || : > "${_WORK}/egress"
+  fi
+  _n_egress=$(grep -c '^add|' "${_WORK}/egress")
 }
 
 _show_plan() {
@@ -352,6 +403,12 @@ _show_plan() {
       echo "  » after the files: the ${_hv} upgrade step — $(sed -n 's/^# *step: *//p' "$_h" | head -1)"
     done < "${_WORK}/hooks"
   fi
+  while IFS='|' read -r _ea _eh _ew _ey; do
+    case "$_ea" in
+      add)  echo "  + egress ${_eh}  (${_ew})" ;;
+      skip) echo "  ! egress ${_eh} is needed (${_ew}) but will not be added: ${_ey}" ;;
+    esac
+  done < "${_WORK}/egress"
   if [ -s "${_WORK}/cfg" ]; then
     echo ""
     echo "  Configuration written when this VM was built changed upstream. Not replaced: these"
@@ -364,10 +421,10 @@ _show_plan() {
     _note "Look at it before anything replaces it — the change is the evidence of how:"
     _note "  diff <installed> ${STAGED}/<same path>      wasp-verify-integrity.sh"
     _note "Then re-run with --force to overwrite it."
-  elif [ "${_N_CHANGES:-0}" -eq 0 ] && [ ! -s "${_WORK}/hooks" ] && [ "${_n_staged:-0}" -eq 0 ]; then
+  elif [ "${_N_CHANGES:-0}" -eq 0 ] && [ ! -s "${_WORK}/hooks" ] && [ "${_n_staged:-0}" -eq 0 ] && [ "${_n_egress:-0}" -eq 0 ]; then
     _ok "Nothing to change: the installed tooling already matches ${REL_VER}."
   else
-    _ok "${_N_CHANGES} change(s) to apply."
+    _ok "$(( ${_N_CHANGES:-0} + ${_n_egress:-0} )) change(s) to apply."
   fi
 }
 
@@ -425,7 +482,7 @@ _backup() {
   # Oldest first, keep the newest N.
   ls -1 "$BACKUPS"/*.tar.gz 2>/dev/null | sort \
     | awk -v k="$KEEP_BACKUPS" '{ a[NR] = $0 } END { for (i = 1; i <= NR - k; i++) print a[i] }' \
-    | while IFS= read -r _old; do rm -f "$_old" "${_old%.tar.gz}.created" "${_old%.tar.gz}.from"; done
+    | while IFS= read -r _old; do rm -f "$_old" "${_old%.tar.gz}.created" "${_old%.tar.gz}.from" "${_old%.tar.gz}.egress"; done
   BACKUP="$_bk"
 }
 
@@ -489,6 +546,27 @@ _run_hooks() {
   return "$_hfail"
 }
 
+# After the files and hooks: add the egress the plan listed, with the tool just
+# installed. Only adds; an entry removed with `wasp-egress deny` stays removed.
+_reconcile_egress() {
+  [ "${_n_egress:-0}" -gt 0 ] || return 0
+  _eg="${R}/usr/local/bin/wasp-egress.sh"
+  [ -x "$_eg" ] || { _warn "wasp-egress.sh is not installed: the egress above was not added."; return 0; }
+  echo "  » egress: what WordPress and the plugins installed here need"
+  WASP_SQUID_DIR="${R}/opt/squid" WASP_WP_HTML="${R}/home/wpuser/wp/html" "$_eg" reconcile > "${_WORK}/egress.out" 2>&1
+  _erc=$?
+  grep -v '^[[:space:]]*$' "${_WORK}/egress.out" | grep -v '^━' | sed 's/^/     /'
+  # Beside the backup: rollback does not take these out (the allowlist is
+  # bind-mounted into Squid by inode, and tar would replace it), so it says
+  # what they were and how.
+  if [ "$_erc" = 0 ]; then
+    [ -n "${BACKUP:-}" ] && grep '^add|' "${_WORK}/egress" | cut -d'|' -f2 > "${BACKUP%.tar.gz}.egress" 2>/dev/null
+    return 0
+  fi
+  _bad "The egress was not added (exit ${_erc}); run it by hand: doas wasp-egress.sh reconcile"
+  return 1
+}
+
 _after_checks() {
   _hdr "After the ${_WHAT:-upgrade}"
   _ret=0
@@ -532,7 +610,7 @@ _history() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$HISTORY
 
 # ── commands ─────────────────────────────────────────────────────────────────
 _cmd="${1:-}"; [ $# -gt 0 ] && shift
-_target=""; _DIFF=0; _YES=0; _FORCE=0; _DOWN=0
+_target=""; _DIFF=0; _YES=0; _FORCE=0; _DOWN=0; _FETCHED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --diff) _DIFF=1 ;;
@@ -551,15 +629,22 @@ done
 
 case "$_cmd" in
 check)
-  _lock; _open_release "$_target"; _verify; _plan; _show_plan
+  _lock; case "$_target" in ''|latest) _fetch_latest ;; esac
+  _open_release "$_target"; _verify; _plan; _show_plan
   [ "$_DIFF" = 1 ] && _show_diffs
   echo ""
   [ "$_BLOCKED" = 1 ] && exit 1
-  _note "To apply:  wasp-upgrade.sh apply ${_target}"
+  if [ "$_FETCHED" = 1 ]; then
+    _note "To apply:  wasp-upgrade.sh apply   (fetches the newest again and shows this plan before changing anything)"
+    _note "      or:  wasp-upgrade.sh apply ${_target}   (exactly the release checked here)"
+  else
+    _note "To apply:  wasp-upgrade.sh apply ${_target}"
+  fi
   exit 0 ;;
 
 apply)
-  _lock; _open_release "$_target"; _verify; _plan; _show_plan
+  _lock; case "$_target" in ''|latest) _fetch_latest ;; esac
+  _open_release "$_target"; _verify; _plan; _show_plan
   if [ "$(_vercmp "$REL_VER" "$CUR_VER")" = -1 ] && [ "$_DOWN" != 1 ]; then
     _die "Refusing to move this VM back from ${CUR_VER} to ${REL_VER}." \
          "To return to the state before the last upgrade, use: wasp-upgrade.sh rollback" 1
@@ -572,7 +657,7 @@ apply)
     _N_CHANGES=$(grep -c '^install\|^remove' "${_WORK}/plan")
   fi
   if [ "${_N_CHANGES:-0}" -eq 0 ] && [ ! -s "${_WORK}/hooks" ] && [ "${_n_staged:-0}" -eq 0 ] \
-     && [ ! -s "${_WORK}/cfg" ] && [ "$CUR_VER" = "$REL_VER" ] \
+     && [ ! -s "${_WORK}/cfg" ] && [ "${_n_egress:-0}" -eq 0 ] && [ "$CUR_VER" = "$REL_VER" ] \
      && cmp -s "${REL}/MANIFEST.sha256" "${SRC}/MANIFEST.sha256"; then
     echo ""; _ok "Already up to date. Nothing was changed."; exit 0
   fi
@@ -591,6 +676,7 @@ apply)
   _backup
   _apply_files; _rc=$?
   _run_hooks || _rc=1
+  _reconcile_egress || _rc=1
   _after_checks || _rc=1
   _history "upgrade ${CUR_VER} -> ${REL_VER} $( [ "$_rc" = 0 ] && echo ok || echo with-problems) backup=$(basename "$BACKUP")$( [ "$_SIGNED" = 1 ] || echo ' UNSIGNED')"
   echo ""
@@ -623,6 +709,11 @@ rollback)
   done < "${_bk%.tar.gz}.created"
   _history "rollback ${CUR_VER:-?} -> ${_from:-?} from=$(basename "$_bk")"
   _ok "Rolled back to ${_from:-the previous state}."
+  if [ -s "${_bk%.tar.gz}.egress" ]; then
+    _note "Egress that upgrade added is still allowed (a rollback does not narrow what the site needs):"
+    sed 's/^/       /' "${_bk%.tar.gz}.egress"
+    _note "Remove one if it is not wanted:  doas wasp-egress.sh deny <domain>"
+  fi
   BACKUP="$_bk"; REL_VER="${_from:-previous}"; _WHAT=rollback
   _after_checks || exit 1
   exit 0 ;;

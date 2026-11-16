@@ -289,10 +289,32 @@ function wcs_html(string $html, array $site_hosts, array &$outbound) {
     // another widget): reported once per block, only if no link said it already.
     if (!$spam_link_seen && preg_match(wcs_spam_text_re(), strip_tags($html), $wm)) {
         $plain = strip_tags(html_entity_decode($html, ENT_QUOTES, 'UTF-8'));
-        $pos = mb_stripos($plain, $wm[0], 0, 'UTF-8');
-        $found[] = array('spam_text', wcs_clip(mb_substr($plain, max(0, $pos - 30), 90, 'UTF-8'), 80));
+        if (wcs_wording_is_spam($html, $plain, $hidden_spans, $sheets)) {
+            $pos = mb_stripos($plain, $wm[0], 0, 'UTF-8');
+            $found[] = array('spam_text', wcs_clip(mb_substr($plain, max(0, $pos - 30), 90, 'UTF-8'), 80));
+        }
     }
     return $found;
+}
+
+/**
+ * Is spam wording with no spam link spam, or a word in ordinary writing? Until
+ * 10.26 one word anywhere was enough, so a field site's tax article, naming a
+ * casino among the workplaces where tips are earned, was reported as spam
+ * with its 34 revisions. Injected text is short and dense
+ * ("Best online casino bonuses in Italy"), hidden, or pasted from a Google
+ * Sheet; a word in a long article is none of those. Spam with a link is
+ * reported by its link whatever this says, and a spam title by the title test.
+ */
+function wcs_wording_is_spam(string $html, string $plain, array $hidden_spans, bool $sheets) {
+    if ($sheets) { return true; }
+    foreach ($hidden_spans as $sp) {
+        if (preg_match(wcs_spam_text_re(), strip_tags(substr($html, $sp[0], $sp[1] - $sp[0])))) { return true; }
+    }
+    $hits  = preg_match_all(wcs_spam_text_re(), $plain);
+    $words = preg_match_all('/[\p{L}\p{N}]+/u', $plain);
+    // One spam word in every 40 or fewer: a blurb, not a passing mention.
+    return $hits > 0 && $hits * 40 >= $words;
 }
 
 /**

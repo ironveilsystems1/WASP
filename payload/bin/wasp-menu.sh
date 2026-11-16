@@ -85,6 +85,12 @@ ask() { # prompt varname
   return 0
 }
 
+# Which release 23/24 use. Unlike ask(), blank is the common answer: the newest.
+_release_arg() {
+  printf '  Release: Enter for the newest from GitHub, or a file/directory on this VM: '
+  read -r _a
+}
+
 _pause() { [ "$IS_TTY" = 1 ] && { printf '\n%spress Enter%s' "$DIM" "$R"; read -r _; }; }
 
 _missing() { # tool
@@ -1024,9 +1030,10 @@ EOF
     is normal when the LAPI lives on another host.
 EOF
     ;;
-  updates.23) _card "23 — What a new release changes" <<'EOF'
+  updates.23) _card "23 — What the newest release changes" <<'EOF'
   WHAT IT DOES
-    Checks a WASP release against the signing key pinned on this VM and every
+    Downloads the newest WASP release from the project (or uses one you name),
+    checks it against the signing key pinned on this VM and every
     file against its manifest, then lists what an upgrade would change: tools,
     WordPress mu-plugins, rules, cron lines, and build-time configuration that
     changed upstream (reported, never replaced). Changes nothing.
@@ -1035,14 +1042,15 @@ EOF
     Before every upgrade, and to see whether a VM has fallen behind.
 
   WHAT IT ASKS YOU
-    Where the release is: the wasp-X.tar.gz you copied over, or the
-    directory you unpacked it into.
+    Nothing, usually: press Enter for the newest release. Or give a
+    wasp-X.tar.gz you copied over, or the directory you unpacked it into.
+    Either way a release that does not verify is refused.
 
   EXAMPLE
     "~ tool wp-links.sh (+120 −8 lines)" · "+ cron 40 4 * * 2 …"
 EOF
     ;;
-  updates.24) _card "24 — Upgrade to a new release" <<'EOF'
+  updates.24) _card "24 — Upgrade to the newest release" <<'EOF'
   WHAT IT DOES
     The check in 23, then: backs up everything it will touch, installs the
     release's tools, rules and mu-plugins (keeping this VM's login slug and
@@ -1054,8 +1062,9 @@ EOF
     each release's CHANGELOG used to list.
 
   WHAT IT ASKS YOU
-    Where the release is, then to type UPGRADE. It stops if a tool here was
-    edited since it was installed: look at that first.
+    Enter for the newest release (or a release on this VM), then to type
+    UPGRADE after the plan. It stops if a tool here was edited since it was
+    installed: look at that first.
 
   EXAMPLE
     "This VM now runs WASP 10.18." — undo with 26.
@@ -2189,8 +2198,8 @@ menu_updates() {
     7) ${RED}[!]${R} Update Squid (egress proxy)  ${DIM}update.sh squid${R}
     8) ${RED}[!]${R} Update Alpine OS packages    ${DIM}update.sh os${R}
   ${B}WASP's own tools${R}
-   23) What a new release changes    ${DIM}wasp-upgrade.sh check <release>${R}
-   24) ${RED}[!]${R} Upgrade to a new release     ${DIM}wasp-upgrade.sh apply <release>${R}
+   23) What the newest release changes ${DIM}wasp-upgrade.sh check${R}
+   24) ${RED}[!]${R} Upgrade to the newest release ${DIM}wasp-upgrade.sh apply${R}
    25) Version and upgrade history   ${DIM}wasp-upgrade.sh status${R}
    26) ${RED}[!]${R} Undo the last upgrade        ${DIM}wasp-upgrade.sh rollback${R}
     b) back
@@ -2207,8 +2216,10 @@ EOF
       6) run "Update CrowdSec" 1 update.sh crowdsec ;;
       7) run "Update Squid" 1 update.sh squid ;;
       8) run "Update OS packages" 1 update.sh os ;;
-      23) _have wasp-upgrade.sh && { if ask "Release (wasp-X.tar.gz or its directory)" _a; then run "WASP release: verify and plan" 0 wasp-upgrade.sh check "$_a"; fi; } || _missing wasp-upgrade.sh ;;
-      24) _have wasp-upgrade.sh && { if ask "Release (wasp-X.tar.gz or its directory)" _a; then run "Upgrade WASP's tools" 1 wasp-upgrade.sh apply "$_a"; fi; } || _missing wasp-upgrade.sh ;;
+      # Enter = the newest release from the project (wasp-upgrade.sh fetches and
+      # verifies it); a path = a release already on this VM.
+      23) _have wasp-upgrade.sh && { _release_arg; if [ -n "$_a" ]; then run "WASP release: verify and plan" 0 wasp-upgrade.sh check "$_a"; else run "The newest WASP release: fetch, verify and plan" 0 wasp-upgrade.sh check; fi; } || _missing wasp-upgrade.sh ;;
+      24) _have wasp-upgrade.sh && { _release_arg; if [ -n "$_a" ]; then run "Upgrade WASP's tools" 1 wasp-upgrade.sh apply "$_a"; else run "Upgrade WASP's tools to the newest release" 1 wasp-upgrade.sh apply; fi; } || _missing wasp-upgrade.sh ;;
       25) _have wasp-upgrade.sh && run "WASP version and upgrades" 0 wasp-upgrade.sh status || _missing wasp-upgrade.sh ;;
       26) _have wasp-upgrade.sh && run "Undo the last upgrade" 1 wasp-upgrade.sh rollback || _missing wasp-upgrade.sh ;;
       b|B) return ;;

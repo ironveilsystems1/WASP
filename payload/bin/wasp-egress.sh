@@ -20,6 +20,8 @@
 #   wasp-egress expire              cron, every minute: close what has expired
 #   wasp-egress hive set <address> | test | status | refresh | remove
 #                                   the path from this VM to its WASP Hive
+#   wasp-egress reconcile [--check] add what WordPress and the commercial
+#                                   plugins installed here need, if missing
 #
 # THE BOUNDARY
 #
@@ -49,12 +51,14 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 [ -r /etc/wp-install/vars.sh ] && . /etc/wp-install/vars.sh
 
-SQ=/opt/squid
+SQ="${WASP_SQUID_DIR:-/opt/squid}"      # WASP_SQUID_DIR, WASP_WP_HTML: wasp-upgrade.sh's tests
+WP_HTML_DIR="${WASP_WP_HTML:-/home/wpuser/wp/html}"
 CONF="${SQ}/config"
 LOGS="${SQ}/logs"
 RUNTIME="${CONF}/allowlist-runtime.txt"
 MAINT="${CONF}/allowlist-maintenance.txt"
 MAINT_META="${CONF}/.maintenance"
+DENIED="${CONF}/.denied"                # what `deny` removed: reconcile never puts it back
 IMPORT_SOURCES=/etc/wp-install/import-sources.txt
 HIVE_EGRESS=${HIVE_EGRESS:-/etc/wp-install/hive-egress}
 HIVE_CONF_FILE=${HIVE_CONF_FILE:-/etc/wp-install/hive.conf}
@@ -121,6 +125,90 @@ _valid_domain() {
           _note "Allow the specific host you need."; return 1; } ;;
   esac
   return 0
+}
+
+# ── What this VM needs: reconcile ────────────────────────────────────────────
+# A VM upgraded from an older release, or a site that gained a commercial
+# plugin after it was built, can lack an entry it needs, and nothing says so:
+# the plugin installs, then silently never updates or validates its licence.
+# Field case (2026-11-16): a site running Ultimate Addons for Elementor was
+# denied support.brainstormforce.com 134 times in a week. `reconcile` adds
+# what is missing, and only that; wasp-upgrade.sh runs it on every apply.
+#
+# The list is deliberately short. WordPress's own update servers, then one
+# entry per commercial plugin or theme that is INSTALLED here (its directory
+# exists), for its licence and update server. Nothing is added for a plugin
+# that is not installed, nothing is ever removed, and anything an operator
+# removed with `deny` is never put back. WASP's own host tools (vulnerability
+# feeds, CrowdSec, GeoIP, apk) do not go through this proxy and need nothing
+# here.
+REQUIRED=".wordpress.org .w.org"
+_required_why() {
+  case "$1" in
+    .wordpress.org) echo "WordPress core, plugin and theme updates" ;;
+    .w.org)         echo "WordPress update files and translations" ;;
+  esac
+}
+# Directory name -> the host its licence and updates come from. Only hosts
+# seen on real sites or that the vendor documents; anything else is a
+# question for `discovery`, not a guess here.
+_vendor() {  # plugin|theme <directory> -> "host|why" or nothing
+  case "$1:$2" in
+    plugin:elementor-pro)        echo ".elementor.com|Elementor Pro: licence and updates" ;;
+    plugin:ultimate-elementor)   echo "support.brainstormforce.com|Ultimate Addons for Elementor: licence and updates" ;;
+    plugin:astra-addon)          echo "support.brainstormforce.com|Astra Pro: licence and updates" ;;
+    plugin:wordfence)            echo "noc1.wordfence.com|Wordfence plugin: firewall rules and malware signatures" ;;
+    plugin:wpvulnerability)      echo "www.wpvulnerability.net|WPVulnerability plugin: its vulnerability lookups" ;;
+    plugin:divi-builder|theme:Divi|theme:Extra)
+                                 echo ".elegantthemes.com|Divi / Elegant Themes: licence and updates" ;;
+    plugin:js_composer)          echo ".wpbakery.com|WPBakery: licence and updates" ;;
+    plugin:bb-plugin|theme:bb-theme)
+                                 echo ".beaverbuilder.com|Beaver Builder: licence and updates" ;;
+    plugin:kadence-pro|plugin:kadence-blocks-pro)
+                                 echo ".kadencewp.com|Kadence Pro: licence and updates" ;;
+    plugin:gp-premium)           echo ".generatepress.com|GeneratePress Premium: licence and updates" ;;
+  esac
+}
+# Every needed entry, "host|why", one per line; installed plugins and themes
+# are read from the site's files, so this works with WordPress stopped.
+_needed() {
+  for _r in $REQUIRED; do printf '%s|%s\n' "$_r" "$(_required_why "$_r")"; done
+  for _k in plugin theme; do
+    for _d in "${WP_HTML_DIR}/wp-content/${_k}s"/*/; do
+      [ -d "$_d" ] || continue
+      _n=$(basename "$_d")
+      _v=$(_vendor "$_k" "$_n")
+      [ -n "$_v" ] && printf '%s (%s %s installed)\n' "$_v" "$_k" "$_n"
+    done
+  done | awk -F'|' '!seen[$1]++'
+}
+# The allowlist's entries, comments and blanks dropped.
+_entries() { grep -v '^[[:space:]]*#' "$RUNTIME" 2>/dev/null | tr -d ' \t\r' | grep -v '^$'; }
+# What is missing: "add|host|why" to add, "skip|host|why|reason" left out.
+_reconcile_plan() {
+  _ents=$(_entries)
+  _needed | while IFS='|' read -r _h _w; do
+    [ -n "$_h" ] || continue
+    _have=""; _narrow=""
+    for _e in $_ents; do
+      case "$_h" in
+        .*) # Only a dotted entry covers every host under it.
+            case "$_e" in .*) _covers "$_e" "${_h#.}" && { _have=1; break; } ;; esac
+            # A narrower entry under the parent: Squid treats listing both as
+            # a fatal error, so the parent cannot be added beside it.
+            _covers "$_h" "${_e#.}" && _narrow="${_narrow:+${_narrow} }${_e}" ;;
+        *)  _covers "$_e" "$_h" && { _have=1; break; } ;;
+      esac
+    done
+    [ -n "$_have" ] && continue
+    if [ -s "$DENIED" ] && awk -v d="$_h" '$2==d {f=1} END {exit !f}' "$DENIED"; then
+      echo "skip|${_h}|${_w}|removed with wasp-egress deny; allow it with --permanent to restore"
+    elif [ -n "$_narrow" ]; then
+      echo "skip|${_h}|${_w}|${_narrow} is listed; Squid refuses a parent beside it"
+    else
+      echo "add|${_h}|${_w}"
+    fi
+  done
 }
 
 # Minutes for a temporary entry: a whole number, 1..TEMP_MAX. Over the cap is
@@ -484,8 +572,22 @@ discovery)
   # (www.wordfence.com is WASP's own vulnerability feed and is on the list;
   # noc1 is the Wordfence PLUGIN's, and a site that runs the plugin without it
   # silently keeps stale firewall rules and malware signatures.)
+  _need=$(_needed)
   _known=$(printf '%s\n' "$_d" | awk '{print $2}' | while read -r _h; do
+    # Needed by something installed here: reconcile adds it (once, and say why).
+    _nw=$(printf '%s\n' "$_need" | while IFS='|' read -r _nh _ny; do
+            case "$_nh" in .*) _covers "$_nh" "$_h" ;; *) [ "$_nh" = "$_h" ] ;; esac && { printf '%s' "$_ny"; break; }
+          done)
+    if [ -n "$_nw" ]; then
+      printf '  %s\n      %s.\n      REQUIRED here:  doas wasp-egress.sh reconcile\n' "$_h" "$_nw"; continue
+    fi
     case "$_h" in
+      support.brainstormforce.com)
+        printf '  %s\n      Brainstorm Force (Ultimate Addons for Elementor, Astra Pro): licence and updates.\n      REQUIRED if the site runs one:  doas wasp-egress.sh reconcile\n' "$_h" ;;
+      www.wpvulnerability.net|wpvulnerability.net)
+        printf '  %s\n      A plugin'"'"'s vulnerability lookups. WASP'"'"'s own run from the host, not\n      through this proxy, and do not need it. UNNECESSARY unless a plugin you keep does.\n' "$_h" ;;
+      example.com|169.254.169.254|1.1.1.1)
+        printf '  %s\n      A probe by wasp-egress test, denied on purpose. Nothing to do.\n' "$_h" ;;
       noc[0-9]*.wordfence.com)
         printf '  %s\n      Wordfence plugin: firewall rules, malware signatures, blocked IPs.\n      REQUIRED if the site runs Wordfence:  wasp-egress allow %s --permanent\n' "$_h" "$_h" ;;
       *.indexnow.org|indexnow.org)
@@ -687,6 +789,8 @@ allow)
     if [ "$_tg" = allow ]; then _notify_open "Egress opened to ${_dom} for ${_mins} minutes"; fi
     exit 0
   fi
+  # Allowed again on purpose: reconcile may keep it from now on.
+  if [ -s "$DENIED" ]; then awk -v d="$_dom" '$2!=d' "$DENIED" > "${DENIED}.tmp" && cat "${DENIED}.tmp" > "$DENIED"; rm -f "${DENIED}.tmp"; fi
   cp "$RUNTIME" "${RUNTIME}.bak-$(date -u +%s)"
   grep -qxF "$_dom" "$RUNTIME" && { echo "Already allowed: ${_dom}"; exit 0; }
   printf '%s\n' "$_dom" >> "$RUNTIME"
@@ -720,6 +824,40 @@ deny)
     exit 1
   fi
   _ok "Removed: ${_dom}"
+  # Recorded, so an upgrade's reconcile does not put back what was taken out.
+  printf '%s %s %s\n' "$(date -u +%s)" "$_dom" "$(_who)" >> "$DENIED"
+  _reload_or_restore ;;
+
+# ── Reconcile: add what is needed and missing ───────────────────────────────
+reconcile)
+  _chk=0
+  case "${2:-}" in --check) _chk=1 ;; '') : ;; *) echo "Usage: wasp-egress reconcile [--check]" >&2; exit 1 ;; esac
+  if [ ! -f "$RUNTIME" ]; then
+    [ "$_chk" = 1 ] || _note "Egress filtering is not set up on this VM: nothing to reconcile."
+    exit 0
+  fi
+  _plan=$(_reconcile_plan)
+  # --check: the plan only, one line each, for wasp-upgrade.sh's plan.
+  if [ "$_chk" = 1 ]; then printf '%s\n' "$_plan" | grep -v '^$'; exit 0; fi
+  _hdr "Egress this VM needs"
+  printf '%s\n' "$_plan" | grep '^skip|' | while IFS='|' read -r _x _h _w _why; do
+    _warn "Not added: ${_h} (${_w})"; _note "${_why}"
+  done
+  _adds=$(printf '%s\n' "$_plan" | grep '^add|')
+  if [ -z "$_adds" ]; then _ok "Everything WordPress and its installed plugins need is on the allowlist."; exit 0; fi
+  cp "$RUNTIME" "${RUNTIME}.bak-$(date -u +%s)"
+  # Appended (>>): the file is bind-mounted into Squid as a single file, and
+  # only an in-place write keeps the inode Squid reads.
+  {
+    echo ""
+    echo "# Added by wasp-egress reconcile, $(date -u +%Y-%m-%d): needed by what this VM runs."
+    echo "# Remove one with:  doas wasp-egress.sh deny <domain>   (reconcile will not re-add it)"
+    printf '%s\n' "$_adds" | while IFS='|' read -r _x _h _w; do
+      case "$_h" in *[!a-z0-9.-]*|'') continue ;; esac   # a dstdomain entry and nothing else
+      printf '# %s\n%s\n' "$_w" "$_h"
+    done
+  } >> "$RUNTIME"
+  printf '%s\n' "$_adds" | while IFS='|' read -r _x _h _w; do _ok "Allowed: ${_h}"; _note "${_w}"; done
   _reload_or_restore ;;
 
 # ── Import sources ───────────────────────────────────────────────────────────

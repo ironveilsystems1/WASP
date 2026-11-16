@@ -45,6 +45,11 @@ if [ "${1:-}" = "--digest" ]; then
   _vsave=""
   if [ -r "$VULN_STATE" ]; then _vsave=$(mktemp); cp "$VULN_STATE" "$_vsave"; fi
   _vrc=0
+  # On a terminal, say what the wait is: the pass prints nothing until it is
+  # done, and after an image update every component is looked up afresh (with
+  # rate-limit backoff), which can take minutes. An operator took it for a hang.
+  # Not to cron: its output is mailed.
+  [ -t 2 ] && printf '  Checking every plugin, theme and component for known vulnerabilities.\n  This can take a few minutes; the report follows.\n\n' >&2
   /usr/local/bin/wp-plugins.sh vulns >"$OUT" 2>&1 || _vrc=$?
   if [ -n "$_vsave" ]; then cat "$_vsave" > "$VULN_STATE"; rm -f "$_vsave"
   else rm -f "$VULN_STATE"; fi
