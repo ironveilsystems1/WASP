@@ -26,10 +26,32 @@ which does what:
   back on failure, and account locking limited to privileged accounts and
   never a batch. `test/test-egress-temporary.sh` proves nothing temporary on
   the egress allowlist outlives an hour, with no one running a command.
+  `test/test-mail-wordpress.sh` proves, on real WordPress, that WASP's alerts
+  take the operator relay and the site's mail the client's server (Microsoft
+  365 through Graph, or SMTP), and that a failing client path still delivers
+  through the relay. It needs the same WASP_TEST_WP and WASP_TEST_WPCLI.
   `test/test-egress-reconcile.sh` proves an upgrade adds the egress WordPress
   and the commercial plugins installed on the VM need, and only adds: nothing
   for an uninstalled plugin, never what `deny` removed, never a parent beside
   a narrower entry, written in place.
+  `test/test-embeds.sh` drives `wp-hardening.sh embeds` against WASP's own
+  header file, with Apache and the live header stood in, under the host shell
+  and BusyBox: both header lines rewritten together and in place, a refused
+  configtest restored, a hand edit adopted, report-only mode, and the report
+  grouping what browsers blocked; `test/test-csp-report.php` covers the
+  mu-plugin that receives those reports (both report formats, nothing logged
+  that a visitor sent beyond the blocked host and the page's path, the hourly
+  ceiling). `test/test-malware-accept.sh` runs the real scanner: an accepted
+  file is shown and not counted, one changed byte reports it again, a copy
+  under another name and a scan of another tree are not accepted.
+  `test/test-tls-check.sh` makes a throwaway CA and serves real TLS on local
+  ports: a good chain on both names, a missing intermediate, a certificate
+  without www, one expiring, a site that does not answer, and the address
+  taken from DNS rather than the hosts file. `test/test-offsite-hypervisor.sh`
+  covers recording offsite copies as the hypervisor's, and the weekly report.
+  `test/test-boot-wait.sh` covers `mariadb-health-check.sh --wait` and the
+  service that runs it at boot, new and as the 10.28 upgrade step rewrites an
+  older one.
   `test/test-notify.sh` runs the real `--passwordeval` command against a real
   `smtp.ini`, so it checks the password the relay would actually receive.
   `test/test-hive.py` tests the WASP Hive server: TOTP, sessions, throttling,

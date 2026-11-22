@@ -39,7 +39,7 @@ STUB
 printf '#!/bin/sh\nexit 0\n' > "$T/bin/logger"
 chmod +x "$T/bin/"*
 
-_eg() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" WASP_SQUID_DIR="$T/sq" WASP_WP_HTML="$T/wp" \
+_eg() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" WASP_SQUID_DIR="$T/sq" WASP_WP_HTML="$T/wp" WASP_CLIENT_MAIL="$T/client-mail.ini" \
           ${WASP_TEST_SH:-sh} "$T/wasp-egress.sh" "$@" 2>&1; }
 _has() { grep -qxF "$1" "$R"; }
 _ino() { ls -i "$R" | awk '{print $1}'; }
@@ -119,6 +119,17 @@ out=$(_eg reconcile); rc=$?
 [ "$rc" = 0 ] && [ ! -e "$R" ] && printf '%s' "$out" | grep -q 'not set up' && _p "no egress filtering: nothing created, said so" || _f "off" "$rc $out"
 [ -z "$(_eg reconcile --check)" ] && _p "and --check is silent" || _f "off --check" "$(_eg reconcile --check)"
 mv "$T/off" "$R"
+
+echo ""
+echo "── the client's mail through Microsoft 365 (10.27)"
+printf '.wordpress.org\n.w.org\n' > "$R"; rm -f "$D"; rm -rf "$T/wp/wp-content/plugins/"* "$T/wp/wp-content/themes/"*
+printf 'transport = m365\ntenant = contoso.example\nfrom = forms@client.example\n' > "$T/client-mail.ini"
+out=$(_eg reconcile --check)
+printf '%s\n' "$out" | grep -q "^add|login.microsoftonline.com|Microsoft 365 sign-in" && printf '%s\n' "$out" | grep -q '^add|graph.microsoft.com|' \
+  && _p "Microsoft 365 for the client's mail needs sign-in and Graph" || _f "m365 egress" "$out"
+printf 'transport = smtp\nhost = smtp.gmail.com\n' > "$T/client-mail.ini"
+[ -z "$(_eg reconcile --check)" ] && _p "SMTP for the client's mail needs no web egress (it is a firewall pin)" || _f "smtp egress" "$(_eg reconcile --check)"
+rm -f "$T/client-mail.ini"
 
 echo ""
 echo "── a list Squid refuses is put back"

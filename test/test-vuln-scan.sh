@@ -56,6 +56,8 @@ cat > "$T/bin/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
   ps\ *) echo wordpress ;;
+  *'plugin list --update=available'*) cat "$T/plugin-updates.csv" 2>/dev/null ;;
+  *'theme list --update=available'*)  cat "$T/theme-updates.csv" 2>/dev/null ;;
   *'plugin list'*) cat "$T/plugins.csv" ;;
   *'theme list'*)  printf 'name,version,status\nastra,4.0.0,active\n' ;;
   *'core version'*) echo 7.1.4 ;;
@@ -93,7 +95,7 @@ chmod +x "$T/notify.sh" "$T/wp-plugins.sh"
 
 _scan() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/wp-plugins.sh" vulns "$@" 2>&1; }
 _cron() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/cron.sh" 2>&1; }
-_reset() { rm -rf "$T/cache"/* "$T/cache"/.[a-z]* "$T/wf.json" "$T/api"/*; : > "$T/requests"; : > "$T/notify"; : > "$T/sleeps"; rm -f "$T/syslog" "$T/etc/vuln-sources.conf"; }
+_reset() { rm -rf "$T/cache"/* "$T/cache"/.[a-z]* "$T/wf.json" "$T/api"/* "$T/plugin-updates.csv" "$T/theme-updates.csv"; : > "$T/requests"; : > "$T/notify"; : > "$T/sleeps"; rm -f "$T/syslog" "$T/etc/vuln-sources.conf"; }
 _conf() { printf '%s\n' "$@" > "$T/etc/vuln-sources.conf"; }
 wf() { printf '%s' "$1" > "$T/wf.json"; }
 
@@ -309,6 +311,81 @@ grep -q '^30 6 \* \* \* /usr/local/bin/wp-vuln-cron.sh$' "$REPO/payload/cron/wor
 grep -q '^30 3 \* \* \* /usr/local/bin/wp-malware-scan.sh quick' "$REPO/payload/cron/wordpress-vm.cron" \
   && grep -q '^45 3 \* \* 0 /usr/local/bin/wp-malware-scan.sh yara' "$REPO/payload/cron/wordpress-vm.cron" \
   && _p "the malware scans are scheduled daily and weekly" || _f "malware cron" ""
+
+echo ""
+echo "── 10.28: a busy service is not a gap; answers do not all expire at once"
+_age_all() { for _c in "$T/cache/wpv"/*.json; do touch -d "@$(( $(date +%s) - $1 * 3600 - 60 ))" "$_c"; done; }
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 "$(vuln 'Cached bug' ge 1.0.0 lt 3.5.0 0 CVE-2026-6100 8.1 h)"
+api plugin-contact-form 0 ""; api plugin-my-bespoke 0 ""; api theme-astra 0 ""; api core-7.1.4 0 ""; api php-8.4.27 0 ""; api mariadb-11.4.8 0 ""
+_scan >/dev/null
+_age_all 20; printf 429 > "$T/api/plugin-elementor.code"; : > "$T/requests"; : > "$T/sleeps"
+o=$(_scan); rc=$?
+_has "a refused refresh uses yesterday's answer: the finding is still reported" "$o" "CVE-2026-6100"
+[ "$rc" = 0 ] && _p "and the scan is complete, not INCOMPLETE" || _f "stale rc" "exit $rc: $o"
+_has "saying which answer, and how old" "$o" "answer from up"
+_has "...20h" "$o" "to 20h ago"
+_age_all 100; : > "$T/requests"
+o=$(_scan); rc=$?
+[ "$rc" = 3 ] && _p "an answer over 72h old: INCOMPLETE" || _f "old rc" "exit $rc"
+_has "saying for how long" "$o" "for over 72h"
+_has "but still checked against it" "$o" "CVE-2026-6100"
+rm -f "$T/api/plugin-elementor.code"; rm -rf "$T/cache/wpv"; printf 429 > "$T/api/plugin-elementor.code"
+o=$(_scan); [ $? = 3 ] && _p "no answer at all is still INCOMPLETE" || _f "none" "$o"
+rm -f "$T/api/plugin-elementor.code"
+_reset; _conf 'WORDFENCE_API_KEY=t' 'WPVULNERABILITY=0'; wf '{}'; _scan >/dev/null
+touch -d "@$(( $(date +%s) - 20 * 3600 ))" "$T/cache/wordfence-scanner.json"; rm -f "$T/wf.json"
+o=$(_scan); rc=$?
+[ "$rc" = 0 ] && _p "a Wordfence feed that cannot refresh, 20h old: used, not INCOMPLETE" || _f "wf 20h" "exit $rc: $o"
+_has "and said" "$o" "Refresh failed; using cached feed (20h old)"
+
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 ""; api plugin-contact-form 0 ""; api plugin-my-bespoke 0 ""; api theme-astra 0 ""
+api core-7.1.4 0 ""; api php-8.4.27 0 ""; api mariadb-11.4.8 0 ""
+_scan >/dev/null; _age_all 12; : > "$T/requests"
+_scan >/dev/null
+_jok=1; _seen=""
+for _k in plugin-elementor plugin-contact-form plugin-my-bespoke theme-astra core-7.1.4 php-8.4.27 mariadb-11.4.8; do
+  _j=$(printf '%s' "$_k" | cksum | awk '{print $1 % 6}'); _seen="$_seen $_j"
+  _u=$(printf '%s' "$_k" | sed 's|-|/|')
+  if [ "$_j" = 0 ]; then grep -q "/${_u}/" "$T/requests" || _jok=0
+  else grep -q "/${_u}/" "$T/requests" && _jok=0; fi
+done
+[ "$_jok" = 1 ] && _p "at 12h only the components whose refresh time is 12h are asked again" || _f "ttl" "$_seen :: $(cat "$T/requests")"
+[ "$(printf '%s\n' $_seen | sort -u | wc -l)" -ge 3 ] && _p "and refresh times differ by component (12-17h)" || _f "spread" "$_seen"
+
+_age_all 30; : > "$T/requests"
+o=$(WPV_REFRESH_MAX=2 _scan); rc=$?
+[ "$(grep -c wpvulnerability "$T/requests")" = 2 ] && _p "at most WPV_REFRESH_MAX expired answers are refreshed in one run" || _f "cap" "$(cat "$T/requests")"
+[ "$rc" = 0 ] && _has "the rest are used and kept for a later run" "$o" "5 older answer(s) kept for a later run" || _f "cap rc" "exit $rc: $o"
+rm -rf "$T/cache/wpv/plugin-contact-form.json"; : > "$T/requests"
+WPV_REFRESH_MAX=0 _scan >/dev/null
+grep -q 'plugin/contact-form' "$T/requests" && _p "a component with no answer is always asked, whatever the cap" || _f "cap new" "$(cat "$T/requests")"
+
+echo ""
+echo "── 10.28: does the update on offer fix it?"
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 "$(vuln 'Fixed in 3.5' ge 1.0.0 lt 3.5.0 0 CVE-2026-6201 8.1 h),$(vuln 'Still in 3.6' ge 1.0.0 lt 4.0.0 0 CVE-2026-6202 7.5 h)"
+api plugin-contact-form 0 "$(vuln 'No update' ge 1.0 lt 3.0 0 CVE-2026-6203 6.1 m)"
+printf 'name,update_version\nelementor,3.6.0\n' > "$T/plugin-updates.csv"
+o=$(_scan)
+printf '%s\n' "$o" | grep -A4 'Fixed in 3.5' | grep -q 'update available now: 3.6.0 fixes this' \
+  && _p "an update that leaves the range: 'update available now: 3.6.0 fixes this'" || _f "fixes" "$o"
+printf '%s\n' "$o" | grep -A4 'Still in 3.6' | grep -q 'the update available now (3.6.0) does NOT fix this one' \
+  && _p "an update still inside the range says it does NOT fix it" || _f "not fixed" "$o"
+printf '%s\n' "$o" | grep -A4 'No update' | grep -q 'fix: wp-plugins.sh update-plugins contact-form$' \
+  && _p "no update on offer: the advice is unchanged" || _f "no update" "$o"
+_has "the summary names what an update fixes now" "$o" "An update available now fixes at least one of them for: elementor"
+_reset; _conf 'WORDFENCE_API_KEY=t' 'WPVULNERABILITY=0'
+wf '{"a":{"title":"WF fixed","cve":"CVE-2026-6301","cvss":{"score":8.0},"software":[{"slug":"elementor","affected_versions":{"x":{"from_version":"*","from_inclusive":true,"to_version":"3.5.0","to_inclusive":true}}}]},"b":{"title":"WF not fixed","cve":"CVE-2026-6302","cvss":{"score":8.0},"software":[{"slug":"elementor","affected_versions":{"x":{"from_version":"*","from_inclusive":true,"to_version":"3.6.0","to_inclusive":true}}}]}}'
+printf 'name,update_version\nelementor,3.6.0\n' > "$T/plugin-updates.csv"
+o=$(_scan)
+printf '%s\n' "$o" | grep -A4 'WF fixed' | grep -q 'update available now: 3.6.0 fixes this' \
+  && _p "the same for a Wordfence record" || _f "wf fixes" "$o"
+printf '%s\n' "$o" | grep -A4 'WF not fixed' | grep -q 'does NOT fix this one' \
+  && _p "...including an inclusive upper bound equal to the update" || _f "wf inclusive" "$o"
+o=$(_scan --inventory "$T/inv.csv" 2>/dev/null)
+_hasnt "a staged inventory does not ask the live site for updates" "$o" "update available now"
 
 echo ""
 printf '  passed %d   failed %d\n' "$PASS" "$FAIL"

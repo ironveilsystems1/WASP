@@ -42,6 +42,11 @@ if command -v php >/dev/null 2>&1; then
   else
     echo "  test-login-guard.php MISSING"; rc=1
   fi
+  if [ -f test/test-csp-report.php ]; then
+    php test/test-csp-report.php || rc=1
+  else
+    echo "  test-csp-report.php MISSING"; rc=1
+  fi
   if [ -f test/test-wpress-reader.php ]; then
     php test/test-wpress-reader.php || rc=1
   else
@@ -87,7 +92,7 @@ if command -v python3 >/dev/null 2>&1; then
 else
   echo "  python3 missing: WASP Hive server tests NOT run"; rc=1
 fi
-for _t in test-vuln-scan.sh test-import-source.sh test-import-findings.sh test-egress-temporary.sh test-egress-reconcile.sh test-threats.sh test-notify.sh test-hive-report.sh test-appsec.sh test-hive-role.sh test-updraft-import.sh test-remoteip-fix.sh test-smtp-config.sh test-malware-scan.sh test-alerts.sh test-verify-integrity.sh test-links.sh test-links-wordpress.sh test-upgrade.sh test-busybox-run.sh; do
+for _t in test-vuln-scan.sh test-import-source.sh test-import-findings.sh test-egress-temporary.sh test-egress-reconcile.sh test-threats.sh test-notify.sh test-hive-report.sh test-appsec.sh test-hive-role.sh test-updraft-import.sh test-remoteip-fix.sh test-embeds.sh test-smtp-config.sh test-malware-scan.sh test-malware-accept.sh test-tls-check.sh test-offsite-hypervisor.sh test-boot-wait.sh test-alerts.sh test-verify-integrity.sh test-links.sh test-links-wordpress.sh test-mail-wordpress.sh test-upgrade.sh test-busybox-run.sh; do
   if [ -f "test/${_t}" ]; then
     bash "test/${_t}" || rc=1
   else
