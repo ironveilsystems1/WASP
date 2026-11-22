@@ -454,16 +454,45 @@ _finding() {  # slug version title cve score letter unfixed fix
 # file exists to avoid.
 WPV_BASE="https://www.wpvulnerability.net"
 WPV_CACHE_HOURS=12
+# 10.28: at most this many cached answers are refreshed in one run; the rest
+# are used as they are while they are inside VULN_MAX_AGE_H, and refreshed on
+# a later run. Every answer was fetched in the same minute, so every answer
+# expired in the same minute, and the daily run asked for all of them at once
+# -- about forty requests in a few seconds, which is what a free API's rate
+# limit exists to refuse. A component with no answer at all is always asked.
+WPV_REFRESH_MAX="${WPV_REFRESH_MAX:-15}"
 
-_wpv_get() {  # kind key -> 0 answered, 2 unknown, 1 failed
+# Hours before a component's answer is refreshed: 12 plus 0-5 by its name, so
+# answers fetched together do not all expire together.
+_wpv_ttl() {
+  _wj=$(printf '%s' "$1" | cksum | awk '{print $1 % 6}')
+  echo $((WPV_CACHE_HOURS + _wj))
+}
+
+# No answer this run. 10.28: a cached answer, when there is one, is used
+# instead and marked with its age (3); before, a refusal made the component
+# failed even with yesterday's answer on disk, and the scan INCOMPLETE.
+_wpv_fallback() {
+  [ -n "${_wa:-}" ] && [ -s "$_wc" ] && { _WPV_AGE="$_wa"; return 3; }
+  return 1
+}
+
+_wpv_get() {  # kind key -> 0 answered, 3 answered from an older copy, 2 unknown, 1 failed
   _wc="$VULN_CACHE/wpv/${1}-${2}.json"
   mkdir -p "$VULN_CACHE/wpv"
+  _wa=""; _WPV_AGE=""
   if [ -f "$_wc" ]; then
     _wa=$(( ( $(date +%s) - $(stat -c %Y "$_wc" 2>/dev/null || echo 0) ) / 3600 ))
-    [ "$_wa" -lt "$WPV_CACHE_HOURS" ] && return 0
+    [ "$_wa" -lt "$(_wpv_ttl "${1}-${2}")" ] && return 0
+    _wn=$(grep -c . "$VULN_CACHE/.wpv-fetched.$$" 2>/dev/null) || _wn=0
+    if [ "$_wn" -ge "$WPV_REFRESH_MAX" ] && [ "$_wa" -le "$VULN_MAX_AGE_H" ]; then
+      echo "${1}-${2}" >> "$VULN_CACHE/.wpv-deferred.$$"
+      return 0
+    fi
   fi
-  # Refused repeatedly this run: stop asking. The rest are failed, and said to be.
-  [ -f "$VULN_CACHE/.wpv-stop.$$" ] && return 1
+  # Refused repeatedly this run: stop asking. The rest use what they have.
+  [ -f "$VULN_CACHE/.wpv-stop.$$" ] && { _wpv_fallback; return $?; }
+  echo "${1}-${2}" >> "$VULN_CACHE/.wpv-fetched.$$"
   # Three tries, with a pause between. This gave up after one refusal and
   # marked every remaining component failed, so on the unattended daily run a
   # momentary rate limit turned into an INCOMPLETE verdict for the whole site.
@@ -484,24 +513,24 @@ _wpv_get() {  # kind key -> 0 answered, 2 unknown, 1 failed
           mv "${_wc}.tmp" "$_wc"
           return 0
         fi
-        rm -f "${_wc}.tmp"; return 1 ;;
+        rm -f "${_wc}.tmp"; _wpv_fallback; return $? ;;
       404) rm -f "${_wc}.tmp" "${_wc}.hdr"; return 2 ;;
       429|000|5[0-9][0-9])
         rm -f "${_wc}.tmp"
         if [ "$_try" -ge 3 ]; then
           rm -f "${_wc}.hdr"
           [ "$_code" = 429 ] && : > "$VULN_CACHE/.wpv-stop.$$"
-          return 1
+          _wpv_fallback; return $?
         fi
         _wait=""
-        [ "$_code" = 429 ] && _wait=$(tr -d '\r' < "${_wc}.hdr" 2>/dev/null \
+        [ "$_code" = 429 ] && _wait=$(tr -d '\r' 2>/dev/null < "${_wc}.hdr" \
             | awk -F: 'tolower($1)=="retry-after" {gsub(/[^0-9]/, "", $2); print $2; exit}')
         case "$_wait" in ''|*[!0-9]*) [ "$_try" = 1 ] && _wait=5 || _wait=15 ;; esac
         [ "$_wait" -gt 60 ] && _wait=60
         rm -f "${_wc}.hdr"
         sleep "$_wait"
         _try=$((_try + 1)) ;;
-      *) rm -f "${_wc}.tmp" "${_wc}.hdr"; return 1 ;;
+      *) rm -f "${_wc}.tmp" "${_wc}.hdr"; _wpv_fallback; return $? ;;
     esac
   done
 }
@@ -540,6 +569,14 @@ _wpv_check() {  # kind key label version fix
   _wpv_get "$1" "$2" || _wr=$?
   case "$_wr" in
     0) : ;;
+    3) # An older answer. Inside VULN_MAX_AGE_H it is used and said to be; past
+       # it, it is still checked -- an old answer finds old bugs -- and the scan
+       # is incomplete.
+       if [ "${_WPV_AGE:-0}" -le "$VULN_MAX_AGE_H" ]; then
+         echo "${_WPV_AGE}|$3" >> "$VULN_CACHE/.wpv-stale.$$"
+       else
+         echo "${_WPV_AGE}|$3" >> "$VULN_CACHE/.wpv-old.$$"
+       fi ;;
     2) echo "$3" >> "$VULN_CACHE/.wpv-unknown.$$"; return 0 ;;
     *) echo "$3" >> "$VULN_CACHE/.wpv-failed.$$";  return 0 ;;
   esac
@@ -566,11 +603,30 @@ _wpv_check() {  # kind key label version fix
     | map(tostring | gsub("[[:cntrl:]]"; " ")) | join("\u001f")
   ' "$_wj" 2>/dev/null) || { echo "$3" >> "$VULN_CACHE/.wpv-failed.$$"; return 0; }
   [ -n "$_wrows" ] || return 0
+  _wup=$(_upd_for "$1" "$2")
   printf '%s\n' "$_wrows" | while IFS="$_VD" read -r _mo _mv _xo _xv _un _title _cve _score _lt; do
     _wpv_in_range "$1" "$4" "$_mo" "$_mv" "$_xo" "$_xv" || continue
-    _finding "$3" "$4" "$_title" "$_cve" "$_score" "$_lt" "${_un:-0}" "$5"
+    _wfix="$5"
+    if [ -n "$_wup" ]; then
+      if _wpv_in_range "$1" "$_wup" "$_mo" "$_mv" "$_xo" "$_xv"; then
+        _wfix="$5 -- the update available now (${_wup}) does NOT fix this one"
+      else
+        _wfix="update available now: ${_wup} fixes this -- $5"; _un=0
+        echo "$3" >> "$VULN_CACHE/.fixable.$$"
+      fi
+    fi
+    _finding "$3" "$4" "$_title" "$_cve" "$_score" "$_lt" "${_un:-0}" "$_wfix"
   done
   return 0
+}
+
+# 10.28: the version an available update would install, or nothing. Read once
+# per scan from WordPress (live site only), so a finding can say whether the
+# update on offer fixes it -- "update" was the advice for every finding,
+# including the ones the newest release still has.
+_upd_for() {  # kind slug
+  [ -s "$VULN_CACHE/.upd.$$" ] || return 0
+  awk -F, -v k="$1" -v s="$2" '$1 == k && $2 == s { print $3; exit }' "$VULN_CACHE/.upd.$$"
 }
 
 _wf_match() {  # kind slug version
@@ -585,6 +641,7 @@ _wf_match() {  # kind slug version
     | map(tostring | gsub("[[:cntrl:]]"; " ")) | join("\u001f")
   ' 2>/dev/null)
   [ -n "$_ranges" ] || return 0
+  _xup=$(_upd_for "$1" "$2")
 
   printf '%s\n' "$_ranges" | while IFS="$_VD" read -r _fv _fi _tv _ti _title _cve _score; do  # subshell-ok: _ver_le only counts its own loop
     # Is the installed version inside this affected range?
@@ -598,7 +655,26 @@ _wf_match() {  # kind slug version
       else _ver_le "$_tv" "$3" && _in=0; fi
     fi
     [ "$_in" = 1 ] || continue
-    _finding "$2" "$3" "$_title" "$_cve" "$_score" "" 0 "wp-plugins.sh update-plugins $2"
+    _xfix="wp-plugins.sh update-plugins $2"
+    if [ -n "$_xup" ]; then
+      # The same range test, against the version an update would install.
+      _uin=1
+      if [ "$_fv" != "*" ]; then
+        if [ "$_fi" = "true" ]; then _ver_le "$_fv" "$_xup" || _uin=0
+        else _ver_le "$_xup" "$_fv" && _uin=0; fi
+      fi
+      if [ "$_tv" != "*" ] && [ "$_uin" = 1 ]; then
+        if [ "$_ti" = "true" ]; then _ver_le "$_xup" "$_tv" || _uin=0
+        else _ver_le "$_tv" "$_xup" && _uin=0; fi
+      fi
+      if [ "$_uin" = 1 ]; then
+        _xfix="$_xfix -- the update available now (${_xup}) does NOT fix this one"
+      else
+        _xfix="update available now: ${_xup} fixes this -- $_xfix"
+        echo "$2" >> "$VULN_CACHE/.fixable.$$"
+      fi
+    fi
+    _finding "$2" "$3" "$_title" "$_cve" "$_score" "" 0 "$_xfix"
   done
   return 0
 }
@@ -615,7 +691,9 @@ vuln_scan() {
   command -v jq >/dev/null 2>&1 || { echo "✗ jq is required: apk add jq" >&2; exit 1; }
   mkdir -p "$VULN_CACHE"
   rm -f "$VULN_CACHE/.incomplete.$$" "$VULN_CACHE/.seen.$$" "$VULN_CACHE/.hits.$$" \
-        "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$"
+        "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$" \
+        "$VULN_CACHE/.wpv-fetched.$$" "$VULN_CACHE/.wpv-deferred.$$" "$VULN_CACHE/.wpv-stale.$$" \
+        "$VULN_CACHE/.wpv-old.$$" "$VULN_CACHE/.upd.$$" "$VULN_CACHE/.fixable.$$"
 
   _wf_ok=1
   _wf_refresh || _wf_ok=0
@@ -658,6 +736,11 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
   | tail -n +2 | awk -F, 'NF{print "theme," $1 "," $2}')" || true
     [ -n "$(printf '%s' "$_inv" | tr -d '[:space:]')" ] \
       || _incomplete "could not list the installed plugins and themes"
+    { _wp plugin list --update=available --fields=name,update_version --format=csv 2>/dev/null \
+        | tail -n +2 | awk -F, 'NF >= 2 && $2 != "" {print "plugin," $1 "," $2}'
+      _wp theme list --update=available --fields=name,update_version --format=csv 2>/dev/null \
+        | tail -n +2 | awk -F, 'NF >= 2 && $2 != "" {print "theme," $1 "," $2}'
+    } | tr -d '\r' > "$VULN_CACHE/.upd.$$" || true
   fi
 
   if [ -n "$_src_list" ]; then
@@ -696,6 +779,22 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
     _nf=$(grep -c . "$VULN_CACHE/.wpv-failed.$$") || _nf=0
     _incomplete "WPVulnerability did not answer for ${_nf} component(s)"
   fi
+  if [ -f "$VULN_CACHE/.wpv-stale.$$" ]; then
+    _ns=$(grep -c . "$VULN_CACHE/.wpv-stale.$$") || _ns=0
+    _sa=$(cut -d'|' -f1 "$VULN_CACHE/.wpv-stale.$$" | sort -n | tail -1)
+    echo "  ${_ns} component(s) were checked against WPVulnerability's answer from up"
+    echo "  to ${_sa}h ago: the service did not answer this run (busy or rate-limited)."
+    echo "  Answers up to ${VULN_MAX_AGE_H}h old are used and refreshed on a later run."
+  fi
+  if [ -f "$VULN_CACHE/.wpv-old.$$" ]; then
+    _no=$(grep -c . "$VULN_CACHE/.wpv-old.$$") || _no=0
+    _oa=$(cut -d'|' -f1 "$VULN_CACHE/.wpv-old.$$" | sort -n | tail -1)
+    _incomplete "WPVulnerability has not answered for ${_no} component(s) for over ${VULN_MAX_AGE_H}h; they were checked against answers up to ${_oa}h old"
+  fi
+  if [ -f "$VULN_CACHE/.wpv-deferred.$$" ]; then
+    _nd=$(grep -c . "$VULN_CACHE/.wpv-deferred.$$") || _nd=0
+    echo "  ${_nd} older answer(s) kept for a later run (at most ${WPV_REFRESH_MAX} are refreshed per run)."
+  fi
   if [ -f "$VULN_CACHE/.wpv-unknown.$$" ]; then
     _nu=$(grep -c . "$VULN_CACHE/.wpv-unknown.$$") || _nu=0
     echo "  ${_nu} component(s) have no WPVulnerability record, which is normal for"
@@ -715,6 +814,11 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
   echo ""
   if [ "${_hits:-0}" -gt 0 ]; then
     echo "  ${_hits} component(s) match a known vulnerability."
+    if [ -s "$VULN_CACHE/.fixable.$$" ]; then
+      _fx=$(sort -u "$VULN_CACHE/.fixable.$$" | tr '\n' ' ' | sed 's/ *$//')
+      echo "  An update available now fixes at least one of them for: ${_fx}"
+      echo "    wp-plugins.sh update-plugins <slug>   (a backup is taken first)"
+    fi
     echo "  Update first, then re-run. If no fix exists yet, consider deactivating"
     echo "  and deleting the plugin — deactivated code is still on disk and still"
     echo "  reachable by direct request."
@@ -743,7 +847,9 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
     } > "$VULN_CACHE/.last-scan"
   fi
   rm -f "$VULN_CACHE/.incomplete.$$" "$VULN_CACHE/.seen.$$" "$VULN_CACHE/.hits.$$" \
-        "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$"
+        "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$" \
+        "$VULN_CACHE/.wpv-fetched.$$" "$VULN_CACHE/.wpv-deferred.$$" "$VULN_CACHE/.wpv-stale.$$" \
+        "$VULN_CACHE/.wpv-old.$$" "$VULN_CACHE/.upd.$$" "$VULN_CACHE/.fixable.$$"
 
   # Licensing obligation of the Wordfence feed, not decoration: MITRE
   # copyright claims must be displayed for MITRE records shown to end users.

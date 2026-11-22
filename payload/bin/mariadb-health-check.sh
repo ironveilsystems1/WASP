@@ -3,7 +3,36 @@
 # that mariadbd-admin ping succeeds. See the long comment above this
 # heredoc in create-wordpress-vm.sh for the full rationale.
 # Usage: mariadb-health-check.sh [container_name]
+#        mariadb-health-check.sh --wait [seconds] [container_name]
 # Exit 0 = all critical checks passed. Exit 1 = one or more failed.
+#
+# --wait (10.28): wait until WordPress could connect -- its own user, its own
+# database, InnoDB answering -- for up to [seconds] (120), then exit 0, or 1
+# when it never did. wp-container runs it before starting WordPress at boot.
+# The wait it replaced was a root `ping`, which answers before InnoDB is
+# ready and while the WordPress user cannot yet log in: the gap in which a
+# rebooted site said "Error establishing a database connection".
+if [ "${1:-}" = "--wait" ]; then
+  _max="${2:-120}"; CONTAINER="${3:-mariadb}"
+  case "$_max" in ''|*[!0-9]*) _max=120 ;; esac
+  _t=0
+  while :; do
+    _r=$(sed -n 's/^MARIADB_PASSWORD=//p' "${WASP_DB_ENV:-/etc/wordpress/env}" 2>/dev/null | head -1 \
+      | podman exec -i "$CONTAINER" sh -c \
+      'IFS= read -r p; MYSQL_PWD="$p"; export MYSQL_PWD
+       q="SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE();"
+       mariadb -u"${MARIADB_USER}" "${MARIADB_DATABASE}" -N -e "$q" 2>/dev/null ||
+       mysql   -u"${MARIADB_USER}" "${MARIADB_DATABASE}" -N -e "$q" 2>/dev/null' 2>/dev/null)
+    case "$_r" in
+      ''|*[!0-9]*) : ;;
+      *) echo "MariaDB ready for WordPress after ${_t}s"; exit 0 ;;
+    esac
+    [ "$_t" -ge "$_max" ] && break
+    sleep 2; _t=$((_t + 2))
+  done
+  echo "MariaDB not ready for WordPress after ${_max}s: mariadb-health-check.sh" >&2
+  exit 1
+fi
 CONTAINER="${1:-mariadb}"
 FAIL=0
 

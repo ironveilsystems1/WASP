@@ -282,6 +282,47 @@ EOF
 EOF
     ;;
 
+  health.6) _card "6 — HTTPS certificate (www too)" <<'EOF'
+  WHAT IT DOES
+    Connects to the site from outside as a browser would — the bare domain
+    AND www — and checks each certificate: days left, the chain (the
+    intermediate the proxy must send), and that it covers that name.
+
+  WHEN TO USE IT
+    A visitor reports a security warning, after changing the proxy host, or
+    when the daily check (09:00) mails. That mail comes at 14 days left, when
+    a browser would refuse the certificate, or when the site cannot be
+    reached at all.
+
+  WHAT IT ASKS YOU
+    Nothing. Certificates are the proxy's job; this only observes them.
+    The VM's VLAN cannot reach the public address? Point the check at the
+    proxy's inside address: TLS_CHECK_ADDR=10.x.x.x in vars.sh.
+
+  EXAMPLE
+    "www.example.com — ✗ browsers will refuse it: hostname mismatch -- the
+     certificate does not cover www.example.com".
+EOF
+    ;;
+  health.7) _card "7 — Is the database ready yet?" <<'EOF'
+  WHAT IT DOES
+    Waits, up to 120 seconds, until WordPress could connect: its own database
+    user, its own database, InnoDB answering a query. Says how long it took.
+
+  WHEN TO USE IT
+    Just after a reboot, when the site says "Error establishing a database
+    connection". At boot WordPress waits for exactly this (up to 120s), so
+    the message should not appear; if it does, this says whether the
+    database is still starting or something is wrong.
+
+  WHAT IT ASKS YOU
+    Nothing.
+
+  EXAMPLE
+    "MariaDB ready for WordPress after 14s". Not ready after 120s: option 5.
+EOF
+    ;;
+
   # ── Backup ────────────────────────────────────────────────────────────────
   backup.menu) _card "Backup & restore — the one to get right" <<'EOF'
   A backup you have never restored is a hope, not a backup. This menu is
@@ -431,6 +472,25 @@ EOF
     Secret access key  : (typed, not shown)
     Use a key scoped to ONE bucket with write-but-not-delete if your
     provider supports it. A backup key that can delete is a ransomware target.
+EOF
+    ;;
+  backup.10) _card "10 — Offsite is the hypervisor's" <<'EOF'
+  WHAT IT DOES
+    Records that this VM's offsite copies are made by the hypervisor — a
+    Proxmox Backup Server, a vzdump job to other storage — not by this VM.
+    Backups then stop reporting "Off-VM backup copy FAILED" (and mailing it),
+    and status, the weekly report, triage and the WASP Hive say where the
+    copies are made.
+
+  WHEN TO USE IT
+    Only when that is true. It is your statement: nothing on this VM can see
+    the hypervisor's copies, so prove they restore there.
+
+  WHAT IT ASKS YOU
+    Where and how, in a few words (shown in every report). 'off' undoes it.
+
+  EXAMPLE
+    "PBS on the backup host, nightly, 30 days kept".
 EOF
     ;;
   backup.9) _card "9 — Change backup destination" <<'EOF'
@@ -963,6 +1023,112 @@ EOF
     "widget w1spam1 (text-editor) on page 120: casino-spam.example"
 EOF
     ;;
+  security.35) _card "35 — Outside services embedded" <<'EOF'
+  WHAT IT DOES
+    Shows which outside services this site's security header lets pages
+    load — Google Maps, reCAPTCHA, Google Fonts, YouTube, or an origin you
+    added — whether the header is enforcing or only reporting, and whether
+    the header Apache is sending now matches the setting.
+
+  WHEN TO USE IT
+    A map, a captcha or a font that works on the old host and is missing
+    here. The header lets pages load only the site's own files unless a
+    service is allowed; the browser blocks the rest without a word.
+
+  WHAT IT ASKS YOU
+    Nothing. Changes nothing.
+
+  EXAMPLE
+    "google-maps  allowed   the map in a page or footer (frame)".
+EOF
+    ;;
+  security.36) _card "36 — Allow maps/reCAPTCHA/fonts…" <<'EOF'
+  WHAT IT DOES
+    Adds a service to the security header: google-maps, recaptcha,
+    google-fonts or youtube. Rewrites the header for the public pages and
+    wp-admin together, checks Apache accepts it (the old file is put back
+    if not), restarts WordPress and checks the live header.
+
+  WHEN TO USE IT
+    A footer map is missing, or a form fails with "The Captcha field cannot
+    be blank". reCAPTCHA also opens the site's outbound path to
+    www.google.com, which its server-side check needs.
+
+  WHAT IT ASKS YOU
+    The service name(s). Anything else, from the console:
+      doas wp-hardening.sh embeds add frame-src https://player.vimeo.com
+    Not sure what a site needs? Report first, block nothing:
+      doas wp-hardening.sh embeds mode report     ...browse the site...
+      doas wp-hardening.sh embeds report          (37)
+      doas wp-hardening.sh embeds mode enforce
+
+  EXAMPLE
+    "✔ Live header matches: www.google.com allowed for frames".
+EOF
+    ;;
+  security.37) _card "37 — What the header blocked" <<'EOF'
+  WHAT IT DOES
+    Reads the reports browsers send when the security header blocks
+    something, groups them by outside host and kind (script, frame, font…),
+    counts them, names the pages, and says which service to allow — or the
+    exact 'embeds add' line when it is not one WASP knows.
+
+  WHEN TO USE IT
+    After a site is imported, or after 'embeds mode report' and a browse of
+    its pages. Also when a client says "part of the page is missing".
+
+  WHAT IT ASKS YOU
+    Nothing. Covers the last 7 days; from the console, another window:
+      doas wp-hardening.sh embeds report 48      (hours)
+
+  EXAMPLE
+    "frame  https://www.google.com  14 times on /contact-us/ /
+     -> doas wp-hardening.sh embeds allow google-maps".
+EOF
+    ;;
+  security.38) _card "38 — Accept a reviewed scan file" <<'EOF'
+  WHAT IT DOES
+    Records a file's checksum, who accepted it, when and why. While the
+    file is unchanged, scans show it as [ACCEPTED] with that note and do
+    not count it: no CRITICAL mail, no daily line. One changed byte and it
+    is reported again at full severity, saying it was accepted once.
+
+  WHEN TO USE IT
+    Only for a file you have REVIEWED and know to be legitimate — a vendor's
+    licence loader, an updater, a template a plugin really does keep in
+    uploads — that the scan reports on every run. Compare it with a copy from
+    the vendor first. Never to quiet a finding you have not looked at.
+
+  WHAT IT ASKS YOU
+    The file and why it is legitimate (both required). A file the last scan
+    called CRITICAL also needs --critical, from the console:
+      doas wp-malware-scan.sh accept <file> "why" --critical
+    Only this site's files; a scan of an import ignores the list.
+
+  EXAMPLE
+    "✔ Accepted wp-content/plugins/vendor/loader.php — by admin: encoded
+     licence loader, identical to the vendor's 2.4.1 zip".
+EOF
+    ;;
+  security.39) _card "39 — Files accepted from scans" <<'EOF'
+  WHAT IT DOES
+    Lists every accepted file with who accepted it, when and why, and
+    whether it is unchanged, CHANGED since (reported again by scans) or gone.
+
+  WHEN TO USE IT
+    Reviewing a site, or when a scan says "accepted once, CHANGED since".
+    A legitimate update to an accepted file: review it and accept it again,
+    which replaces the entry. To stop accepting one:
+      doas wp-malware-scan.sh revoke <file>
+
+  WHAT IT ASKS YOU
+    Nothing. Changes nothing.
+
+  EXAMPLE
+    "unchanged   wp-content/plugins/vendor/loader.php
+                 2026-11-21 by admin: encoded licence loader".
+EOF
+    ;;
   security.18) _card "18 — Report bans to a central LAPI" <<'EOF'
   WHAT IT DOES
     Points this VM's CrowdSec agent at a shared Local API on another host, so
@@ -1320,8 +1486,9 @@ EOF
     ;;
   diag.6) _card "6 — Mail: send a test" <<'EOF'
   WHAT IT DOES
-    Sends a real test message through the configured path and reports what
-    happened.
+    Sends a real test message through the operator relay (the path WASP's
+    alerts use) and reports what happened. The client's own server, if the
+    site has one, is tested with 15.
 
   WHEN TO USE IT
     After configuring SMTP, to prove it works.
@@ -1334,6 +1501,64 @@ EOF
     Use an address you can actually check. Then look in spam -- delivered but
     filtered is a different problem from not sent, and needs SPF and DKIM
     rather than more debugging here.
+EOF
+    ;;
+  diag.13) _card "13 — Client mail: status" <<'EOF'
+  WHAT IT DOES
+    Shows where the site's own mail goes: contact forms, password resets and
+    notifications. Either the operator relay (the default) or the client's
+    own Microsoft 365 or mail server. WASP's security alerts always use the
+    operator relay, whatever this says.
+
+  WHEN TO USE IT
+    When a client says form enquiries are not arriving, or a Microsoft 365
+    secret is about to expire.
+
+  WHAT IT ASKS YOU
+    Nothing. The secret and password are never shown.
+
+  EXAMPLE
+    Press 13. "Recent messages the client's server did not take" means the
+    client's path failed and those messages went through the relay instead.
+EOF
+    ;;
+  diag.14) _card "14 — Client mail: set up" <<'EOF'
+  WHAT IT DOES
+    Sends the site's mail through the client's own server, so enquiries come
+    from their mailbox and land as their own mail. Microsoft 365 goes through
+    Graph over HTTPS (no SMTP, no port 25); anything else through SMTP on 587
+    or 465 with a password or app password.
+
+  WHEN TO USE IT
+    Once per client, after their Microsoft 365 admin has registered the app
+    (README: Microsoft 365 for the site's mail), or they have made a Google
+    Workspace app password.
+
+  WHAT IT ASKS YOU
+    Microsoft 365: tenant ID, application ID, the secret's value and expiry,
+    and the mailbox that sends. SMTP: server, port, mailbox and password.
+
+  EXAMPLE
+    1, then contoso.onmicrosoft.com, the application ID, the secret, its
+    expiry date, forms@contoso.com. It adds the egress it needs by itself.
+EOF
+    ;;
+  diag.15) _card "15 — Client mail: send a test" <<'EOF'
+  WHAT IT DOES
+    Sends a real message through the client's server, the way a contact form
+    would. If the client's server refuses it, it says so and why; the message
+    still arrives, through the relay.
+
+  WHEN TO USE IT
+    Right after setting it up, and whenever the client changes their mailbox,
+    app or password.
+
+  WHAT IT ASKS YOU
+    The destination address: one at the client, so they see it arrive.
+
+  EXAMPLE
+    office@contoso.com. Then check the sending mailbox's Sent Items: a copy
+    there proves Microsoft 365 sent it.
 EOF
     ;;
   diag.8) _card "8 — Mail: diagnose" <<'EOF'
@@ -1973,6 +2198,8 @@ menu_health() {
     3) Full test report (send-able)  ${DIM}wasp-testreport.sh${R}
     4) Container / WordPress health  ${DIM}wp-health-check.sh${R}
     5) Database health               ${DIM}mariadb-health-check.sh${R}
+    6) HTTPS certificate (www too)   ${DIM}wp-hardening.sh tls${R}
+    7) Is the database ready yet?    ${DIM}mariadb-health-check.sh --wait${R}
     b) back
 EOF
     _sel health
@@ -1982,6 +2209,8 @@ EOF
       3) _have wasp-testreport.sh && run "Full test report" 0 wasp-testreport.sh || _missing wasp-testreport.sh ;;
       4) _have wp-health-check.sh && run "WordPress health" 0 wp-health-check.sh || _missing wp-health-check.sh ;;
       5) _have mariadb-health-check.sh && run "Database health" 0 mariadb-health-check.sh || _missing mariadb-health-check.sh ;;
+      6) _have wp-hardening.sh && run "HTTPS certificate, both names" 0 wp-hardening.sh tls || _missing wp-hardening.sh ;;
+      7) _have mariadb-health-check.sh && run "Waiting for the database (up to 120s)" 0 mariadb-health-check.sh --wait || _missing mariadb-health-check.sh ;;
       b|B) return ;;
     esac
   done
@@ -2002,6 +2231,7 @@ menu_backup() {
     4) ${RED}[!]${R} Prove offsite recovery      ${DIM}wasp-offsite-backup.sh remote-restore-drill${R}
     5) ${RED}[!]${R} Restore from backup          ${DIM}wasp-offsite-backup.sh restore${R}
     6) Self-test (local restore)     ${DIM}wasp-selftest.sh restore-test${R}
+   10) Offsite is the hypervisor's   ${DIM}wasp-offsite-backup.sh hypervisor "<where>"${R}
     b) back
 EOF
     _sel backup
@@ -2015,6 +2245,15 @@ EOF
       4) _have wasp-offsite-backup.sh && run "Remote restore drill" 1 wasp-offsite-backup.sh remote-restore-drill || _missing wasp-offsite-backup.sh ;;
       5) _have wasp-offsite-backup.sh && run "Restore from backup" 1 wasp-offsite-backup.sh restore || _missing wasp-offsite-backup.sh ;;
       6) _have wasp-selftest.sh && run "Self-test restore" 0 wasp-selftest.sh restore-test || _missing wasp-selftest.sh ;;
+      10) if _have wasp-offsite-backup.sh; then
+            run "Where offsite copies are made" 0 wasp-offsite-backup.sh hypervisor
+            echo ""
+            echo "  Only if the HYPERVISOR copies this VM off-host (Proxmox Backup"
+            echo "  Server, a vzdump job to other storage). Type 'off' to undo."
+            if ask "Where and how (e.g. PBS on the backup host, nightly)" _hv; then
+              run "Offsite copies are made at the hypervisor" 1 wasp-offsite-backup.sh hypervisor "$_hv"
+            fi
+          else _missing wasp-offsite-backup.sh; fi ;;
       b|B) return ;;
     esac
   done
@@ -2048,6 +2287,11 @@ menu_security() {
    32) Find spam links in the pages  ${DIM}wp-links.sh spam${R}
    33) Find broken links             ${DIM}wp-links.sh broken${R}
    34) Clean spam out of the pages   ${DIM}wp-links.sh clean${R}
+   35) Outside services embedded     ${DIM}wp-hardening.sh embeds status${R}
+   36) Allow maps/reCAPTCHA/fonts…   ${DIM}wp-hardening.sh embeds allow <service>${R}
+   37) What the header blocked       ${DIM}wp-hardening.sh embeds report${R}
+   38) Accept a reviewed scan file   ${DIM}wp-malware-scan.sh accept <file> "why"${R}
+   39) Files accepted from scans     ${DIM}wp-malware-scan.sh accepted${R}
     5) Plugin vulnerability scan     ${DIM}wp-plugins.sh vulns${R}
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
@@ -2108,6 +2352,27 @@ EOF
       32) _have wp-links.sh && run "Spam links in the content" 0 wp-links.sh spam || _missing wp-links.sh ;;
       33) _have wp-links.sh && run "Broken links" 0 wp-links.sh broken || _missing wp-links.sh ;;
       34) _have wp-links.sh && run "What spam could be cleaned (changes nothing)" 0 wp-links.sh clean || _missing wp-links.sh ;;
+      35) _have wp-hardening.sh && run "Outside services the site embeds" 0 wp-hardening.sh embeds status || _missing wp-hardening.sh ;;
+      36) if _have wp-hardening.sh; then
+            echo ""
+            echo "  Services: google-maps recaptcha google-fonts youtube"
+            echo "  Anything else: doas wp-hardening.sh embeds add frame-src <https://origin>"
+            if ask "Service (or several, space-separated)" _es; then
+              # shellcheck disable=SC2086
+              run "Allow outside services in the security header" 1 wp-hardening.sh embeds allow $_es
+            fi
+          else _missing wp-hardening.sh; fi ;;
+      37) _have wp-hardening.sh && run "What the security header blocked (last 7 days)" 0 wp-hardening.sh embeds report || _missing wp-hardening.sh ;;
+      38) if _have wp-malware-scan.sh; then
+            echo ""
+            echo "  Only a file you have reviewed — ideally compared with a copy from"
+            echo "  its vendor. While it is unchanged, scans show it as [ACCEPTED] and do"
+            echo "  not count it; any change and it is reported again."
+            if ask "File (full path, or relative to the site)" _af && ask "Why it is legitimate" _aw; then
+              run "Accept a reviewed file" 1 wp-malware-scan.sh accept "$_af" "$_aw"
+            fi
+          else _missing wp-malware-scan.sh; fi ;;
+      39) _have wp-malware-scan.sh && run "Files accepted from scans" 0 wp-malware-scan.sh accepted || _missing wp-malware-scan.sh ;;
       22) _have wp-vuln-cron.sh && run "Weekly security report (sent now)" 0 wp-vuln-cron.sh --digest || _missing wp-vuln-cron.sh ;;
       23) _have wasp-hive-report.sh && run "WASP Hive reporting" 0 wasp-hive-report.sh status || _missing wasp-hive-report.sh ;;
       24) if _have wasp-hive-report.sh; then
@@ -2429,6 +2694,9 @@ menu_diagnostics() {
    10) Security alerts: send a test  ${DIM}wasp-alerts.sh test${R}
    11) Security alerts: on / off     ${DIM}wasp-alerts.sh on|off <event>${R}
    12) Forensics: app passwords      ${DIM}wp-forensics.sh app-passwords${R}
+   13) Client mail: status           ${DIM}wp-mail.sh client${R}
+   14) Client mail: set up           ${DIM}wp-mail.sh client setup${R}
+   15) Client mail: send a test      ${DIM}wp-mail.sh client test <addr>${R}
     b) back
 EOF
     _sel diag
@@ -2444,6 +2712,9 @@ EOF
       9) _have wasp-alerts.sh && run "Security alerts" 0 wasp-alerts.sh status || _missing wasp-alerts.sh ;;
      10) _have wasp-alerts.sh && run "Security alert test" 0 wasp-alerts.sh test || _missing wasp-alerts.sh ;;
      12) _have wp-forensics.sh && run "Forensics: application passwords" 0 wp-forensics.sh app-passwords || _missing wp-forensics.sh ;;
+     13) _have wp-mail.sh && run "Client mail" 0 wp-mail.sh client status || _missing wp-mail.sh ;;
+     14) _have wp-mail.sh && run "Client mail setup" 1 wp-mail.sh client setup || _missing wp-mail.sh ;;
+     15) _have wp-mail.sh && { if ask "Send test to" _a; then run "Client mail test" 0 wp-mail.sh client test "$_a"; fi; } || _missing wp-mail.sh ;;
      11) if _have wasp-alerts.sh; then
            if ask "on or off" _st && ask "Event (or all)" _ev; then
              case "$_st" in

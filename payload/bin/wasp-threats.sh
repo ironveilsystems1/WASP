@@ -33,7 +33,7 @@ set -u
 # WASP's own mu-plugins. Anything else at the top of mu-plugins on a WASP VM
 # was put there by someone else. test/test-threats.sh checks this list against
 # payload/mu-plugins/ so the two cannot drift.
-WASP_MU="00-wpvm-login-slug.php 01-wpvm-smtp.php 02-wpvm-login-guard.php 03-wpvm-mfa-enforce.php 05-wasp-contact.php 06-wasp-username-privacy.php 07-wasp-alerts.php"
+WASP_MU="00-wpvm-login-slug.php 01-wpvm-smtp.php 02-wpvm-login-guard.php 03-wpvm-mfa-enforce.php 05-wasp-contact.php 06-wasp-username-privacy.php 07-wasp-alerts.php 08-wasp-csp-report.php"
 
 # Extensions that stop PHP running. Kept identical to inspect's listing check.
 RENAMED_RE='\.(php[0-9]?|phtml|phar)(\.(bak|bk|old|orig|save|sav|back|backup|copy|disabled?|off|suspected|quarantined?|infected|hacked|malware|txt|tmp)|~)$'

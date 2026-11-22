@@ -269,6 +269,8 @@ restore_test() {
     _i "  Force one now:  doas wp-db-backup.sh"
   fi
     fi
+  elif [ -r /etc/wp-install/offsite-hypervisor ]; then
+    _i "Off-VM copies are made at the hypervisor ($(sed -n 's/^note=//p' /etc/wp-install/offsite-hypervisor)): not visible from here; test a restore there"
   else
     _i "Off-VM backup not configured — this backup dies with the VM"
   fi

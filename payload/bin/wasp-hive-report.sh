@@ -173,6 +173,7 @@ collect() {
   _boat=$(_num "$(cat "$ETC/offsite-last-ok" 2>/dev/null)")
   _boerr=false; [ -e "$ETC/offsite-last-error" ] && _boerr=true
   _bocfg=false; [ -r "$ETC/offsite.conf" ] && _bocfg=true
+  _bohv=false; [ -r "$ETC/offsite-hypervisor" ] && _bohv=true
 
   # Egress open temporarily.
   _tmp="[]"
@@ -199,7 +200,7 @@ collect() {
     --argjson csaln "$(_num "$_csaln")" --argjson cstop "${_cstop:-[]}" --arg csb "$_csb" \
     --argjson ase "$_ase" --argjson asl "$_asl" --arg asf "$_asf" --argjson asm "$_asm" \
     --argjson asr "$(_num "$_asr")" --argjson asb "$(_num "$_asb")" \
-    --argjson blat "$_blat" --argjson boat "$_boat" --argjson boerr "$_boerr" --argjson bocfg "$_bocfg" \
+    --argjson blat "$_blat" --argjson boat "$_boat" --argjson boerr "$_boerr" --argjson bocfg "$_bocfg" --argjson bohv "$_bohv" \
     --argjson tmp "${_tmp:-[]}" \
     --arg mfa "${MFA_ENFORCE:-0}" --arg mfag "${MFA_GRACE_DAYS:-7}" \
     --arg eproxy "${EGRESS_PROXY:-0}" --arg erestrict "${RESTRICT_EGRESS:-0}" \
@@ -221,7 +222,7 @@ collect() {
                  top_scenarios: $cstop, bouncer: $csb,
                  appsec: {enabled: $ase, listening: $asl, failure_action: $asf, mem_mb: $asm,
                           watchdog_restarts_24h: $asr, blocked_24h: $asb}},
-      backups:  {local_at: $blat, offsite_at: $boat, offsite_error: $boerr, offsite_configured: $bocfg},
+      backups:  {local_at: $blat, offsite_at: $boat, offsite_error: $boerr, offsite_configured: $bocfg, offsite_hypervisor: $bohv},
       egress:   {temporary: $tmp},
       controls: {mfa_enforce: ($mfa == "1"), mfa_grace_days: ($mfag | tonumber? // 7),
                  egress_proxy: ($eproxy == "1"), restrict_egress: ($erestrict == "1"),

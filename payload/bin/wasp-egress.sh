@@ -53,6 +53,7 @@ fi
 
 SQ="${WASP_SQUID_DIR:-/opt/squid}"      # WASP_SQUID_DIR, WASP_WP_HTML: wasp-upgrade.sh's tests
 WP_HTML_DIR="${WASP_WP_HTML:-/home/wpuser/wp/html}"
+CLIENT_MAIL="${WASP_CLIENT_MAIL:-/home/wpuser/wp/secrets/client-mail.ini}"   # wp-mail.sh client
 CONF="${SQ}/config"
 LOGS="${SQ}/logs"
 RUNTIME="${CONF}/allowlist-runtime.txt"
@@ -141,7 +142,8 @@ _valid_domain() {
 # that is not installed, nothing is ever removed, and anything an operator
 # removed with `deny` is never put back. WASP's own host tools (vulnerability
 # feeds, CrowdSec, GeoIP, apk) do not go through this proxy and need nothing
-# here.
+# here. The one exception is the client's own mail through Microsoft 365
+# (wp-mail.sh client), which is WordPress talking to Microsoft over HTTPS.
 REQUIRED=".wordpress.org .w.org"
 _required_why() {
   case "$1" in
@@ -181,6 +183,13 @@ _needed() {
       [ -n "$_v" ] && printf '%s (%s %s installed)\n' "$_v" "$_k" "$_n"
     done
   done | awk -F'|' '!seen[$1]++'
+  # The client's mail through Microsoft 365 (wp-mail.sh client setup): sign-in
+  # and Graph, over HTTPS through this proxy. Nothing for SMTP: that is a
+  # firewall pin (wp-hardening.sh smtp-repin), not a web request.
+  if [ -r "$CLIENT_MAIL" ] && grep -qiE '^[[:space:]]*transport[[:space:]]*=[[:space:]]*m365[[:space:]]*$' "$CLIENT_MAIL"; then
+    printf '%s|%s\n' login.microsoftonline.com "Microsoft 365 sign-in for the client's mail (wp-mail.sh client)"
+    printf '%s|%s\n' graph.microsoft.com "Microsoft Graph: sends the client's mail (wp-mail.sh client)"
+  fi
 }
 # The allowlist's entries, comments and blanks dropped.
 _entries() { grep -v '^[[:space:]]*#' "$RUNTIME" 2>/dev/null | tr -d ' \t\r' | grep -v '^$'; }

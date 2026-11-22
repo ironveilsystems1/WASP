@@ -152,7 +152,10 @@ if [ "$CHECK_MODE" = "1" ]; then
   # signal that survives a silent, ongoing failure is the AGE of the newest
   # remote copy, so that is what is checked. Nothing off-site for two days on a
   # daily schedule means the last two runs failed, whatever the reason.
-  if [ -r /etc/wp-install/offsite-last-ok ]; then
+  # Not when the operator recorded that the hypervisor makes the offsite
+  # copies and this VM sends none (10.28): the last push only gets older.
+  if [ -r /etc/wp-install/offsite-last-ok ] \
+     && [ "$(/usr/local/bin/wasp-offsite-backup.sh mode 2>/dev/null)" != hypervisor ]; then
     _oo=$(cat /etc/wp-install/offsite-last-ok 2>/dev/null)
     _oa=$(( ( $(date +%s) - ${_oo:-0} ) / 86400 ))
     if [ "$_oa" -ge 2 ]; then
@@ -901,6 +904,22 @@ if [ "${GEOIP_ENABLED:-0}" = "1" ]; then
          "/usr/local/bin/wp-geoip-setup.sh ; tail -40 /var/log/wp-geoip.log"
   fi
 fi
+
+# ── Security header exceptions (wp-hardening.sh embeds, 10.28) ─────────────
+if [ -f /etc/wp-install/embeds ] && [ -x /usr/local/bin/wp-hardening.sh ]; then
+  _emb_rc=0
+  _emb_out=$(/usr/local/bin/wp-hardening.sh embeds check 2>/dev/null) || _emb_rc=$?
+  case "$_emb_rc" in
+    0) pass "Security header matches its settings (${_emb_out})" ;;
+    2) warn "Security header is in REPORT-ONLY mode: nothing is blocked" "${_emb_out}" \
+            "wp-hardening.sh embeds report ; then wp-hardening.sh embeds mode enforce" ;;
+    1) warn "The live security header differs from its settings" "${_emb_out}" \
+            "wp-hardening.sh embeds status ; wp-hardening.sh embeds apply" ;;
+    *) info "Security header not checked: ${_emb_out:-the site did not answer}" ;;
+  esac
+elif grep -qE 'www\.gstatic\.com|maps\.google\.com|fonts\.googleapis\.com' /home/wpuser/wp/apache-conf/wp-security.conf 2>/dev/null; then
+  info "The security header was edited by hand to allow Google embeds; record it as a setting: wp-hardening.sh embeds status"
+fi
 fi
 
 # ── UPDATES ────────────────────────────────────────────────────────────────
@@ -1236,6 +1255,60 @@ else
        "Password resets, new-user notices and WooCommerce receipts fail SILENTLY: the UI reports success and nothing is logged." \
        "wp-mail.sh setup"
 fi
+
+  # ── The client's own server for the site's mail (10.27) ──────────────────
+  # Optional. When it is set, a failure is not lost mail (the relay takes the
+  # message instead) but it is mail arriving from the wrong sender, which a
+  # client's filter may quarantine, so it is worth knowing early.
+  _cmf=/home/wpuser/wp/secrets/client-mail.ini
+  if [ -r "$_cmf" ]; then
+    _cm_t=$(sed -n 's/^[[:space:]]*transport[[:space:]]*=[[:space:]]*//p' "$_cmf" | head -1 | tr -d ' \r')
+    _cm_t="${_cm_t:-smtp}"
+    _cm_p=$(stat -c '%a %u %g' "$_cmf" 2>/dev/null)
+    case "$_cm_p" in
+      "440 0 33") pass "Client mail settings ($_cm_t) are 0440 root:www-data" ;;
+      *) fail "Client mail settings are '${_cm_p}', expected '440 0 33'" \
+              "They hold the client's Microsoft 365 secret or mailbox password." \
+              "chown 0:33 ${_cmf} && chmod 0440 ${_cmf}" ;;
+    esac
+    if [ "$_cm_t" = m365 ]; then
+      _cm_x=$(sed -n 's/^[[:space:]]*secret_expires[[:space:]]*=[[:space:]]*//p' "$_cmf" | head -1 | tr -d ' \r')
+      _cm_soon=$(date -u -d "@$(( $(date +%s) + 30*86400 ))" +%Y-%m-%d 2>/dev/null)
+      if [ -z "$_cm_x" ]; then
+        info "Client mail: the Microsoft 365 secret's expiry is not recorded (wp-mail.sh client setup records it)"
+      elif [ ! "$_cm_x" \> "$(date -u +%Y-%m-%d)" ]; then
+        fail "Client mail: the Microsoft 365 secret expired on ${_cm_x}" \
+             "The site's mail is going through the operator relay, from the relay's address." \
+             "Ask the client's admin for a new secret, then: wp-mail.sh client setup"
+      elif [ -n "$_cm_soon" ] && [ "$_cm_x" \< "$_cm_soon" ]; then
+        warn "Client mail: the Microsoft 365 secret expires on ${_cm_x}" \
+             "After that the site's mail goes through the operator relay." \
+             "Ask the client's admin for a new secret, then: wp-mail.sh client setup"
+      else
+        pass "Client mail: the Microsoft 365 secret is valid until ${_cm_x}"
+      fi
+      _cm_al=/opt/squid/config/allowlist-runtime.txt
+      if [ -r "$_cm_al" ]; then
+        _cm_miss=""
+        for _cm_h in login.microsoftonline.com graph.microsoft.com; do
+          grep -v '^[[:space:]]*#' "$_cm_al" | tr -d ' \t\r' | grep -qxF -e "$_cm_h" -e ".${_cm_h#*.}" || _cm_miss="${_cm_miss} ${_cm_h}"
+        done
+        if [ -z "$_cm_miss" ]; then
+          pass "Client mail: Microsoft sign-in and Graph are on the egress allowlist"
+        else
+          fail "Client mail: not on the egress allowlist:${_cm_miss}" \
+               "WordPress cannot reach Microsoft, so the site's mail goes through the operator relay." \
+               "wasp-egress.sh reconcile"
+        fi
+      fi
+    fi
+    _cm_fb=$(grep -h 'wpvm-smtp\] client mail failed' /home/wpuser/wp/logs/*.log 2>/dev/null | tail -1)
+    if [ -n "$_cm_fb" ]; then
+      warn "Client mail: a recent message went through the operator relay instead" \
+           "$(printf '%s' "$_cm_fb" | sed 's/.*client mail failed (//; s/); sent through.*//' | cut -c1-160)" \
+           "wp-mail.sh client status ; wp-mail.sh client test <address>"
+    fi
+  fi
 
 fi
 

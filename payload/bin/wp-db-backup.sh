@@ -148,7 +148,15 @@ logger -t wp-db-backup "OK — ${BACKUP_FILE} ($(du -sh "${BACKUP_FILE}" | cut -
 # rotation has run: a copy of a backup that failed verification is not worth
 # sending, and a push failure must not prevent a good local backup from being
 # kept. A failure here is reported and does not fail the local backup.
-if [ -x /usr/local/bin/wasp-offsite-backup.sh ]; then
+_OFFMODE=""
+[ -x /usr/local/bin/wasp-offsite-backup.sh ] && _OFFMODE=$(/usr/local/bin/wasp-offsite-backup.sh mode 2>/dev/null)
+if [ "$_OFFMODE" = hypervisor ]; then
+  # 10.28: the operator recorded that this VM is copied off-host by the
+  # hypervisor (wasp-offsite-backup.sh hypervisor). Nothing to send, and not a
+  # failure: this was "Off-VM backup copy FAILED", mailed after every backup.
+  logger -t wp-db-backup "off-VM copies are made at the hypervisor; nothing sent from this VM"
+  rm -f /etc/wp-install/offsite-last-error 2>/dev/null || true
+elif [ -x /usr/local/bin/wasp-offsite-backup.sh ]; then
   # NOTE the path. This block used to write to "$_OFFLOG" and then read from a
   # hardcoded /tmp/.offsite.log -- two different files. So on a real VM the
   # push failed, the error was captured, and the line meant to report it read

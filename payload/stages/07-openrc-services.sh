@@ -72,6 +72,16 @@ start() {
   # 60s cap, then start anyway: if MariaDB is genuinely broken, a WordPress
   # container that is up and erroring is more diagnosable than one that never
   # started, and the health checks will report the real problem.
+  #
+  # 10.28: ready means WordPress could connect -- its own user, its database,
+  # InnoDB answering -- not that root's ping answers, which it does first.
+  # mariadb-health-check.sh --wait checks exactly that, for up to 120s. The
+  # ping loop below is kept for a VM whose tool predates it, and passes at
+  # once when the wait above has.
+  if [ -x /usr/local/bin/mariadb-health-check.sh ] && grep -q -- '--wait' /usr/local/bin/mariadb-health-check.sh 2>/dev/null; then
+    /usr/local/bin/mariadb-health-check.sh --wait "\${WASP_DB_WAIT:-120}" >/dev/null 2>&1 \
+      || einfo "MariaDB not ready for WordPress after \${WASP_DB_WAIT:-120}s — starting anyway; check: mariadb-health-check.sh"
+  fi
   _wait=0
   while [ \$_wait -lt 60 ]; do
     if podman exec mariadb sh -c \

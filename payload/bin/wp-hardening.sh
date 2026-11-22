@@ -21,7 +21,9 @@ PRUN() {
 }
 
 HTACCESS="/home/wpuser/wp/htaccess/.htaccess"
-APACHE_CONF="/home/wpuser/wp/apache-conf/wp-security.conf"
+APACHE_CONF="${WASP_APACHE_CONF:-/home/wpuser/wp/apache-conf/wp-security.conf}"
+EMBEDS_STATE="${WASP_EMBEDS_STATE:-/etc/wp-install/embeds}"   # wp-hardening.sh embeds
+WP_LOG_DIR="${WP_LOG_DIR:-/home/wpuser/wp/logs}"
 TRIVY_CACHE_DIR="/var/cache/trivy"
 # FORENSIC FIX (new-audit High finding, confirmed accurate): "enable
 # uploads-php" (i.e. open the PHP-execution block) had no automatic
@@ -104,6 +106,8 @@ show_status() {
   echo "          web-list | web-allow <ip> | web-deny <ip>"
   echo "          cti [ip|--status] | cti-key <key> [budget] | cti-watch"
   echo "          lynis [run] | disk | disk-check | tls [domain]"
+  echo "          embeds [status|allow <what>|deny <what>|add <directive> <origin>|"
+  echo "                  remove <directive> <origin>|mode report|enforce|report [hours]|apply]"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "          cs-doctor | cs-lapi <url> <login> <password>"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
@@ -223,20 +227,331 @@ B
   esac
 }
 
+# ── Security-header exceptions: embeds (10.28) ───────────────────────────────
+# WASP's Content-Security-Policy lets the browser load scripts, frames, styles
+# and fonts only from the site. Imported sites embed Google Maps, reCAPTCHA,
+# Google Fonts and YouTube; on two field VMs that meant a missing footer map
+# and a contact form failing "The Captcha field cannot be blank", fixed by
+# hand-editing wp-security.conf -- an edit nothing knew about, and one the
+# container did not even apply until it was restarted. This makes it a setting:
+# recorded in /etc/wp-install/embeds, written into the two header lines, the
+# container restarted, and the live header read back.
+EMBED_SERVICES="google-maps recaptcha google-fonts youtube"
+_emb_sources() {  # service -> "directive origin" lines
+  case "$1" in
+    google-maps)  printf '%s\n' "frame-src https://www.google.com" "frame-src https://maps.google.com" ;;
+    recaptcha)    printf '%s\n' "script-src https://www.google.com" "script-src https://www.gstatic.com" "frame-src https://www.google.com" ;;
+    google-fonts) printf '%s\n' "style-src https://fonts.googleapis.com" "font-src https://fonts.gstatic.com" ;;
+    youtube)      printf '%s\n' "frame-src https://www.youtube.com" "frame-src https://www.youtube-nocookie.com" ;;
+    *) return 1 ;;
+  esac
+}
+_emb_why() {
+  case "$1" in
+    google-maps)  echo "a Google map in a page or footer" ;;
+    recaptcha)    echo "a form's reCAPTCHA box (and the server's check, through egress)" ;;
+    google-fonts) echo "fonts loaded from Google (Elementor and many themes)" ;;
+    youtube)      echo "embedded YouTube videos" ;;
+  esac
+}
+# Directives a custom origin may be added to. img-src already allows any
+# https image; form-action does not fall back to default-src, so setting it
+# would restrict every other form.
+_emb_dir_ok() { case "$1" in script-src|style-src|font-src|frame-src|connect-src|media-src) return 0 ;; esac; return 1; }
+_emb_origin_ok() { printf '%s' "$1" | grep -qE '^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?$'; }
+
+# A VM whose header was edited by hand before 10.28: what it already allows.
+_emb_detect() {
+  _l=$(grep -m1 -E '^[[:space:]]*Header[[:space:]]+always[[:space:]]+set[[:space:]]+Content-Security-Policy' "$APACHE_CONF" 2>/dev/null)
+  case "$_l" in *maps.google.com*) echo "allow google-maps" ;; esac
+  case "$_l" in *www.gstatic.com*) echo "allow recaptcha" ;; esac
+  case "$_l" in *fonts.googleapis.com*) echo "allow google-fonts" ;; esac
+  case "$_l" in *youtube.com*) echo "allow youtube" ;; esac
+}
+# The settings, created on first use from what the header already allows, so
+# a hand-made exception is kept rather than silently dropped.
+_emb_state() {
+  if [ ! -f "$EMBEDS_STATE" ]; then
+    mkdir -p "$(dirname "$EMBEDS_STATE")"
+    { echo "# wp-hardening.sh embeds: what the security header allows beyond the site."
+      echo "mode=enforce"
+      _emb_detect; } > "$EMBEDS_STATE"
+    chmod 0644 "$EMBEDS_STATE"
+  fi
+}
+_emb_mode() { _m=$(sed -n 's/^mode=//p' "$EMBEDS_STATE" 2>/dev/null | tail -1); printf '%s' "${_m:-enforce}"; }
+_emb_allowed() { sed -n 's/^allow //p' "$EMBEDS_STATE" 2>/dev/null; }
+_emb_customs() { sed -n 's/^custom //p' "$EMBEDS_STATE" 2>/dev/null; }
+# Every "directive origin" pair the settings grant.
+_emb_pairs() {
+  { for _s in $(_emb_allowed); do _emb_sources "$_s"; done; _emb_customs; } | awk 'NF==2 && !seen[$0]++'
+}
+_emb_list() {  # directive -> " origin origin"
+  _emb_pairs | awk -v d="$1" '$1==d {printf " %s", $2}'
+}
+# The policy. Same as WASP has always sent, plus the granted origins; the
+# admin pages keep 'unsafe-eval' (the block editor needs it) and send no reports.
+_emb_policy() {  # public|admin
+  _ev=""; [ "$1" = admin ] && _ev=" 'unsafe-eval'"
+  _fr=$(_emb_list frame-src); _cn=$(_emb_list connect-src); _md=$(_emb_list media-src)
+  printf "default-src 'self'; script-src 'self' 'unsafe-inline'%s%s; style-src 'self' 'unsafe-inline'%s; img-src 'self' data: https:; font-src 'self' data:%s;" \
+    "$_ev" "$(_emb_list script-src)" "$(_emb_list style-src)" "$(_emb_list font-src)"
+  [ -n "$_fr" ] && printf " frame-src 'self'%s;" "$_fr"
+  [ -n "$_cn" ] && printf " connect-src 'self'%s;" "$_cn"
+  [ -n "$_md" ] && printf " media-src 'self'%s;" "$_md"
+  printf " frame-ancestors 'self'"
+  [ "$1" = public ] && printf "; report-uri /?wasp_csp_report=1"
+  return 0
+}
+# The header the container serves now, read from inside it.
+_emb_live() {
+  PRUN exec --user www-data wordpress php -r '
+    error_reporting(0);
+    $c = stream_context_create(["http" => ["method" => "HEAD", "timeout" => 8, "follow_location" => 0, "ignore_errors" => true]]);
+    @file_get_contents("http://127.0.0.1:80/", false, $c);
+    foreach ((array) $http_response_header as $h) {
+      if (stripos($h, "Content-Security-Policy") === 0) { echo $h, "\n"; }
+    }' 2>/dev/null
+}
+# Write both header lines from the settings, check Apache accepts them, restart
+# WordPress (a graceful reload did not apply a changed header on a field VM),
+# and read the header back.
+_emb_apply() {
+  [ -f "$APACHE_CONF" ] || { echo "✗  ${APACHE_CONF} not found." >&2; return 1; }
+  _pub=$(_emb_policy public); _adm=$(_emb_policy admin)
+  _hdr="Content-Security-Policy"; [ "$(_emb_mode)" = report ] && _hdr="Content-Security-Policy-Report-Only"
+  _new=$(mktemp); _rc=0
+  awk -v pub="$_pub" -v adm="$_adm" -v hdr="$_hdr" '
+    /<LocationMatch[^>]*wp-admin/ { inadm = 1 }
+    /<\/LocationMatch>/           { inadm = 0 }
+    /^[[:space:]]*Header[[:space:]]+always[[:space:]]+set[[:space:]]+Content-Security-Policy(-Report-Only)?[[:space:]]/ {
+      match($0, /^[[:space:]]*/); ind = substr($0, 1, RLENGTH)
+      if (inadm) { print ind "Header always set Content-Security-Policy \"" adm "\""; a++ }
+      else       { print ind "Header always set " hdr " \"" pub "\""; p++ }
+      next
+    }
+    { print }
+    END { if (p != 1 || a != 1) exit 3 }' "$APACHE_CONF" > "$_new" || _rc=$?
+  if [ "$_rc" != 0 ]; then
+    rm -f "$_new"
+    echo "✗  ${APACHE_CONF} does not have the two header lines WASP writes (one for the site, one" >&2
+    echo "   inside the wp-admin LocationMatch). Nothing was changed. Compare it with" >&2
+    echo "   payload/apache-conf/wp-security-fallback.conf before editing by hand." >&2
+    return 1
+  fi
+  if cmp -s "$_new" "$APACHE_CONF"; then
+    rm -f "$_new"; echo "  The header already matches these settings."
+  else
+    _bak="${APACHE_CONF}.bak-embeds-$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$APACHE_CONF" "$_bak"
+    # In place: the container is given this one file, and a replaced file
+    # leaves it reading the old copy.
+    cat "$_new" > "$APACHE_CONF"; rm -f "$_new"
+    if ! PRUN exec wordpress apache2ctl -t >/dev/null 2>&1; then
+      cat "$_bak" > "$APACHE_CONF"
+      echo "✗  Apache refused the new header; the previous file is back. Nothing else changed." >&2
+      return 1
+    fi
+    ls -1t "${APACHE_CONF}".bak-embeds-* 2>/dev/null | tail -n +6 | while IFS= read -r _o; do rm -f "$_o"; done  # subshell-ok: one line, no counter
+    echo "  ✔  Header written (previous copy: $(basename "$_bak"))"
+  fi
+  if [ "${_EMB_NO_RESTART:-0}" = 1 ]; then
+    echo "  Not restarted (--no-restart): the change applies at the next restart of WordPress."
+    return 0
+  fi
+  echo "  Restarting WordPress so Apache applies it (10–20 seconds)…"
+  PRUN restart wordpress >/dev/null 2>&1 || { echo "✗  podman restart wordpress failed." >&2; return 1; }
+  _live=""; _i=0
+  while [ "$_i" -lt 30 ]; do
+    _live=$(_emb_live); [ -n "$_live" ] && break
+    _i=$((_i + 1)); sleep 1
+  done
+  case "$_live" in
+    *"${_hdr}: ${_pub}"*) echo "  ✔  The site now serves it." ;;
+    "") echo "  ⚠  Could not read the header back: the site did not answer within 30 seconds." >&2; return 1 ;;
+    *) echo "  ⚠  The site serves a different header than the file holds:" >&2
+       printf '%s\n' "$_live" | sed 's/^/       /' >&2
+       echo "     Another file may set it too (an imported .htaccess):" >&2
+       echo "       doas podman exec wordpress grep -rln Content-Security-Policy /etc/apache2/ /var/www/html/.htaccess" >&2
+       return 1 ;;
+  esac
+}
+# What the browser reported blocking: the reports plugin's lines, grouped.
+_emb_report() {
+  _hrs="${1:-168}"
+  case "$_hrs" in ''|*[!0-9]*) echo "Usage: wp-hardening.sh embeds report [hours]" >&2; return 1 ;; esac
+  _since=$(date -u -d "@$(( $(date +%s) - _hrs * 3600 ))" +%s)
+  echo ""
+  echo "What browsers reported blocking, last ${_hrs} hours"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  _rows=$(for _lf in "$WP_LOG_DIR"/error.log*; do
+            [ -f "$_lf" ] || continue
+            [ "$(stat -c %Y "$_lf" 2>/dev/null || echo 0)" -ge "$_since" ] || continue
+            case "$_lf" in *.gz) gzip -dc "$_lf" 2>/dev/null ;; *) cat "$_lf" ;; esac
+          done | sed -n 's/.*\[wasp-csp\] \([a-z-]*\) blocked \([^ ]*\) on \([^ ]*\).*/\1 \2 \3/p')
+  if [ -z "$_rows" ]; then
+    echo "  Nothing reported. Either nothing was blocked, or no browser has visited since"
+    echo "  the header began asking for reports (10.28, or the last: embeds apply)."
+    return 0
+  fi
+  printf '%s\n' "$_rows" | awk '{k=$1" "$2; n[k]++; if (!(k in p)) p[k]=$3} END {for (k in n) printf "%7d  %s  (first seen on %s)\n", n[k], k, p[k]}' | sort -rn | head -30
+  echo ""
+  _sug=""
+  _pairs=$(mktemp)
+  printf '%s\n' "$_rows" | awk '{print $1" "$2}' | sort -u > "$_pairs"
+  while read -r _d _o; do
+    _hit=""
+    for _s in $EMBED_SERVICES; do
+      _emb_sources "$_s" | grep -qx "${_d} ${_o}" && { _hit="$_s"; break; }
+    done
+    if [ -n "$_hit" ]; then
+      case " $_sug " in *" $_hit "*) : ;; *) _sug="${_sug} ${_hit}" ;; esac
+    elif _emb_dir_ok "$_d" && _emb_origin_ok "$_o"; then
+      echo "  ${_o} (${_d}): not one WASP knows. If the site needs it:"
+      echo "      doas wp-hardening.sh embeds add ${_d} ${_o}"
+    fi
+  done < "$_pairs"
+  rm -f "$_pairs"
+  for _s in $_sug; do
+    if _emb_allowed | grep -qx "$_s"; then
+      echo "  ${_s}: already allowed (reports from before it was, or a page loads more than it covers)"
+    else
+      echo "  ${_s}: $(_emb_why "$_s").  doas wp-hardening.sh embeds allow ${_s}"
+    fi
+  done
+  echo "  inline/eval lines are the site's own scripts; nothing to allow."
+}
+_emb_status() {
+  echo ""
+  echo "Security header: what the browser may load beyond the site"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  case "$(_emb_mode)" in
+    report) echo "  Mode:     REPORT ONLY — nothing is blocked, everything is reported"
+            echo "            (enforce when the report is clean: embeds mode enforce)" ;;
+    *)      echo "  Mode:     enforce" ;;
+  esac
+  for _s in $EMBED_SERVICES; do
+    if _emb_allowed | grep -qx "$_s"; then printf "  %-13s allowed   — %s\n" "$_s" "$(_emb_why "$_s")"
+    else printf "  %-13s blocked\n" "$_s"; fi
+  done
+  _emb_customs | while read -r _d _o; do printf "  %-13s allowed   — %s (added by hand)\n" "$_o" "$_d"; done  # subshell-ok: one line, no counter
+  _want=$(_emb_policy public)
+  _live=$(_emb_live)
+  echo ""
+  case "$_live" in
+    *": ${_want}"*) echo "  The site serves exactly this. ✔" ;;
+    "") echo "  Could not read the live header (is WordPress running?)." ;;
+    *) echo "  ⚠  The site serves something else:"
+       printf '%s\n' "$_live" | sed 's/^/       /'
+       echo "     Apply the settings:  doas wp-hardening.sh embeds apply" ;;
+  esac
+  echo ""
+  echo "  What browsers reported blocking:  doas wp-hardening.sh embeds report"
+}
+_embeds() {
+  _emb_state
+  _EMB_NO_RESTART=0
+  _a=""; for _x in "$@"; do case "$_x" in --no-restart) _EMB_NO_RESTART=1 ;; *) _a="${_a} ${_x}" ;; esac; done
+  # shellcheck disable=SC2086
+  set -- $_a
+  case "${1:-status}" in
+    status) _emb_status ;;
+    allow|deny)
+      _act="$1"; shift
+      [ -n "${1:-}" ] || { echo "Usage: wp-hardening.sh embeds ${_act} <google-maps|recaptcha|google-fonts|youtube>..." >&2; return 1; }
+      for _s in "$@"; do
+        _emb_sources "$_s" >/dev/null || { echo "✗  Unknown: ${_s}. Known: ${EMBED_SERVICES}. Anything else: embeds add <directive> <https://host>" >&2; return 1; }
+      done
+      for _s in "$@"; do
+        _t=$(mktemp); grep -vx "allow ${_s}" "$EMBEDS_STATE" > "$_t" || true
+        [ "$_act" = allow ] && echo "allow ${_s}" >> "$_t"
+        cat "$_t" > "$EMBEDS_STATE"; rm -f "$_t"
+      done
+      _emb_apply || return 1
+      # reCAPTCHA is checked twice: in the browser, and by the form plugin on
+      # the server, which asks www.google.com through the egress proxy.
+      case " $* " in *" recaptcha "*)
+        if command -v wasp-egress.sh >/dev/null 2>&1 && [ -f /opt/squid/config/allowlist-runtime.txt ]; then
+          if [ "$_act" = allow ]; then
+            echo "  reCAPTCHA's server-side check needs www.google.com through the egress proxy:"
+            wasp-egress.sh allow www.google.com --permanent
+          else
+            echo "  www.google.com stays on the egress allowlist unless you remove it:"
+            echo "      doas wasp-egress.sh deny www.google.com"
+          fi
+        fi ;;
+      esac ;;
+    add|remove)
+      _act="$1"; _d="${2:-}"; _o="${3:-}"
+      _emb_dir_ok "$_d" || { echo "Usage: wp-hardening.sh embeds ${_act} <script-src|style-src|font-src|frame-src|connect-src|media-src> <https://host>" >&2; return 1; }
+      _emb_origin_ok "$_o" || { echo "✗  '${_o}' is not an https origin (https://host, no path)." >&2; return 1; }
+      _t=$(mktemp); grep -vx "custom ${_d} ${_o}" "$EMBEDS_STATE" > "$_t" || true
+      [ "$_act" = add ] && echo "custom ${_d} ${_o}" >> "$_t"
+      cat "$_t" > "$EMBEDS_STATE"; rm -f "$_t"
+      _emb_apply ;;
+    mode)
+      case "${2:-}" in report|enforce) : ;; *) echo "Usage: wp-hardening.sh embeds mode report|enforce" >&2; return 1 ;; esac
+      _t=$(mktemp); grep -v '^mode=' "$EMBEDS_STATE" > "$_t" || true
+      echo "mode=${2}" >> "$_t"; [ "$2" = report ] && echo "report_since=$(date -u +%Y-%m-%d)" >> "$_t"
+      [ "$2" = enforce ] && { grep -v '^report_since=' "$_t" > "${_t}.2"; mv "${_t}.2" "$_t"; }
+      cat "$_t" > "$EMBEDS_STATE"; rm -f "$_t"
+      _emb_apply ;;
+    report) _emb_report "${2:-}" ;;
+    apply)  _emb_apply ;;
+    # For validate-wordpress.sh: one line, and the exit code says it all.
+    # 0 live header matches the settings (enforced), 2 report-only mode,
+    # 1 it differs, 3 it could not be read.
+    check)
+      _al=$(_emb_allowed | tr '\n' ' '); _cu=$(_emb_customs | awk '{print $2}' | tr '\n' ' ')
+      _what=$(printf '%s%s' "$_al" "$_cu" | sed 's/ *$//'); _what="${_what:-nothing beyond the site}"
+      _live=$(_emb_live)
+      _hdr="Content-Security-Policy"; [ "$(_emb_mode)" = report ] && _hdr="Content-Security-Policy-Report-Only"
+      [ -n "$_live" ] || { echo "could not read the live header"; return 3; }
+      case "$_live" in *"${_hdr}: $(_emb_policy public)"*) : ;; *) echo "allows: ${_what}; the live header differs"; return 1 ;; esac
+      if [ "$(_emb_mode)" = report ]; then
+        echo "report-only since $(sed -n 's/^report_since=//p' "$EMBEDS_STATE" | tail -1); allows: ${_what}"; return 2
+      fi
+      echo "allows: ${_what}"; return 0 ;;
+    *) echo "Usage: wp-hardening.sh embeds [status|allow <what>|deny <what>|add <directive> <origin>|remove <directive> <origin>|mode report|enforce|report [hours]|apply] [--no-restart]" >&2; return 1 ;;
+  esac
+}
+
 case "${1:-status}" in
+  embeds) shift; _embeds "$@" ;;
+
   smtp-repin)
     # Re-resolve the relay and rewrite the SMTP destination rule. Needed when a
     # hosted relay changes IP, which silently breaks mail until re-run -- the
     # known cost of pinning the destination rather than allowing any host on
     # port 587.
-    _h=$(sed -n 's/^SMTP_HOST=//p' /etc/wp-install/vars.sh 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
-    [ -n "$_h" ] || { echo "No SMTP relay configured." >&2; exit 1; }
-    _ips=$(getent ahostsv4 "$_h" 2>/dev/null | awk '{print $1}' | sort -u | head -8 | tr '\n' ',' | sed 's/,$//')
-    [ -n "$_ips" ] || { echo "✗  Could not resolve ${_h}. Check DNS before re-pinning." >&2; exit 1; }
-    echo "  ${_h} now resolves to: ${_ips}"
-    if nft -c -f /etc/nftables.nft 2>/dev/null; then
-      sed -i "s|ip daddr { [0-9.,]* } tcp dport|ip daddr { ${_ips} } tcp dport|" /etc/nftables.nft
-      if nft -c -f /etc/nftables.nft 2>/dev/null && nft -f /etc/nftables.nft 2>/dev/null; then
+    #
+    # The client's own SMTP server (wp-mail.sh client, transport smtp) shares
+    # the rule: both servers' addresses go in the one set. Microsoft 365
+    # through Graph needs nothing here; it is HTTPS through the proxy.
+    _h=$(sed -n 's/^SMTP_HOST=//p' "${WASP_VARS:-/etc/wp-install/vars.sh}" 2>/dev/null | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | head -1)
+    _cm="${WASP_CLIENT_MAIL:-/home/wpuser/wp/secrets/client-mail.ini}"; _ch=""
+    if [ -r "$_cm" ]; then
+      _ct=$(sed -n 's/^[[:space:]]*transport[[:space:]]*=[[:space:]]*//p' "$_cm" | head -1 | tr -d ' \r')
+      if [ "${_ct:-smtp}" = smtp ]; then
+        _ch=$(sed -n 's/^[[:space:]]*host[[:space:]]*=[[:space:]]*//p' "$_cm" | head -1 | tr -d ' \r')
+        case "$_ch" in *[!A-Za-z0-9.-]*) echo "✗  client-mail.ini has an invalid host: ${_ch}" >&2; exit 1 ;; esac
+      fi
+    fi
+    [ -n "${_h}${_ch}" ] || { echo "No SMTP relay configured." >&2; exit 1; }
+    _ips=""
+    for _x in $_h $_ch; do
+      _r=$(getent ahostsv4 "$_x" 2>/dev/null | awk '{print $1}' | sort -u | head -8)
+      [ -n "$_r" ] || { echo "✗  Could not resolve ${_x}. Check DNS before re-pinning." >&2; exit 1; }
+      echo "  ${_x} now resolves to: $(printf '%s' "$_r" | tr '\n' ',' | sed 's/,$//')"
+      _ips="${_ips} ${_r}"
+    done
+    _ips=$(printf '%s\n' $_ips | sort -u | head -16 | tr '\n' ',' | sed 's/,$//')
+    _nf="${WASP_NFT_FILE:-/etc/nftables.nft}"
+    grep -q 'ip daddr { [0-9.,]* } tcp dport' "$_nf" 2>/dev/null \
+      || { echo "✗  ${_nf} has no SMTP destination rule to re-pin (built without a relay?)." >&2; exit 1; }
+    if nft -c -f "$_nf" 2>/dev/null; then
+      sed -i "s|ip daddr { [0-9.,]* } tcp dport|ip daddr { ${_ips} } tcp dport|" "$_nf"
+      if nft -c -f "$_nf" 2>/dev/null && nft -f "$_nf" 2>/dev/null; then
         echo "  ✔  SMTP destination re-pinned and the ruleset reloaded."
         echo "     Verify:  doas wp-mail.sh doctor"
       else
@@ -1084,64 +1399,165 @@ SNIPPET2
     #
     # Worth having because a broken renewal is otherwise invisible until a
     # visitor's browser warns them, and by then it has been broken for days.
+    #
+    # 10.28, three gaps closed:
+    #   - Only the bare domain was checked. A certificate that does not cover
+    #     www, or a www host on the proxy with its own lapsed certificate,
+    #     failed for everyone who typed www and nothing here noticed. Both
+    #     names are checked now; a www with no DNS record is skipped, said.
+    #   - Only the expiry date was read. A certificate served without its
+    #     intermediate, or for the wrong name, is refused by browsers
+    #     however far its expiry is. The chain and the name are verified.
+    #   - A site that could not be reached exited 1 with no alert, on the
+    #     one path whose job is alerting. It is retried once and then mailed.
+    #   And it asks DNS, not /etc/hosts: the loopback entry WASP writes so
+    #   WP-Cron keeps working (LOOPBACK_HOSTS) pointed this check at the VM
+    #   itself, which has no certificate, so it failed silently every day.
     . /etc/wp-install/vars.sh 2>/dev/null || true
-    _d="${2:-${WP_DOMAIN:-}}"
-    [ -n "$_d" ] || { echo "Usage: wp-hardening.sh tls <domain>" >&2; exit 1; }
     command -v openssl >/dev/null 2>&1 || { echo "✗ openssl not installed: apk add openssl" >&2; exit 1; }
-
-    _end=$(echo | openssl s_client -servername "$_d" -connect "${_d}:443" 2>/dev/null \
-           | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
-    if [ -z "$_end" ]; then
-      _quiet="${3:-}"
-      [ "$_quiet" = "--quiet" ] || {
-        echo ""
-        echo "✗ Could not retrieve a certificate for ${_d}."
-        echo "  Either the name does not resolve, the proxy is not answering on"
-        echo "  443, or egress to that host is blocked from this VM."
-        echo "    wp-hardening.sh egress-list"
-      }
-      exit 1
+    if [ -n "${2:-}" ]; then
+      _names="$2"
+    elif [ -n "${TLS_CHECK_NAMES:-}" ]; then
+      _names="$TLS_CHECK_NAMES"
+    elif [ -n "${WP_DOMAIN:-}" ]; then
+      _bare="${WP_DOMAIN#www.}"
+      _names="$WP_DOMAIN"
+      [ "$WP_DOMAIN" = "$_bare" ] && _names="$_names www.${_bare}" || _names="$_names ${_bare}"
+    else
+      echo "Usage: wp-hardening.sh tls [domain]" >&2; exit 1
     fi
-    _es=$(date -u -d "$_end" +%s 2>/dev/null) || _es=""
-    _days=$(( ( ${_es:-0} - $(date -u +%s) ) / 86400 ))
-    _iss=$(echo | openssl s_client -servername "$_d" -connect "${_d}:443" 2>/dev/null \
-           | openssl x509 -noout -issuer 2>/dev/null | sed 's/.*CN *= *//')
+    _primary=${_names%% *}
+
+    # The public address of a name, from DNS. TLS_CHECK_ADDR in vars.sh sends
+    # every check to one address instead (the proxy's inside address, where the
+    # VLAN cannot reach the public one).
+    _tls_addr() {
+      [ -n "${TLS_CHECK_ADDR:-}" ] && { echo "$TLS_CHECK_ADDR"; return 0; }
+      if command -v nslookup >/dev/null 2>&1; then
+        _ra=$(_tls_t 10 nslookup "$1" 2>/dev/null | awk '
+          /^Name:/ { n = 1; next }
+          n && /^Address/ { sub(/^Address[^:]*:[ \t]*/, ""); if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print; exit } }')
+        [ -n "$_ra" ] && { echo "$_ra"; return 0; }
+        return 1
+      fi
+      # No resolver tool: let openssl resolve, unless the hosts file points
+      # the name at this VM.
+      awk -v n="$1" '$1 ~ /^(127\.|::1$)/ { for (i = 2; i <= NF; i++) if ($i == n) f = 1 } END { exit !f }' \
+        "${TLS_HOSTS_FILE:-/etc/hosts}" 2>/dev/null && return 1
+      echo "$1"
+    }
+    _tls_t() { _tt="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$_tt" "$@"; else "$@"; fi; }
+
+    # One name -> _T_STATE: ok | soon | expired | untrusted | unreachable | unresolved
+    _tls_probe() {
+      _T_STATE=""; _T_END=""; _T_DAYS=""; _T_ISS=""; _T_WHY=""; _T_ADDR=""
+      _T_ADDR=$(_tls_addr "$1") || { _T_STATE=unresolved; return 0; }
+      _out=$(echo | _tls_t 20 openssl s_client -servername "$1" -connect "${_T_ADDR}:${TLS_CHECK_PORT:-443}" \
+               -verify_hostname "$1" ${TLS_CHECK_CAFILE:+-CAfile "$TLS_CHECK_CAFILE"} 2>&1) || true
+      if ! printf '%s\n' "$_out" | grep -q 'BEGIN CERTIFICATE'; then
+        _T_STATE=unreachable
+        _T_WHY=$(printf '%s\n' "$_out" | grep -iE 'refused|timed out|unreachable|no route|errno|alert|handshake' | head -1 | cut -c1-120)
+        return 0
+      fi
+      _T_END=$(printf '%s\n' "$_out" | openssl x509 -noout -enddate -dateopt iso_8601 2>/dev/null | sed 's/notAfter=//')
+      [ -n "$_T_END" ] || _T_END=$(printf '%s\n' "$_out" | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+      _T_ISS=$(printf '%s\n' "$_out" | openssl x509 -noout -issuer 2>/dev/null | sed 's/.*CN *= *//')
+      _es=$(date -u -d "$(printf '%s' "$_T_END" | sed 's/Z$//')" +%s 2>/dev/null) || _es=0
+      _T_DAYS=$(( ( _es - $(date -u +%s) ) / 86400 ))
+      _vr=$(printf '%s\n' "$_out" | sed -n 's/^ *Verify return code: \([0-9]*\) (\(.*\))/\1|\2/p' | tail -1)
+      if [ "$_es" -gt 0 ] && [ "$_es" -le "$(date -u +%s)" ]; then
+        _T_STATE=expired
+      elif [ -n "$_vr" ] && [ "${_vr%%|*}" != 0 ]; then
+        _T_STATE=untrusted; _T_WHY="${_vr#*|}"
+        case "${_vr%%|*}" in
+          20|21|2) _T_WHY="${_T_WHY} -- the proxy is not sending the intermediate certificate (incomplete chain)" ;;
+          62)      _T_WHY="${_T_WHY} -- the certificate does not cover ${1}" ;;
+          18|19)   _T_WHY="${_T_WHY} -- self-signed, not from a public authority" ;;
+        esac
+      elif [ "$_es" = 0 ]; then
+        _T_STATE=untrusted; _T_WHY="could not read the certificate's expiry"
+      elif [ "$_T_DAYS" -le 14 ]; then
+        _T_STATE=soon
+      else
+        _T_STATE=ok
+      fi
+      return 0
+    }
+    _tls_line() {  # name -> one line saying what was found
+      case "$_T_STATE" in
+        ok)          printf '✔ %s day(s) left, chain and name verified (%s)' "$_T_DAYS" "${_T_ISS:-unknown issuer}" ;;
+        soon)        printf '⚠ %s day(s) left -- automatic renewal (at 30) has not happened' "$_T_DAYS" ;;
+        expired)     printf '✗ EXPIRED (%s)' "$_T_END" ;;
+        untrusted)   printf '✗ browsers will refuse it: %s' "$_T_WHY" ;;
+        unreachable) printf '✗ could not connect to %s:%s%s' "$_T_ADDR" "${TLS_CHECK_PORT:-443}" "${_T_WHY:+ ($_T_WHY)}" ;;
+        unresolved)  printf '%s' '- no DNS record from this VM; not checked' ;;
+      esac
+    }
 
     if [ "${1}" = "tls-check" ]; then
-      # Cron path: silent unless it actually matters. Let's Encrypt renews at
-      # 30 days, so warning at 30 would fire on every healthy certificate.
-      [ "$_days" -le 14 ] || exit 0
-      logger -t wasp-tls "certificate for ${_d} expires in ${_days} day(s)"
-      [ -x /usr/local/bin/wp-notify.sh ] || exit 0
-      _b=$(mktemp)
+      # Cron path: silent unless it matters. Let's Encrypt renews at 30 days,
+      # so warning at 30 would fire on every healthy certificate.
+      _b=$(mktemp); _bad=0; _subj=""
+      for _n in $_names; do
+        _tls_probe "$_n"
+        if [ "$_T_STATE" = unreachable ]; then
+          sleep "${TLS_RETRY_WAIT:-30}"; _tls_probe "$_n"
+        fi
+        case "$_T_STATE" in
+          ok) continue ;;
+          unresolved) [ "$_n" = "$_primary" ] || continue ;;
+        esac
+        _bad=$((_bad + 1))
+        logger -t wasp-tls "${_n}: $(_tls_line)" 2>/dev/null || true
+        printf '  %s\n    %s\n' "$_n" "$(_tls_line)" >> "$_b"
+        [ -n "$_T_END" ] && printf '    expires %s, issuer %s\n' "$_T_END" "${_T_ISS:-unknown}" >> "$_b"
+        [ -n "$_subj" ] || case "$_T_STATE" in
+          soon)        _subj="TLS certificate for ${_n} expires in ${_T_DAYS} days" ;;
+          expired)     _subj="TLS certificate for ${_n} has EXPIRED" ;;
+          untrusted)   _subj="TLS certificate for ${_n} is refused by browsers" ;;
+          *)           _subj="${_n} could not be reached over HTTPS from $(hostname)" ;;
+        esac
+      done
+      if [ "$_bad" = 0 ] || [ ! -x /usr/local/bin/wp-notify.sh ]; then rm -f "$_b"; exit 0; fi
+      _m=$(mktemp)
       {
-        printf 'The TLS certificate for %s expires in %s day(s).\n\n' "$_d" "$_days"
-        printf '  Expires : %s\n  Issuer  : %s\n\n' "$_end" "${_iss:-unknown}"
-        printf 'Renewal happens at the reverse proxy, not on this VM. Automatic\n'
-        printf 'renewal has had time to run and has not — check the proxy.\n\n'
-        printf 'A common cause is an ACME HTTP-01 challenge blocked by a\n'
-        printf 'rule denying dotfile paths: /.well-known/ begins with a dot.\n'
-        printf 'Confirm it is reachable:\n'
-        printf '  curl -sI https://%s/.well-known/acme-challenge/test\n' "$_d"
-      } > "$_b"
-      NOTIFY_COOLDOWN_HOURS=72 /usr/local/bin/wp-notify.sh wasp-tls \
-        "TLS certificate for ${_d} expires in ${_days} days" "$_b"
-      rm -f "$_b"
+        printf 'HTTPS for this site needs attention.\n\n'
+        cat "$_b"
+        printf '\nCertificates are renewed and served by the reverse proxy, not by\n'
+        printf 'this VM. "Expires soon": automatic renewal has had time to run and\n'
+        printf 'has not -- a common cause is an ACME HTTP-01 challenge blocked by a\n'
+        printf 'rule denying dotfile paths (/.well-known/ begins with a dot):\n'
+        printf '  curl -sI https://%s/.well-known/acme-challenge/test\n' "$_primary"
+        printf '"Refused by browsers": the proxy host for that name needs the full\n'
+        printf 'chain, or a certificate that covers the name.\n'
+        printf '"Could not connect": tried twice, 30s apart. It may be this VM'"'"'s\n'
+        printf 'own path out rather than the site -- check from a browser first.\n\n'
+        printf 'Re-check:  doas wp-hardening.sh tls\n'
+      } > "$_m"
+      NOTIFY_COOLDOWN_HOURS=72 /usr/local/bin/wp-notify.sh wasp-tls "$_subj" "$_m"
+      rm -f "$_b" "$_m"
       exit 0
     fi
 
     echo ""
-    echo "TLS — ${_d}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf '  Expires : %s\n' "$_end"
-    printf '  Issuer  : %s\n' "${_iss:-unknown}"
-    if   [ "$_days" -lt 0 ]  ; then echo "  ✗ EXPIRED ${_days#-} day(s) ago."; exit 2
-    elif [ "$_days" -le 7 ]  ; then echo "  ✗ ${_days} day(s) left — renewal has failed."; exit 2
-    elif [ "$_days" -le 14 ] ; then echo "  ⚠ ${_days} day(s) left. Let's Encrypt renews at 30, so this is late."; exit 1
-    else                            echo "  ✔ ${_days} day(s) remaining."
-    fi
+    echo "TLS — $(echo $_names)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    _rc=0
+    for _n in $_names; do
+      _tls_probe "$_n"
+      printf '  %s\n    %s\n' "$_n" "$(_tls_line)"
+      [ -n "$_T_END" ] && printf '    expires %s   via %s\n' "$_T_END" "$_T_ADDR"
+      case "$_T_STATE" in
+        ok) : ;;
+        soon) [ "$_T_DAYS" -le 7 ] && _rc=2 || { [ "$_rc" -ge 1 ] || _rc=1; } ;;
+        unresolved) [ "$_n" = "$_primary" ] && _rc=2 ;;
+        *) _rc=2 ;;
+      esac
+    done
     echo ""
-    echo "  Renewal is the proxy's job — this VM only observes the result." ;;
+    echo "  Renewal is the proxy's job — this VM only observes the result."
+    [ "$_rc" = 0 ] || echo "  The daily check (09:00) mails this; at most once in 72 hours."
+    exit "$_rc" ;;
 
   disk)
     # Disk exhaustion is the classic "site stopped working overnight for no

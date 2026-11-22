@@ -407,6 +407,11 @@ install -m 0644 "${PAYLOAD_DIR}/mu-plugins/06-wasp-username-privacy.php" \
 install -m 0644 "${PAYLOAD_DIR}/mu-plugins/07-wasp-alerts.php" \
   "${SMTP_MU_DIR}/07-wasp-alerts.php" 2>/dev/null || true
 chown 33:33 "${SMTP_MU_DIR}/07-wasp-alerts.php" 2>/dev/null || true
+# Security-header reports (10.28): logs which outside host the browser
+# blocked, so `wp-hardening.sh embeds report` says what a site needs.
+install -m 0644 "${PAYLOAD_DIR}/mu-plugins/08-wasp-csp-report.php" \
+  "${SMTP_MU_DIR}/08-wasp-csp-report.php" 2>/dev/null || true
+chown 33:33 "${SMTP_MU_DIR}/08-wasp-csp-report.php" 2>/dev/null || true
 chown 33:33 "${SMTP_MU_DIR}/06-wasp-username-privacy.php" 2>/dev/null || true
 chown 33:33 "${SMTP_MU_DIR}/05-wasp-contact.php" 2>/dev/null || true
 # Login rate-limiting. Unconditional and in the same block as the SMTP

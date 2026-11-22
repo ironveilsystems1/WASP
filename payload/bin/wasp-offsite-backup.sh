@@ -8,6 +8,8 @@
 #   wasp-offsite-backup.sh test          prove the destination works, end to end
 #   wasp-offsite-backup.sh prune         apply remote retention
 #   wasp-offsite-backup.sh status        configuration summary
+#   wasp-offsite-backup.sh hypervisor "<where>"   offsite copies are made by
+#                                        the hypervisor, not this VM (| off)
 #
 # WHY THIS EXISTS
 #
@@ -75,6 +77,13 @@ fi
 # now DETECTED and reported rather than silently ignored -- and
 # `set-destination` exists so nobody has to hand-edit either file.
 CONF=/etc/wp-install/offsite.conf
+# 10.28: a fleet whose VMs are backed up off-host by the hypervisor (Proxmox
+# Backup Server, a vzdump job to other storage) has its offsite copies. This
+# VM pushing nothing was reported as a FAILED off-VM copy after every backup,
+# mailed with no cooldown, until the mail was filtered. Recording it here --
+# where, set by whom, when -- stops that, and every report says so instead.
+# It is a statement by the operator: nothing on the VM can see the copies.
+HV_FILE="${WASP_OFFSITE_HV:-/etc/wp-install/offsite-hypervisor}"
 SSH_KEY=/etc/wp-install/offsite-key
 RCLONE_CONF=/etc/wp-install/rclone.conf
 BACKUP_DIR="${BACKUP_DIR:-/root/wp-db-backups}"
@@ -655,11 +664,21 @@ case "${1:-status}" in
     echo ""
     echo "Off-VM backup"
     echo "━━━━━━━━━━━━━"
+    if ! _configured && [ -r "$HV_FILE" ]; then
+      echo "  MADE AT THE HYPERVISOR — this VM sends nothing itself."
+      sed -n 's/^note=/  Where       : /p; s/^since=/  Recorded    : /p; s/^by=/  By          : /p' "$HV_FILE"
+      echo "  Nothing on this VM can see those copies. Proving they restore is"
+      echo "  a job at the hypervisor (a restore test there), not here."
+      echo "  Undo:  doas wasp-offsite-backup.sh hypervisor off"
+      exit 0
+    fi
     if ! _configured; then
       echo "  NOT CONFIGURED — backups exist only on this VM."
       echo "  A backup on the same disk, hypervisor and attacker as the thing"
       echo "  it protects survives disk failure and nothing else."
       echo "  Configure: wasp-offsite-backup.sh setup   (or re-run the installer)"
+      echo "  Backed up off-host by the hypervisor instead? Record it:"
+      echo "    doas wasp-offsite-backup.sh hypervisor \"Proxmox Backup Server, nightly\""
       exit 0
     fi
     printf '  Method      : %s\n' "$OFFSITE_METHOD"
@@ -695,6 +714,47 @@ case "${1:-status}" in
     fi ;;
 
   init|setup) do_init ;;
+  mode)
+    # For the other tools: how this VM's backups leave it.
+    if _configured; then echo "$OFFSITE_METHOD"
+    elif [ -r "$HV_FILE" ]; then echo hypervisor
+    else echo none; fi ;;
+  hypervisor)
+    case "${2:-}" in
+      '')
+        if [ -r "$HV_FILE" ]; then
+          echo "Offsite copies are made at the hypervisor:"
+          sed 's/^/  /' "$HV_FILE"
+        else
+          echo "Not recorded. If the hypervisor copies this VM off-host:"
+          echo "  doas wasp-offsite-backup.sh hypervisor \"Proxmox Backup Server, nightly, off-site\""
+        fi ;;
+      off|none|remove)
+        rm -f "$HV_FILE"
+        _ok "No longer recorded as backed up by the hypervisor."
+        _configured || _note "This VM sends nothing itself, so each backup reports that again." ;;
+      *)
+        _hn=$(printf '%s' "$2" | tr -d '\r\n' | cut -c1-160)
+        mkdir -p "$(dirname "$HV_FILE")"
+        { printf 'note=%s\n' "$_hn"
+          printf 'since=%s\n' "$(date -u +%Y-%m-%d)"
+          printf 'by=%s\n' "${DOAS_USER:-${SUDO_USER:-$(id -un 2>/dev/null || echo root)}}"
+        } > "$HV_FILE"
+        chmod 644 "$HV_FILE"
+        if _configured; then
+          _ok "Recorded: ${_hn}"
+          _note "This VM also sends its own copies (${OFFSITE_METHOD}); that is unchanged, and"
+          _note "a failure there is still reported."
+        else
+          # The record of pushes that will now never run would read as a failure,
+          # or a last success, getting older every day.
+          rm -f /etc/wp-install/offsite-last-error /etc/wp-install/offsite-last-ok 2>/dev/null || true
+          _ok "Recorded: offsite copies are made at the hypervisor (${_hn})."
+          _note "Backups no longer report a failed off-VM copy, and the reports say"
+          _note "where the copies are made. Nothing here can check them: test a"
+          _note "restore at the hypervisor."
+        fi ;;
+    esac ;;
   restore)    shift 2>/dev/null || true; do_restore "$@" ;;
   push)   _configured || { _bad "Off-VM backup is not configured"; exit 1; }
           push_one "${2:-}" ;;
@@ -1165,5 +1225,5 @@ case "${1:-status}" in
     echo "  The private key belongs somewhere that is neither this VM nor the"
     echo "  storage bucket. Both are things an attacker may already hold." ;;
 
-  *) sed -n '4,10p' "$0" ;;
+  *) sed -n '4,12p' "$0" ;;
 esac

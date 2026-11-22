@@ -369,10 +369,12 @@ add_action('wp_login_failed', function ($username, $error = null) {
             $body .= "is affecting EVERY visitor. Check with:\n";
             $body .= "  doas wp-hardening.sh proxy-check\n";
 
+            // The operator's relay, never the client's server (01-wpvm-smtp.php).
             wp_mail(
                 $wpvm_notify,
                 sprintf('[%s] Login lockout — %s', $site, $ip),
-                $body
+                $body,
+                array('X-WASP-Mail: operator')
             );
         }
     } else {

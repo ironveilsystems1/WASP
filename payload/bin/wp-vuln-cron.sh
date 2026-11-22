@@ -27,6 +27,7 @@ trap 'rm -f "$OUT"' EXIT INT TERM
 VULN_STATE="${VULN_STATE:-/var/cache/wp-vulns/.last-scan}"
 MALWARE_STATE="${MALWARE_STATE:-/var/lib/wp-malware-scan}"
 STALE_HOURS="${STALE_HOURS:-48}"
+OFFSITE_ETC="${OFFSITE_ETC:-/etc/wp-install}"
 
 if [ "${1:-}" = "--digest" ]; then
   _send=1; [ "${2:-}" = "--print" ] && _send=0
@@ -105,6 +106,8 @@ if [ "${1:-}" = "--digest" ]; then
       _mc=$(grep -c '^CRITICAL' "$MALWARE_STATE/last-scan.tsv" 2>/dev/null) || _mc=0
       _mh=$(grep -c '^HIGH' "$MALWARE_STATE/last-scan.tsv" 2>/dev/null) || _mh=0
       printf '  Last run : %s (%sh ago): %s critical, %s high\n' "$_mt" "$(_age_h "$_ms")" "$_mc" "$_mh"
+      _ma=$(grep -c '^ACCEPTED' "$MALWARE_STATE/last-scan.tsv" 2>/dev/null) || _ma=0
+      [ "$_ma" -gt 0 ] && printf '             %s reviewed file(s) accepted and unchanged (wp-malware-scan.sh accepted)\n' "$_ma"
       [ "$(_age_h "$_ms")" -gt "$STALE_HOURS" ] && _attn="${_attn}the daily malware scan has not run for $(_age_h "$_ms")h; "
       grep -E '^(CRITICAL|HIGH)' "$MALWARE_STATE/last-scan.tsv" 2>/dev/null | cut -f1,2 | head -20 \
         | sed 's/\t/  /; s/^/    /'
@@ -112,6 +115,25 @@ if [ "${1:-}" = "--digest" ]; then
     else
       printf '  Last run : never recorded\n'
       _attn="${_attn}no malware scan has been recorded; "
+    fi
+    printf '\n'
+
+    # 10.28: where the backups go, said every week, including when the answer
+    # is "the hypervisor" (recorded by the operator) or "nowhere".
+    printf 'OFF-VM BACKUPS\n'
+    if [ -r "$OFFSITE_ETC/offsite-hypervisor" ] && [ ! -r "$OFFSITE_ETC/offsite-last-ok" ]; then
+      printf '  Made at the hypervisor: %s\n' "$(sed -n 's/^note=//p' "$OFFSITE_ETC/offsite-hypervisor")"
+      printf '  (recorded %s; nothing on the VM can see those copies -- test a restore there)\n' \
+        "$(sed -n 's/^since=//p' "$OFFSITE_ETC/offsite-hypervisor")"
+    elif [ -r "$OFFSITE_ETC/offsite-last-ok" ]; then
+      _oo=$(cat "$OFFSITE_ETC/offsite-last-ok" 2>/dev/null)
+      printf '  Last copy sent from this VM: %sh ago\n' "$(_age_h "${_oo:-0}")"
+      if [ -s "$OFFSITE_ETC/offsite-last-error" ]; then
+        printf '  The last push FAILED: wasp-offsite-backup.sh status\n'
+        _attn="${_attn}the last off-VM backup copy failed; "
+      fi
+    else
+      printf '  None: backups exist only on this VM. wasp-offsite-backup.sh status\n'
     fi
     printf '\n'
 

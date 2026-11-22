@@ -212,7 +212,14 @@ if grep -q '^MFA_ENFORCE="1"' /etc/wp-install/vars.sh 2>/dev/null; then
 fi
 
 # ── 6. Is anything actually reaching off-site? ──────────────────────────────
-if [ -r /etc/wp-install/rclone.conf ] || grep -q '^OFFSITE_METHOD=' /etc/wp-install/vars.sh 2>/dev/null; then
+# 10.28: copied off-host by the hypervisor, as the operator recorded it. The
+# VM's own push checks below then do not apply.
+_offhv=""
+[ -x /usr/local/bin/wasp-offsite-backup.sh ] && [ "$(/usr/local/bin/wasp-offsite-backup.sh mode 2>/dev/null)" = hypervisor ] \
+  && _offhv=$(sed -n 's/^note=//p' /etc/wp-install/offsite-hypervisor 2>/dev/null)
+if [ -n "$_offhv" ]; then
+  _pass "Off-site copies are made at the hypervisor (recorded: ${_offhv}); not visible from this VM"
+elif [ -r /etc/wp-install/rclone.conf ] || grep -q '^OFFSITE_METHOD=' /etc/wp-install/vars.sh 2>/dev/null; then
   # Age of the last SUCCESSFUL copy, checked before the error file, because an
   # expired token produces an unchanging error that reads as one failure when
   # it is actually every failure since a date.

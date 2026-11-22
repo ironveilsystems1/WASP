@@ -8,10 +8,25 @@
 # "did that actually send?" is otherwise unanswerable without reading logs.
 #
 #   wp-mail.sh status              what is configured (password redacted)
-#   wp-mail.sh test you@example.com  send a real message and report the result
+#   wp-mail.sh test you@example.com  send a real message through the relay
 #   wp-mail.sh setup               (re)configure the relay interactively
 #   wp-mail.sh log                 recent mail failures from the PHP error log
 #   wp-mail.sh doctor              config + mount + mu-plugin + DNS checks
+#
+#   wp-mail.sh client [status]     the client's own mail server, if any
+#   wp-mail.sh client setup        Microsoft 365 (Graph) or SMTP for the site's mail
+#   wp-mail.sh client test <addr>  send through the client's server
+#   wp-mail.sh client off          the site's mail back to the relay
+#
+# TWO PATHS (10.27). The relay set at install is the OPERATOR's: WASP's
+# security alerts and lockout notices always go through it, so a client
+# changing their mailbox can never silence an alert. The site's own mail --
+# contact forms, password resets, notifications -- goes through the CLIENT's
+# server when `client setup` has set one: Microsoft 365 through Graph (HTTPS,
+# no SMTP, no port 25), or SMTP submission on 587/465 (Google Workspace with
+# an app password, or any host). If the client's path fails, the message goes
+# through the relay instead and the failure is logged; nothing is lost.
+# Host-side alerts (wp-notify.sh, backups, heartbeat) use the relay as before.
 # =============================================================================
 set -e
 
@@ -27,6 +42,11 @@ WP_ENV_FILE=/etc/wordpress/wp.env
 [ -r "$WP_ENV_FILE" ] || WP_ENV_FILE=/etc/wordpress/env
 
 SECRETS_DIR="/home/wpuser/wp/secrets"
+CLIENT_FILE="${SECRETS_DIR}/client-mail.ini"
+# PHP's errors (and so the mail plugin's) go to Apache's error log here.
+WP_LOG_DIR="${WP_LOG_DIR:-/home/wpuser/wp/logs}"
+# SMTP_HOST: the relay the firewall was pinned to at install.
+[ -r /etc/wp-install/vars.sh ] && SMTP_HOST=$(sed -n 's/^SMTP_HOST=//p' /etc/wp-install/vars.sh | sed -e "s/^[\"']//" -e "s/[\"']\$//" | head -1)
 # INI, not PHP. The credentials file is data now, so reading it cannot
 # execute anything -- see the note in 01-wpvm-smtp.php for why that changed.
 # Legacy smtp.php is still read if present so an existing VM keeps working
@@ -224,13 +244,15 @@ do_test() {
   # relay was fine. Passed through the environment instead: no quoting to get
   # wrong, and the address never becomes part of the PHP source, so an odd
   # character in it cannot alter the code being evaluated.
+  # X-WASP-Mail: operator -- the relay, even when the client has their own
+  # server for the site's mail (that path is `wp-mail.sh client test`).
   WPCLI_ENV="-e WPMAIL_TO=${_to}"
   _out=$(_wp eval '
     $to = getenv("WPMAIL_TO");
     $ok = wp_mail($to, "wp-mail.sh test message",
         "If you are reading this, WordPress on this VM can send mail.\n\n" .
         "Relay, credentials, TLS, and the SMTP mu-plugin are all working.\n" .
-        "Sent: " . gmdate("c") . " UTC\n");
+        "Sent: " . gmdate("c") . " UTC\n", array("X-WASP-Mail: operator"));
     echo $ok ? "SENT" : "FAILED";
   ' 2>&1) || true
   WPCLI_ENV=""
@@ -271,11 +293,12 @@ do_setup() {
   echo ""
   printf "  SMTP server hostname : "; read -r _h
   [ -n "$_h" ] || { echo "Hostname is required." >&2; exit 1; }
+  case "$_h" in *[!A-Za-z0-9.-]*) echo "✗  Not a hostname: ${_h}" >&2; exit 1 ;; esac
   printf "  Port [587] : "; read -r _p; _p="${_p:-587}"
   case "$_p" in 465) _enc="ssl" ;; *) _enc="tls" ;; esac
   printf "  Username (full mailbox address) : "; read -r _u
   printf "  Password / app password : "
-  stty -echo 2>/dev/null; read -r _pw; stty echo 2>/dev/null; echo
+  stty -echo 2>/dev/null || true; read -r _pw; stty echo 2>/dev/null || true; echo
   [ -n "$_pw" ] || { echo "Password is required." >&2; exit 1; }
   printf "  From address [%s] : " "$_u"; read -r _f; _f="${_f:-$_u}"
   printf "  From name [WordPress] : "; read -r _fn; _fn="${_fn:-WordPress}"
@@ -285,7 +308,8 @@ do_setup() {
   mkdir -p "$SECRETS_DIR"
   chown root:33 "$SECRETS_DIR" 2>/dev/null || true
   chmod 0750 "$SECRETS_DIR"
-  install -m 0600 -o 0 -g 33 /dev/null "$SMTP_FILE"
+  # No `install`: not every BusyBox build has it.
+  : > "$SMTP_FILE"; chown 0:33 "$SMTP_FILE"; chmod 0600 "$SMTP_FILE"
   {
     printf '; WASP SMTP relay settings. Data, not code -- never include() this.\n'
     printf 'host = %s\n'       "$_h"
@@ -301,11 +325,249 @@ do_setup() {
   # Retire the executable form if this VM predates the change.
   [ -f "$SMTP_FILE_LEGACY" ] && { rm -f "$SMTP_FILE_LEGACY"; echo "  Removed legacy executable smtp.php"; }
   echo "✔  Written to ${SMTP_FILE} (INI, non-executable, root:33 0440, dir 0750)"
+  # The firewall lets mail out only to the relay's addresses. Until 10.27 this
+  # wrote the new relay and left the rule on the old one, so mail to a new
+  # relay was dropped with nothing saying why. Record the host, then re-pin.
+  if [ -w /etc/wp-install/vars.sh ] && [ "$_h" != "${SMTP_HOST:-}" ]; then
+    # A hostname (checked above): letters, digits, dots and hyphens only.
+    if grep -q '^SMTP_HOST=' /etc/wp-install/vars.sh; then
+      _tmpv=$(mktemp); sed "s|^SMTP_HOST=.*|SMTP_HOST='${_h}'|" /etc/wp-install/vars.sh > "$_tmpv" && cat "$_tmpv" > /etc/wp-install/vars.sh; rm -f "$_tmpv"
+    else
+      printf "SMTP_HOST='%s'\n" "$_h" >> /etc/wp-install/vars.sh
+    fi
+    SMTP_HOST="$_h"
+  fi
+  if command -v wp-hardening.sh >/dev/null 2>&1; then
+    echo "  Re-pinning the firewall to ${_h}…"
+    wp-hardening.sh smtp-repin || echo "  ⚠  Mail to ${_h} stays blocked until: doas wp-hardening.sh smtp-repin" >&2
+  fi
   # The mount is read-only and already in place, and PHP reads the file per
   # request, so no container restart is needed — but opcache can hold a
   # compiled copy, so nudge it.
   podman exec wordpress sh -c 'command -v php >/dev/null && php -r "opcache_reset();" 2>/dev/null' >/dev/null 2>&1 || true
   echo "   Test it:  wp-mail.sh test you@example.com"
+}
+
+# ── The client's own mail server ─────────────────────────────────────────────
+_ccfg() {  # key -> value from client-mail.ini
+  [ -r "$CLIENT_FILE" ] || return 1
+  case "$1" in
+    secret) sed -n 's/^[[:space:]]*secret_b64[[:space:]]*=[[:space:]]*//p' "$CLIENT_FILE" | head -1 | base64 -d 2>/dev/null ;;
+    pass)   sed -n 's/^[[:space:]]*pass_b64[[:space:]]*=[[:space:]]*//p' "$CLIENT_FILE" | head -1 | base64 -d 2>/dev/null ;;
+    *)      sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CLIENT_FILE" | head -1 | tr -d '\r' ;;
+  esac
+}
+_ctransport() { _t=$(_ccfg transport); printf '%s' "${_t:-smtp}"; }
+# Recent client-path failures that went through the relay instead.
+_cfallbacks() {
+  grep -h 'wpvm-smtp\] client mail failed' "$WP_LOG_DIR"/*.log 2>/dev/null | tail -"${1:-3}"
+}
+
+client_status() {
+  echo ""
+  echo "The site's mail (contact forms, password resets, notifications)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ ! -r "$CLIENT_FILE" ]; then
+    echo "  Through the operator relay ($(_cfg host 2>/dev/null || echo 'not configured')), like WASP's own alerts."
+    echo ""
+    echo "  To send it through the client's own Microsoft 365 or mail server:"
+    echo "    doas wp-mail.sh client setup"
+    return 0
+  fi
+  case "$(_ctransport)" in
+    m365)
+      printf "  %-16s %s\n" "Transport:" "Microsoft 365 through Graph (HTTPS, no SMTP)"
+      printf "  %-16s %s\n" "Sends as:" "$(_ccfg from)"
+      printf "  %-16s %s\n" "Tenant:" "$(_ccfg tenant)"
+      printf "  %-16s %s\n" "App (client) ID:" "$(_ccfg client_id)"
+      printf "  %-16s %s\n" "Secret:" "(set — redacted)"
+      _exp=$(_ccfg secret_expires)
+      if [ -n "$_exp" ]; then
+        _now=$(date -u +%Y-%m-%d)
+        _soon=$(date -u -d "@$(( $(date +%s) + 30*86400 ))" +%Y-%m-%d 2>/dev/null)
+        if [ "$_exp" \< "$_now" ] || [ "$_exp" = "$_now" ]; then
+          printf "  %-16s %s\n" "Secret expires:" "${_exp}  ✗ EXPIRED — the site's mail is going through the relay"
+        elif [ -n "$_soon" ] && [ "$_exp" \< "$_soon" ]; then
+          printf "  %-16s %s\n" "Secret expires:" "${_exp}  ⚠ within 30 days: ask for a new secret, then client setup"
+        else
+          printf "  %-16s %s\n" "Secret expires:" "${_exp}"
+        fi
+      else
+        printf "  %-16s %s\n" "Secret expires:" "not recorded (re-run client setup to record it)"
+      fi
+      _al="/opt/squid/config/allowlist-runtime.txt"
+      if [ -r "$_al" ]; then
+        _miss=""
+        for _gh in login.microsoftonline.com graph.microsoft.com; do
+          grep -v '^[[:space:]]*#' "$_al" | tr -d ' \t\r' | grep -qxE "${_gh}|\.(${_gh#*.})" || _miss="${_miss} ${_gh}"
+        done
+        if [ -n "$_miss" ]; then
+          printf "  %-16s %s\n" "Egress:" "MISSING${_miss} ⚠ — run: doas wasp-egress.sh reconcile"
+        else
+          printf "  %-16s %s\n" "Egress:" "login.microsoftonline.com and graph.microsoft.com allowed ✔"
+        fi
+      fi ;;
+    smtp)
+      printf "  %-16s %s\n" "Transport:" "SMTP submission, $(_ccfg host):$(_ccfg port)"
+      printf "  %-16s %s\n" "Username:" "$(_ccfg user)"
+      printf "  %-16s %s\n" "Password:" "(set — redacted)"
+      printf "  %-16s %s\n" "Sends as:" "$(_ccfg from)" ;;
+    *)
+      printf "  %-16s %s\n" "Transport:" "$(_ctransport) — UNKNOWN ⚠ (the site's mail is going through the relay)" ;;
+  esac
+  printf "  %-16s %s\n" "From name:" "$(_ccfg from_name)"
+  _perm=$(stat -c '%a %u:%g' "$CLIENT_FILE" 2>/dev/null || echo "?")
+  case "$_perm" in
+    "440 0:33") printf "  %-16s %s\n" "File mode:" "${_perm} (root:uid33)  ✔" ;;
+    *) printf "  %-16s %s\n" "File mode:" "$_perm  ⚠ expected 440 0:33" ;;
+  esac
+  printf "  %-16s %s\n" "WASP's alerts:" "the operator relay, $(_cfg host 2>/dev/null || echo 'not configured')"
+  _fb=$(_cfallbacks 3)
+  echo ""
+  if [ -n "$_fb" ]; then
+    echo "  ⚠  Recent messages the client's server did not take (sent through the relay):"
+    printf '%s\n' "$_fb" | sed 's/^/     /'
+  else
+    echo "  No recent failures on the client's path."
+  fi
+  echo ""
+  echo "  Verify:  doas wp-mail.sh client test <the client's address>"
+}
+
+client_setup() {
+  echo ""
+  echo "The site's mail through the client's own server"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Contact forms, password resets and notifications will be sent by the"
+  echo "client's mailbox. WASP's security alerts stay on the operator relay."
+  echo ""
+  echo "  1) Microsoft 365 through Graph (recommended for Microsoft 365)"
+  echo "     An app the client's tenant registers; HTTPS, no SMTP, no port 25."
+  echo "  2) SMTP submission, 587 or 465"
+  echo "     Google Workspace with an app password, or any other mail host."
+  echo "     Microsoft 365 too, while its tenant still allows SMTP AUTH."
+  echo ""
+  printf "  Choice [1] : "; read -r _c; _c="${_c:-1}"
+  _tmp=$(mktemp)
+  case "$_c" in
+    1)
+      echo ""
+      echo "  From the app registration in the client's Microsoft Entra admin center"
+      echo "  (README: Microsoft 365 for the site's mail):"
+      printf "  Directory (tenant) ID, or their domain : "; read -r _tn
+      case "$_tn" in ''|*[!A-Za-z0-9.-]*) echo "✗  Not a tenant ID or domain: ${_tn}" >&2; rm -f "$_tmp"; exit 1 ;; esac
+      printf "  Application (client) ID : "; read -r _ci
+      printf '%s' "$_ci" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' \
+        || { echo "✗  An application ID looks like 3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90" >&2; rm -f "$_tmp"; exit 1; }
+      printf "  Client secret VALUE (not its ID) : "
+      stty -echo 2>/dev/null || true; read -r _sec; stty echo 2>/dev/null || true; echo
+      [ -n "$_sec" ] || { echo "✗  The secret is required." >&2; rm -f "$_tmp"; exit 1; }
+      printf "  Secret expires (YYYY-MM-DD, blank = not recorded) : "; read -r _ex
+      case "$_ex" in ''|[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]) : ;; *) echo "✗  Use YYYY-MM-DD." >&2; rm -f "$_tmp"; exit 1 ;; esac
+      printf "  Mailbox that sends (e.g. forms@clientdomain.com) : "; read -r _fr
+      printf "  From name [%s] : " "$(_cfg from_name 2>/dev/null || echo Website)"; read -r _fn
+      _fn="${_fn:-$(_cfg from_name 2>/dev/null || echo Website)}"
+      {
+        printf '; The site'"'"'s mail through the client'"'"'s Microsoft 365. Data, not code.\n'
+        printf 'transport = m365\n'
+        printf 'tenant = %s\n' "$_tn"
+        printf 'client_id = %s\n' "$_ci"
+        printf 'secret_b64 = %s\n' "$(printf '%s' "$_sec" | base64 | tr -d '\n')"
+        [ -n "$_ex" ] && printf 'secret_expires = %s\n' "$_ex"
+        printf 'from = %s\n' "$_fr"
+        printf 'from_name = %s\n' "$_fn"
+      } > "$_tmp" ;;
+    2)
+      echo ""
+      printf "  SMTP server (smtp.gmail.com, smtp.office365.com, …) : "; read -r _h
+      case "$_h" in ''|*[!A-Za-z0-9.-]*) echo "✗  Not a hostname: ${_h}" >&2; rm -f "$_tmp"; exit 1 ;; esac
+      printf "  Port [587] : "; read -r _p; _p="${_p:-587}"
+      case "$_p" in
+        587) _enc=tls ;; 465) _enc=ssl ;;
+        25) echo "✗  Port 25 is server-to-server delivery, not submission. Use 587 or 465." >&2; rm -f "$_tmp"; exit 1 ;;
+        *) echo "✗  Use 587 (STARTTLS) or 465 (TLS)." >&2; rm -f "$_tmp"; exit 1 ;;
+      esac
+      printf "  Username (the full mailbox address) : "; read -r _u
+      printf "  Password or app password : "
+      stty -echo 2>/dev/null || true; read -r _pw; stty echo 2>/dev/null || true; echo
+      [ -n "$_pw" ] || { echo "✗  The password is required." >&2; rm -f "$_tmp"; exit 1; }
+      printf "  From address [%s] : " "$_u"; read -r _fr; _fr="${_fr:-$_u}"
+      printf "  From name [%s] : " "$(_cfg from_name 2>/dev/null || echo Website)"; read -r _fn
+      _fn="${_fn:-$(_cfg from_name 2>/dev/null || echo Website)}"
+      {
+        printf '; The site'"'"'s mail through the client'"'"'s SMTP server. Data, not code.\n'
+        printf 'transport = smtp\n'
+        printf 'host = %s\n' "$_h"
+        printf 'port = %s\n' "$_p"
+        printf 'user = %s\n' "$_u"
+        printf 'pass_b64 = %s\n' "$(printf '%s' "$_pw" | base64 | tr -d '\n')"
+        printf 'from = %s\n' "$_fr"
+        printf 'from_name = %s\n' "$_fn"
+        printf 'encryption = %s\n' "$_enc"
+        printf 'timeout = 10\n'
+      } > "$_tmp" ;;
+    *) echo "Choose 1 or 2." >&2; rm -f "$_tmp"; exit 1 ;;
+  esac
+  case "$_fr" in *@*.*) : ;; *) echo "✗  '${_fr}' is not a mailbox address." >&2; rm -f "$_tmp"; exit 1 ;; esac
+  mkdir -p "$SECRETS_DIR"; chown root:33 "$SECRETS_DIR" 2>/dev/null || true; chmod 0750 "$SECRETS_DIR"
+  [ -f "$CLIENT_FILE" ] || { : > "$CLIENT_FILE"; chown 0:33 "$CLIENT_FILE"; }
+  # In place: the secrets folder is mounted into the container as it is.
+  chmod 0640 "$CLIENT_FILE"; cat "$_tmp" > "$CLIENT_FILE"; rm -f "$_tmp"
+  chmod 0440 "$CLIENT_FILE"; chown root:33 "$CLIENT_FILE"
+  echo "✔  Written to ${CLIENT_FILE} (INI, root:33 0440)"
+  if [ "$_c" = 1 ]; then
+    command -v wasp-egress.sh >/dev/null 2>&1 && { wasp-egress.sh reconcile || echo "  ⚠  Allow them by hand: doas wasp-egress.sh reconcile" >&2; }
+  else
+    command -v wp-hardening.sh >/dev/null 2>&1 && { wp-hardening.sh smtp-repin || echo "  ⚠  Mail to ${_h} is blocked until: doas wp-hardening.sh smtp-repin" >&2; }
+  fi
+  podman exec wordpress sh -c 'command -v php >/dev/null && php -r "opcache_reset();" 2>/dev/null' >/dev/null 2>&1 || true
+  echo ""
+  echo "  Next:  doas wp-mail.sh client test <an address at the client>"
+}
+
+client_test() {
+  _to="$1"
+  case "$_to" in
+    *[!A-Za-z0-9._%+@-]*|*@*@*|@*|*@|'') echo "Usage: wp-mail.sh client test <recipient@example.com>" >&2; exit 1 ;;
+    *@*.*) : ;;
+    *) echo "✗  '${_to}' does not look like an email address." >&2; exit 1 ;;
+  esac
+  [ -r "$CLIENT_FILE" ] || { echo "✗  No client mail server set up; the site's mail uses the relay (wp-mail.sh test)." >&2; exit 1; }
+  echo "Sending through the client's $( [ "$(_ctransport)" = m365 ] && echo 'Microsoft 365' || echo "server $(_ccfg host)") to ${_to}…"
+  WPCLI_ENV="-e WPMAIL_TO=${_to}"
+  _out=$(_wp eval '
+    $ok = wp_mail(getenv("WPMAIL_TO"), "wp-mail.sh client test",
+        "If you are reading this, the site'"'"'s own mail (contact forms, password\n" .
+        "resets) reaches this mailbox through the client'"'"'s server.\n\n" .
+        "Sent: " . gmdate("c") . " UTC\n", array("X-WASP-Mail: client"));
+    global $phpmailer;
+    $fb = is_object($phpmailer) && !empty($phpmailer->wpvm_fellback);
+    echo $ok ? ($fb ? "FELLBACK" : "SENT") : "FAILED";
+  ' 2>&1) || true
+  WPCLI_ENV=""
+  case "$_out" in
+    *FELLBACK*)
+      echo "✗  The client's server did NOT take it. It was delivered through the relay instead." >&2
+      printf '%s\n' "$_out" | grep 'client mail failed' | sed 's/.*client mail failed (/   Why: /; s/); sent through.*//' >&2
+      echo "   Fix it, then test again. Until then the site's mail keeps arriving, from the relay." >&2
+      exit 1 ;;
+    *SENT*)
+      echo "✔  Sent by the client's $( [ "$(_ctransport)" = m365 ] && echo 'Microsoft 365' || echo 'server'). Check ${_to}, and the sending mailbox's Sent Items." ;;
+    *)
+      echo "✗  Not sent:" >&2; printf '%s\n' "$_out" >&2; exit 1 ;;
+  esac
+}
+
+client_off() {
+  [ -r "$CLIENT_FILE" ] || { echo "The site's mail already uses the relay."; return 0; }
+  printf "  Send the site's mail through the operator relay again? Type OFF to confirm: "
+  read -r _a; _a=$(printf '%s' "$_a" | tr -d ' \t\r')
+  [ "$_a" = OFF ] || { echo "Nothing changed."; return 0; }
+  cp -p "$CLIENT_FILE" "${CLIENT_FILE}.off-$(date -u +%Y%m%d%H%M%S)"
+  chmod 0400 "${CLIENT_FILE}".off-* 2>/dev/null || true
+  rm -f "$CLIENT_FILE"
+  echo "✔  The site's mail goes through the relay. The old settings are kept beside it (.off-*)."
+  echo "   Egress for Microsoft 365, if any, stays allowed: doas wasp-egress.sh deny <host>"
 }
 
 show_log() {
@@ -350,6 +612,31 @@ do_doctor() {
     \$e=null;\$s=@fsockopen('${_h}',${_p},\$n,\$e,5);
     echo \$s?'reachable':'UNREACHABLE ('.\$e.')';
     if(\$s)fclose(\$s);" 2>/dev/null || echo "check failed"
+  # The client's path, when the site's mail has one.
+  if [ -r "$CLIENT_FILE" ]; then
+    case "$(_ctransport)" in
+      m365)
+        echo "  client path : Microsoft 365 through Graph, as $(_ccfg from)"
+        printf "  client HTTPS: "
+        # WordPress's own HTTP API, through the proxy, as a send would go.
+        _r=$(_wp eval '$r = wp_remote_get("https://login.microsoftonline.com/common/discovery/keys", array("timeout" => 8)); echo is_wp_error($r) ? "BLOCKED " . $r->get_error_message() : "reachable (HTTP " . wp_remote_retrieve_response_code($r) . ")";' 2>/dev/null || echo "check failed")
+        case "$_r" in reachable*) echo "Microsoft sign-in ${_r}" ;; *) echo "Microsoft sign-in ${_r} ⚠ — doas wasp-egress.sh reconcile" ;; esac ;;
+      *)
+        _chh=$(_ccfg host); _chp=$(_ccfg port)
+        case "${_chh}:${_chp}" in *[!A-Za-z0-9.:-]*|:*) _chh=invalid.invalid; _chp=587 ;; esac
+        echo "  client path : SMTP ${_chh}:${_chp:-587}, as $(_ccfg from)"
+        printf "  client TCP  : "
+        podman exec wordpress php -r "
+          \$e=null;\$s=@fsockopen('${_chh}',${_chp:-587},\$n,\$e,5);
+          echo \$s?'reachable':'UNREACHABLE ('.\$e.') — doas wp-hardening.sh smtp-repin';
+          if(\$s)fclose(\$s);" 2>/dev/null || echo "check failed"
+        echo "" ;;
+    esac
+    _fb=$(_cfallbacks 1)
+    [ -n "$_fb" ] && echo "  last client failure: $(printf '%s' "$_fb" | sed 's/.*client mail failed (//; s/); sent through.*//')"
+  else
+    echo "  client path : none; the site's mail uses the relay too"
+  fi
   echo ""
   echo "  Firewall note: outbound submission is rate limited to 30 new"
   echo "  connections/hour (burst 10). Hitting that logs 'nft-smtp-ratelimit'"
@@ -357,12 +644,22 @@ do_doctor() {
 }
 
 case "${1:-status}" in
-  status) show_status ;;
+  status) show_status; [ -r "$CLIENT_FILE" ] && echo "  The site's own mail goes through the client's server: wp-mail.sh client" ;;
   test)   do_test "${2:-}" ;;
   setup)  do_setup ;;
   log)    show_log ;;
   doctor) do_doctor ;;
+  client)
+    case "${2:-status}" in
+      status) client_status ;;
+      setup)  client_setup ;;
+      test)   client_test "${3:-}" ;;
+      off)    client_off ;;
+      *) echo "Usage: wp-mail.sh client [status|setup|off]"; echo "       wp-mail.sh client test <recipient@example.com>"; exit 1 ;;
+    esac ;;
   *)
     echo "Usage: wp-mail.sh [status|setup|doctor|log]"
-    echo "       wp-mail.sh test <recipient@example.com>" ;;
+    echo "       wp-mail.sh test <recipient@example.com>"
+    echo "       wp-mail.sh client [status|setup|off]"
+    echo "       wp-mail.sh client test <recipient@example.com>" ;;
 esac
