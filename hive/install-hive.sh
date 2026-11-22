@@ -78,7 +78,7 @@ say() { printf '  %s\n' "$*"; }
 
 # ── 1. Packages ──────────────────────────────────────────────────────────────
 say "Installing packages…"
-apk add --no-cache python3 openssl nftables minisign >/dev/null
+apk add --no-cache python3 openssl nftables minisign logrotate >/dev/null
 apk add --no-cache qrencode >/dev/null 2>&1 || say "(qrencode unavailable: authenticator setup will show the secret as text)"
 python3 -c 'import sqlite3, ssl' || { echo "python3 lacks sqlite3 or ssl." >&2; exit 1; }
 
@@ -199,6 +199,25 @@ rc-service nftables restart >/dev/null
 install -m 0755 "$HERE/hive.initd" /etc/init.d/wasp-hive
 touch /var/log/wasp-hive.log
 chown hive:hive /var/log/wasp-hive.log; chmod 0640 /var/log/wasp-hive.log
+# One line per request, about 1,200 a day for twelve VMs: small, but it never
+# stopped growing. Weekly, eight kept, sooner past 10 MB. copytruncate: the
+# service holds the file open (supervise-daemon appends to it), so it is
+# truncated in place, not moved. Alpine runs logrotate from crond daily.
+cat > /etc/logrotate.d/wasp-hive <<'ROT'
+/var/log/wasp-hive.log {
+    weekly
+    rotate 8
+    maxsize 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+ROT
+rc-update add crond default >/dev/null 2>&1 || true
+rc-service crond start >/dev/null 2>&1 || true
 rc-update add wasp-hive default >/dev/null
 rc-service wasp-hive restart >/dev/null
 

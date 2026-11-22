@@ -208,7 +208,11 @@ accept it.
 | `wasp-hive-report.sh leave` *(on a VM)* | stop reporting and delete the token |
 
 Reports are kept for 90 days (`RETENTION_DAYS`). The service log is
-`/var/log/wasp-hive.log`, one line per request and no bodies. Restart with
+`/var/log/wasp-hive.log`, one line per request and no bodies, rotated weekly
+(eight kept, sooner past 10 MB) by `/etc/logrotate.d/wasp-hive`, which
+`install-hive.sh` writes. A Hive installed before 10.28 needs that stanza
+added by hand (it is in section 6 of `install-hive.sh`) and `apk add
+logrotate`. Restart with
 `doas rc-service wasp-hive restart`.
 
 **Backing up the Hive.** Copy `/etc/wasp-hive/` and

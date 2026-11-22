@@ -78,6 +78,7 @@ check was written after a specific defect reached hardware:
 - `test-import-findings.sh` — after the first real compromised import cried wolf twice and missed the malware
 - `test-threats.sh` — after that malware turned out to be detectable by shape, and the clean-up worth automating
 - `test-egress-temporary.sh` — after an egress window was found to close only when someone next ran the tool
+- `test-mail-wordpress.sh` — after clients asked for form enquiries to come from their own Microsoft 365 or Google mailbox rather than the operator's relay, which their mail filters may quarantine
 - `test-egress-reconcile.sh` — after a field site's licensed Elementor add-on was denied its licence server 134 times in a week, and an upgrade had no way to add it
 - `test-notify.sh` — after every alert e-mail was found to authenticate with an empty password
 - `test-hive-report.sh` — written with WASP Hive; its BusyBox run caught every severity arriving as `[HIGH]` on Alpine
@@ -94,6 +95,11 @@ check was written after a specific defect reached hardware:
 - `test-links-wordpress.sh` — written when the clean-up had to work on sites built with other builders and themes than the one it was written for, where a stand-in for WordPress could not prove the stored data came out the shape each builder reads
 - `test-links-clean.php` — written after the spam an import brought was found, and removing it meant six SQL queries and the editor by hand, page by page
 - `test-verify-integrity.sh` — written before the tooling check's result was emailed, when it turned out every VM reported files it never keeps
+- `test-embeds.sh` / `test-csp-report.php` — written after a field site's footer map and contact form were found broken by the security header, and fixed by hand with a container restart
+- `test-malware-accept.sh` — written after a plugin's own reviewed cache file was reported CRITICAL every day
+- `test-tls-check.sh` — written after a client certificate without `www` was found by the link checker, and the certificate check turned out to fail silently on any VM with the loopback hosts entry
+- `test-offsite-hypervisor.sh` — written for VMs backed up off-host by Proxmox, which reported a failed off-VM copy after every backup
+- `test-boot-wait.sh` — written when "Error establishing a database connection" after a reboot was still being explained away as expected
 
 Several caught their own class again within days of being written, including
 two mistakes made while writing the fix for the original.
