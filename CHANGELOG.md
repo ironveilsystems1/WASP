@@ -6,6 +6,79 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.28 — Fewer false alarms, more of the real ones
+
+Field work after 10.27 kept finding the same two problems. Some alarms were false and repeated until nobody read them: a reviewed file was CRITICAL every day, a busy vulnerability service made the scan INCOMPLETE, and a VM backed up by Proxmox reported a failed off-VM copy after every backup. Some real problems raised no alarm at all: a footer map and a contact form broken by the security header, a certificate without `www`, and a certificate check that could not connect and said nothing.
+
+- **The security header's exceptions, as a setting** (`wp-hardening.sh embeds`):
+  - `allow`/`deny` for `google-maps`, `recaptcha`, `google-fonts` and `youtube`, and `add`/`remove <directive> <https://origin>` for anything else. Kept in `/etc/wp-install/embeds`; upgrades leave it alone.
+  - Each change rewrites the public and wp-admin lines of `wp-security.conf` together, in place (the container is given that one file), keeping five previous copies. Apache must accept the new file, or the old one goes back. WordPress then restarts (a graceful reload did not apply a changed header) and the live header is read back.
+  - `recaptcha` also opens `www.google.com` in the egress allowlist, which its server-side check needs; `deny` prints how to close it.
+  - A header edited by hand before 10.28 is adopted on first use.
+  - **Report-only mode.** `embeds mode report` sends the policy as `Content-Security-Policy-Report-Only`: nothing is blocked, and browsers report what would have been. The new `08-wasp-csp-report.php` mu-plugin logs one line per report: directive, blocked origin (scheme and host) and page path. It logs no visitor address, no query string, no code sample, and at most 300 lines an hour. `embeds report [hours]` groups the lines by host and names the service to allow, or the `embeds add` line. The enforcing header reports to the same address.
+  - `validate-wordpress.sh` checks the live header against the setting and warns in report-only mode. Menu: Security, 35 to 37.
+- **Accepting a reviewed file in the malware scan** (`wp-malware-scan.sh accept <file> "why"`, `accepted`, `revoke`):
+  - It records the file's sha256, who accepted it, when and why. While unchanged, the file is printed as `[ACCEPTED]` with that note and not counted: no CRITICAL mail, no non-zero exit.
+  - One changed byte and it is reported at its real severity again, saying it was accepted once and has changed since. YARA hits the same way, marked in the rule's block.
+  - The acceptance covers that path and content only: not a copy under another name, not a scan of another tree. Only the site's own files can be accepted, through `..` and links. A file the last scan called CRITICAL needs `--critical`.
+  - `last-scan.tsv` and the JSON carry `ACCEPTED` lines and a count. `status` and the weekly report show it. Menu: Security, 38 and 39.
+- **The vulnerability scan** (`wp-plugins.sh vulns`):
+  - **An older answer, said, instead of INCOMPLETE.** When WPVulnerability does not answer and there is a cached answer, the component is checked against it and the scan says how old it is. Up to 72 hours the scan stays complete. Past 72 hours it is still checked, and the scan is INCOMPLETE. Before, a refusal made the component failed with yesterday's answer on disk.
+  - **Answers expire at different times.** Each is refreshed after 12 to 17 hours, fixed per component by its name. At most 15 are refreshed per run (`WPV_REFRESH_MAX`); the rest wait for a later run, and a component never answered is always asked. Every answer had been fetched, and so expired, in the same minute.
+  - **Whether the update on offer fixes it.** On the live site each finding says "update available now: X fixes this" or "the update available now (X) does NOT fix this one", for both sources. The summary names the plugins an update fixes now.
+- **The HTTPS check** (`wp-hardening.sh tls`, daily `tls-check`):
+  - **Both names.** The bare domain and `www` (or the bare domain when the site's address is `www`). A `www` with no DNS record is skipped, and says so.
+  - **What a browser checks.** The chain (a missing intermediate) and the name (`-verify_hostname`), as well as days left.
+  - **A site it cannot reach is mailed.** The daily check tries again after 30 s, then mails. It used to exit 1 in silence. One mail covers every name, at most once in 72 hours.
+  - **It asks DNS, not `/etc/hosts`.** The installer's loopback entry for WP-Cron (`LOOPBACK_HOSTS`) pointed the check at the VM itself, which has no certificate, so on those VMs it failed every day without a word. `TLS_CHECK_ADDR` points it at the proxy's inside address where the VLAN cannot reach the public one; `TLS_CHECK_NAMES` sets the names. Menu: Health, 6.
+- **WordPress waits at boot until it could connect.** `mariadb-health-check.sh --wait [seconds]` waits until WordPress's own user can query its own database through InnoDB, up to 120 s by default. `wp-container` runs it before starting WordPress, up to `WASP_DB_WAIT` (120 s). The wait it replaces asked whether root's `ping` answered, which happens first; that gap was the "Error establishing a database connection" after a reboot. The **10.28 upgrade step** adds the wait to a service written before, keeping the previous file, and leaves alone one edited out of shape. Menu: Health, 7.
+- **Offsite copies made at the hypervisor** (`wasp-offsite-backup.sh hypervisor "<where>"`, `hypervisor off`):
+  - Records where the copies are made, by whom and when. Backups then log that there is nothing to send, instead of "Off-VM backup copy FAILED" mailed after every backup.
+  - `status`, `wasp-triage.sh` and `wasp-selftest.sh` say so, and `validate-wordpress.sh` no longer reports the last copy as getting old. The WASP Hive receives `offsite_hypervisor`; its compliance view still counts the offsite checks as unmet, because nothing on the VM can see those copies.
+  - A VM that also sends its own copies keeps doing so. `wasp-offsite-backup.sh mode` tells the other tools which applies. Menu: Backup, 10.
+- **The weekly report** gains an OFF-VM BACKUPS section (the hypervisor, the last copy sent, or none; a failed push is in the subject) and the count of accepted files.
+- **The Hive's log is rotated**: weekly, eight kept, sooner past 10 MB, by `/etc/logrotate.d/wasp-hive` from `install-hive.sh`.
+- **Tests.**
+  - New: `test-embeds.sh` (68 cases, host shell and BusyBox), `test-csp-report.php` (12), `test-malware-accept.sh` (33), `test-tls-check.sh` (19, with a throwaway CA and real TLS), `test-offsite-hypervisor.sh` (14), `test-boot-wait.sh` (12). All of them run under BusyBox too.
+  - `test-vuln-scan.sh`, 92 cases: an older answer used and said, past 72 h INCOMPLETE but still checked, the spread of refresh times, the per-run cap, and whether the update on offer fixes a finding from either source.
+
+### Bringing a VM to 10.28
+
+`doas wasp-upgrade.sh apply`. The upgrade installs the tools and the new mu-plugin, and runs the 10.28 step that adds the boot wait to `wp-container`. Nothing else changes until it is used:
+
+- a site whose header was fixed by hand: `doas wp-hardening.sh embeds status` adopts the edit;
+- a Proxmox-backed VM: `doas wasp-offsite-backup.sh hypervisor "<where>"`;
+- a VM whose VLAN cannot reach its own public address: `TLS_CHECK_ADDR=<proxy inside address>` in `vars.sh`, then `doas wp-hardening.sh tls`.
+
+A Hive installed before 10.28 needs `apk add logrotate` and the stanza in `install-hive.sh` (section 6), added by hand.
+
+## 10.27 — The site's mail through the client's own server
+
+Every VM sent all of WordPress's mail through one relay, the operator's, set at install. That suits WASP's alerts, but not a client's contact forms: their enquiries arrived from the operator's address, through the client's own mail filter, which may quarantine mail from a server it does not know. Most clients use Microsoft 365 or Google Workspace, and Microsoft turns password-based SMTP off by default at the end of December 2026.
+
+- **Two paths, decided per message** (`01-wpvm-smtp.php`, now "WASP — Mail Transport"):
+  - **Operator relay, always:** WASP's security alerts (`X-WASP-Alert`), lockout notices (now tagged `X-WASP-Mail: operator`), `wp-mail.sh test`, and the host-side mail (backups, heartbeat, reports). A client changing their mailbox can never silence an alert.
+  - **The client's server, when set up:** everything else WordPress sends, from contact forms (MetForm, Contact Form 7, WPForms, Elementor, WASP's own handler) to password resets and notifications. Without a client server, the relay as before.
+- **Microsoft 365 through Graph.** The message WordPress built (attachments, Reply-To, HTML, Bcc) goes as MIME to `sendMail`, signed in with the client's app registration (client credentials). It uses HTTPS through the egress proxy to two hosts: no SMTP AUTH, no port 25, no firewall pin to drift. README, "Microsoft 365 for the site's mail", gives the admin's steps, including scoping the app to one mailbox with Exchange RBAC for Applications.
+- **SMTP submission** on 587 (STARTTLS) or 465 (TLS) with a mailbox password or app password: Google Workspace, other hosts, Microsoft 365 while its tenant allows SMTP AUTH. Port 25 is refused.
+- **Nothing lost when the client's path fails.** An expired secret, a changed password, Microsoft refusing, or a message over Graph's 4 MB request limit all end the same way: the message goes through the operator relay, From the relay's address, Reply-To still the visitor, marked `X-WASP-Mail-Fallback`. `wp_mail()` still succeeds, so the form shows no error. The reason is logged in one line, without Microsoft's trace lines or the secret.
+- **`wp-mail.sh client`**: `status` (transport, mailbox, secret expiry, egress, recent fallbacks), `setup`, `test <addr>` (a fallback counts as a failure, with the reason), `off`. Settings go in `/home/wpuser/wp/secrets/client-mail.ini`, `0440 root:www-data`, as data with secrets encoded. `setup` adds Microsoft's two hosts (`wasp-egress.sh reconcile`) or re-pins the firewall to the client's SMTP server. Menu: Diagnostics, 13 to 15.
+- **`validate-wordpress.sh`** checks the client settings' permissions and the Microsoft 365 secret's expiry (warning 30 days ahead, failing once expired). It also checks Microsoft's hosts are allowed and warns on a recent fallback.
+- **`wp-hardening.sh smtp-repin`** pins the relay and the client's SMTP server in one rule, and says so when the ruleset has no pinned rule, instead of reporting success.
+- **Fixed in `wp-mail.sh`:**
+  - `setup` changed the relay and left the firewall pinned to the old one, so mail to a new relay was dropped. It now records the host and re-pins.
+  - `log` looked in an undefined folder and always said "not found".
+  - `status` never compared the relay with the firewall pin, because it never read the relay's host.
+  - `setup` died without a terminal on `stty`, and no longer needs `install`, which some BusyBox builds lack.
+- **Tests.**
+  - `test-mail-wordpress.sh` (new, 32 cases) runs on real WordPress through `wp_mail()`, against two SMTP servers speaking STARTTLS and AUTH, with Microsoft's endpoints stood in. It covers each path and sender, Reply-To, envelope, attachment and Bcc through Graph, the fallback on a dead server, a refused send, a bad secret and an oversized message, and a half-written settings file.
+  - `test-smtp-config.sh`, 68 cases: client setup for both transports, port 25 refused, the secret stored exactly and never in the clear, status, test, off, the relay's re-pin, and `smtp-repin` covering both servers.
+  - `test-egress-reconcile.sh`, 43 cases: Microsoft 365 adds its two hosts; SMTP adds none.
+
+### Bringing a VM to 10.27
+
+`doas wasp-upgrade.sh apply`. Nothing changes until `wp-mail.sh client setup` is run: without it every message takes the relay, as before.
+
 ## 10.26 — Upgrades add the egress a VM needs
 
 A field site running Ultimate Addons for Elementor was denied `support.brainstormforce.com` 134 times in a week. The plugin had installed fine and then could not reach its licence and update server, and nothing said so except the proxy log. The same scan reported a tax article as spam because it named a casino among the workplaces where tips are earned.

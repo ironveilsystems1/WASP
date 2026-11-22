@@ -1,6 +1,6 @@
 # WASP — status and open work
 
-*As of 10.26 (2026-11-16).*
+*As of 10.28 (2026-11-21).*
 
 Everything WASP claims sits in one of three evidence categories. They are kept
 apart because they are different promises: a mechanism proven once on hardware
@@ -42,6 +42,14 @@ What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
 | CrowdSec AppSec request inspection (10.13) | `test/test-appsec.sh` | `wasp-appsec.sh on` and `test` on a real VM; its memory recorded over a week; the upstream-LAPI key path, which has never run |
 | WASP Hive installer and install.sh's Hive role | `test/test-hive.py`, `test/test-hive-role.sh` | `install-hive.sh` on a real Alpine VM (community packages resolve, `supervise-daemon` restarts, 443 redirect answers); the Hive role on a real Proxmox host; the Wazuh connector against a real manager |
 | `.wpress` archives in the 7.x format | `test/test-wpress-reader.php` (the plugin's 4.5 archiver and a third-party 7.x builder) | A real 7.x export |
+| Security-header exceptions for embeds, with a report-only mode (10.28) | `test/test-embeds.sh` (WASP's own header file, Apache and the live header stood in), `test/test-csp-report.php` | On a field VM whose footer map and reCAPTCHA were fixed by hand: `embeds status` adopts the edit, `embeds report` shows nothing blocked, and `validate-wordpress.sh` passes |
+| Accepting a reviewed file in the malware scan (10.28) | `test/test-malware-accept.sh` (structural and YARA passes) | The first accepted file on a field VM, and the daily mail quiet until it changes |
+| The vulnerability scan using an older answer when WPVulnerability is busy, refreshing at most 15 per run, and saying whether the update on offer fixes a finding (10.28) | `test/test-vuln-scan.sh` | A week of daily scans on a VM with 30+ plugins and no INCOMPLETE mail from a rate limit |
+| HTTPS checked for both names, the chain and reachability (10.28) | `test/test-tls-check.sh` (a throwaway CA and real TLS on local ports) | The daily check on a field VM with `LOOPBACK_HOSTS`, and on one whose VLAN cannot reach the public address (`TLS_CHECK_ADDR`) |
+| WordPress waits at boot until it could connect (10.28) | `test/test-boot-wait.sh`, including the upgrade step on an older service | A reboot of a field VM, with no "Error establishing a database connection" while MariaDB starts |
+| Offsite copies recorded as the hypervisor's (10.28) | `test/test-offsite-hypervisor.sh` | A Proxmox-backed VM's next backups and weekly report |
+| The Hive's log rotated (10.28) | None: `install-hive.sh` on a real Alpine VM, which has not run (see the Hive row above) | `logrotate -d /etc/logrotate.d/wasp-hive` on the Hive, then a week |
+| The site's mail through the client's own Microsoft 365 or SMTP server, WASP's alerts on the relay (10.27) | `test/test-mail-wordpress.sh` (real WordPress, two STARTTLS SMTP servers, Microsoft's endpoints stood in), `test/test-smtp-config.sh` | A client's real Microsoft 365 tenant: the app scoped to one mailbox, a form enquiry in their inbox and the mailbox's Sent Items, an alert still from the relay |
 | `wasp-egress reconcile` adding a VM's missing egress on upgrade (10.26) | `test/test-egress-reconcile.sh`, `test/test-upgrade.sh` | The next upgrade of a field VM running Ultimate Addons for Elementor: `support.brainstormforce.com` added, its denials stop |
 | `remoteip-fix` repairing a VM provisioned before 10.6 (10.21) | `test/test-remoteip-fix.sh` | The same repair ran by hand on a field VM; the tool's own run waits for the next such VM |
 | A failed second factor with a correct password reaches CrowdSec | None: needs a real Two Factor plugin | Fail a second factor on a VM and look for the event |
@@ -68,13 +76,9 @@ ticked once.
 
 | Item | Why it matters | State |
 |---|---|---|
-| Mark a reviewed file in the malware scan | A plugin's own PHP cache in uploads (MetForm's icon cache, on a field site) is reported CRITICAL every day after it has been reviewed | Planned: `wp-malware-scan.sh accept <file>`, by checksum and reason; reported again if one byte changes |
-| Offsite backups made at the hypervisor | A fleet backed up by Proxmox off-host gets "Off-VM backup is not configured" after every backup | Planned: record that offsite copies are the hypervisor's, so the warning stops and the weekly report says so |
-| TLS certificates are not monitored | TLS ends at the proxy, so nothing on the VM sees a certificate. A missing `www` name on a client site's certificate was found on 2026-11-15 by `wp-links.sh broken`, not by monitoring | A check against the public endpoint is cheap and not yet written |
-| Boot ordering says "started", not "ready" | After a reboot WordPress can show "Error establishing a database connection" for 20–60 s while MariaDB starts | Deferred; the completion banner and support notes say it is expected. Fix: a readiness wait in `wp-container` using `mariadb-health-check.sh` |
+| Google Workspace through the Gmail API | SMTP with an app password works, but Google's servers change addresses and drift out of the firewall pin (the relay takes the mail meanwhile) | Considered: a service account with domain-wide delegation, over HTTPS like Microsoft 365 |
 | Candidate update code still reads live data | The SELECT-only account stops writes, not reads | Design work |
 | The CrowdSec enrolment key is briefly visible in a process list | A local user could read it during install | Depends on whether the installed `cscli` takes the key on stdin |
-| `/var/log/wasp-hive.log` is not rotated | About 1,200 lines a day for 12 VMs; small, but unbounded | A weekly truncate or a `logrotate` stanza |
 | AppSec watchdog margin | A workaround for crowdsecurity/crowdsec#4797 | Remove when CrowdSec 1.8.3 ships the fix and a week's memory holds |
 | Elementor pass of the real-WordPress test is manual | CI runs `test-links-wordpress.sh` without Elementor (19 cases; 20 with) | Run it with `WASP_TEST_ELEMENTOR` before a release that touches the content tools |
 | Historical narrative in long file headers | Slows a first read | Partly: move field stories from headers over ~60 lines to `docs/design-notes.md`, keep decision rationale inline |
