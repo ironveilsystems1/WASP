@@ -103,16 +103,17 @@ collect() {
     _vsrc=$(sed -n 's/^  Sources: //p' "$VULN_REPORT" | head -1)
     _vfind=$(awk '
       /^  \[(CRITICAL|HIGH|MEDIUM|LOW)\] / {
-        if (sev != "") print sev "\t" comp "\t" title "\t" cve
+        if (sev != "") print sev "\t" comp "\t" title "\t" cve "\t" ex
         sev=substr($1, 2, length($1) - 2); comp=$0; sub(/^  \[[A-Z]+\] /, "", comp)
+        ex = sub(/ +ACTIVELY EXPLOITED$/, "", comp) ? "true" : "false"
         title=""; cve=""; n=0; next }
       sev != "" && n < 3 { n++; line=$0; sub(/^ +/, "", line)
         if (n == 1) title=line
         else if (line ~ /^CVE-/) { split(line, a, " "); cve=a[1] } }
-      END { if (sev != "") print sev "\t" comp "\t" title "\t" cve }' "$VULN_REPORT" \
+      END { if (sev != "") print sev "\t" comp "\t" title "\t" cve "\t" ex }' "$VULN_REPORT" \
       | head -100 \
       | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
-                  | {severity: .[0], component: .[1], title: .[2], cve: .[3]})')
+                  | {severity: .[0], component: .[1], title: .[2], cve: .[3], exploited: (.[4] == "true")})')
   fi
 
   # Malware: the last live-site scan.

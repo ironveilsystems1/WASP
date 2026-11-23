@@ -23,6 +23,7 @@ PRUN() {
 HTACCESS="/home/wpuser/wp/htaccess/.htaccess"
 APACHE_CONF="${WASP_APACHE_CONF:-/home/wpuser/wp/apache-conf/wp-security.conf}"
 EMBEDS_STATE="${WASP_EMBEDS_STATE:-/etc/wp-install/embeds}"   # wp-hardening.sh embeds
+HEADERS_STATE="${WASP_HEADERS_STATE:-/etc/wp-install/headers}" # wp-hardening.sh headers
 WP_LOG_DIR="${WP_LOG_DIR:-/home/wpuser/wp/logs}"
 TRIVY_CACHE_DIR="/var/cache/trivy"
 # FORENSIC FIX (new-audit High finding, confirmed accurate): "enable
@@ -108,6 +109,7 @@ show_status() {
   echo "          lynis [run] | disk | disk-check | tls [domain]"
   echo "          embeds [status|allow <what>|deny <what>|add <directive> <origin>|"
   echo "                  remove <directive> <origin>|mode report|enforce|report [hours]|apply]"
+  echo "          headers [status|coop on|off|hotlink on|off|apply|check]"
   echo "          crowdsec-whitelist [list|add <ip>|remove <ip>]"
   echo "          cs-doctor | cs-lapi <url> <login> <password>"
   echo "Proxmox:  qm guest exec <VMID> -- /usr/local/bin/wp-hardening.sh status"
@@ -516,8 +518,197 @@ _embeds() {
   esac
 }
 
+# ── Cross-origin headers: opener isolation and hotlink protection (10.29) ────
+#
+# Two headers the security header does not cover, both written into one block
+# of wp-security.conf that this command owns, from /etc/wp-install/headers:
+#
+#   Cross-Origin-Opener-Policy: same-origin-allow-popups   (coop, on by default)
+#     A page from another site that opens this one in a window or tab loses its
+#     handle on it, so it cannot navigate it or read anything about it. Popups
+#     this site opens itself keep theirs: a PayPal checkout or a "sign in with
+#     Google" window still reports back. `same-origin` would break those.
+#   Cross-Origin-Resource-Policy: same-site, on /wp-content/uploads/   (hotlink, off by default)
+#     Browsers refuse to show the site's uploaded images and files on another
+#     site's pages. Its own www and bare names are the same site. Search
+#     engines and link previews fetch from their servers, not a browser page,
+#     so they are not affected; a newsletter or a second site of the client's
+#     on another domain that shows these images IS. Hence a setting.
+#
+# Neither touches the Content-Security-Policy lines (wp-hardening.sh embeds),
+# and embeds leaves this block alone.
+_HDR_BEGIN="# BEGIN WASP managed headers -- written by wp-hardening.sh headers; change the setting, not these lines"
+_HDR_END="# END WASP managed headers"
+_hdr_get() {  # key default
+  _hv=$(sed -n "s/^${1}=//p" "$HEADERS_STATE" 2>/dev/null | tail -1)
+  case "$_hv" in on|off) echo "$_hv" ;; *) echo "$2" ;; esac
+}
+_hdr_set() {  # key on|off
+  mkdir -p "$(dirname "$HEADERS_STATE")"
+  _t=$(mktemp); grep -v "^${1}=" "$HEADERS_STATE" > "$_t" 2>/dev/null || true
+  echo "${1}=${2}" >> "$_t"; cat "$_t" > "$HEADERS_STATE"; rm -f "$_t"
+}
+_hdr_block() {
+  echo "$_HDR_BEGIN"
+  [ "$(_hdr_get coop on)" = on ] && echo 'Header always set Cross-Origin-Opener-Policy "same-origin-allow-popups"'
+  if [ "$(_hdr_get hotlink off)" = on ]; then
+    echo '<LocationMatch "^/wp-content/uploads/">'
+    echo '    Header always set Cross-Origin-Resource-Policy "same-site"'
+    echo '</LocationMatch>'
+  fi
+  echo "$_HDR_END"
+}
+# What the container serves on a path: the status line and its Cross-Origin-*
+# headers, read from inside it.
+_hdr_live() {
+  PRUN exec --user www-data wordpress php -r '
+    error_reporting(0);
+    $c = stream_context_create(["http" => ["method" => "HEAD", "timeout" => 8, "follow_location" => 0, "ignore_errors" => true]]);
+    @file_get_contents("http://127.0.0.1:80" . $argv[1], false, $c);
+    foreach ((array) $http_response_header as $h) {
+      if (stripos($h, "HTTP/") === 0 || stripos($h, "Cross-Origin-") === 0) { echo $h, "\n"; }
+    }' "$1" 2>/dev/null
+}
+# 0 the live headers match the settings, 1 they differ, 3 the site did not answer.
+_hdr_match() {
+  _lr=$(_hdr_live /); _lu=$(_hdr_live /wp-content/uploads/)
+  printf '%s' "$_lr" | grep -q '^HTTP/' && printf '%s' "$_lu" | grep -q '^HTTP/' || return 3
+  _ok=0
+  if [ "$(_hdr_get coop on)" = on ]; then
+    printf '%s\n' "$_lr" | grep -qi '^Cross-Origin-Opener-Policy: same-origin-allow-popups' || _ok=1
+  else
+    printf '%s\n' "$_lr" | grep -qi '^Cross-Origin-Opener-Policy:' && _ok=1
+  fi
+  if [ "$(_hdr_get hotlink off)" = on ]; then
+    printf '%s\n' "$_lu" | grep -qi '^Cross-Origin-Resource-Policy: same-site' || _ok=1
+  else
+    printf '%s\n' "$_lu" | grep -qi '^Cross-Origin-Resource-Policy:' && _ok=1
+  fi
+  printf '%s\n' "$_lr" | grep -qi '^Cross-Origin-Resource-Policy:' && _ok=1   # only uploads, never pages
+  return "$_ok"
+}
+_hdr_apply() {
+  [ -f "$APACHE_CONF" ] || { echo "✗  ${APACHE_CONF} not found." >&2; return 1; }
+  _nb=$(grep -c '^# BEGIN WASP managed headers' "$APACHE_CONF") || _nb=0
+  _ne=$(grep -c '^# END WASP managed headers' "$APACHE_CONF") || _ne=0
+  if [ "$_nb" != "$_ne" ] || [ "$_nb" -gt 1 ]; then
+    echo "✗  ${APACHE_CONF} has a damaged managed-headers block (${_nb} begin, ${_ne} end lines)." >&2
+    echo "   Nothing was changed. Remove the block's lines by hand, then: doas wp-hardening.sh headers apply" >&2
+    return 1
+  fi
+  _blk=$(mktemp); _hdr_block > "$_blk"
+  _new=$(mktemp)
+  # The block goes after the site-wide Permissions-Policy line, where the other
+  # site-wide headers are; on a file without one, at the end.
+  awk -v blk="$_blk" '
+    /^# BEGIN WASP managed headers/ { skip = 1; next }
+    skip && /^# END WASP managed headers/ { skip = 0; next }
+    skip { next }
+    /<LocationMatch/ { inloc = 1 }
+    /<\/LocationMatch>/ { inloc = 0 }
+    { print }
+    !done && !inloc && /^[[:space:]]*Header[[:space:]]+always[[:space:]]+set[[:space:]]+Permissions-Policy[[:space:]]/ {
+      while ((getline l < blk) > 0) print l; done = 1 }
+    END { if (!done) while ((getline l < blk) > 0) print l }' "$APACHE_CONF" > "$_new"
+  rm -f "$_blk"
+  if cmp -s "$_new" "$APACHE_CONF"; then
+    rm -f "$_new"; echo "  The file already matches these settings."
+  else
+    _bak="${APACHE_CONF}.bak-headers-$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$APACHE_CONF" "$_bak"
+    # In place: the container is given this one file by inode.
+    cat "$_new" > "$APACHE_CONF"; rm -f "$_new"
+    if ! PRUN exec wordpress apache2ctl -t >/dev/null 2>&1; then
+      cat "$_bak" > "$APACHE_CONF"
+      echo "✗  Apache refused the new headers; the previous file is back. Nothing else changed." >&2
+      return 1
+    fi
+    ls -1t "${APACHE_CONF}".bak-headers-* 2>/dev/null | tail -n +6 | while IFS= read -r _o; do rm -f "$_o"; done  # subshell-ok: one line, no counter
+    echo "  ✔  Headers written (previous copy: $(basename "$_bak"))"
+  fi
+  if [ "${_HDR_NO_RESTART:-0}" = 1 ]; then
+    echo "  Not restarted (--no-restart): the change applies at the next restart of WordPress."
+    return 0
+  fi
+  echo "  Restarting WordPress so Apache applies it (10–20 seconds)…"
+  PRUN restart wordpress >/dev/null 2>&1 || { echo "✗  podman restart wordpress failed." >&2; return 1; }
+  _i=0; _mr=3
+  while [ "$_i" -lt 30 ]; do
+    _mr=0; _hdr_match || _mr=$?
+    [ "$_mr" != 3 ] && break
+    _i=$((_i + 1)); sleep 1
+  done
+  case "$_mr" in
+    0) echo "  ✔  The site now serves them." ;;
+    3) echo "  ⚠  Could not read the headers back: the site did not answer within 30 seconds." >&2; return 1 ;;
+    *) echo "  ⚠  The site serves different cross-origin headers than the file holds. Another" >&2
+       echo "     file may set them (an imported .htaccess):" >&2
+       echo "       doas podman exec wordpress grep -rlni Cross-Origin /etc/apache2/ /var/www/html/.htaccess" >&2
+       return 1 ;;
+  esac
+}
+_hdr_status() {
+  echo ""
+  echo "Cross-origin headers"
+  echo "━━━━━━━━━━━━━━━━━━━━"
+  if [ "$(_hdr_get coop on)" = on ]; then
+    echo "  Opener isolation (COOP)   on   another site that opens this one cannot reach into it;"
+    echo "                                 popups this site opens (payment, sign-in) still work"
+  else
+    echo "  Opener isolation (COOP)   off  turn on: doas wp-hardening.sh headers coop on"
+  fi
+  if [ "$(_hdr_get hotlink off)" = on ]; then
+    echo "  Hotlink protection (CORP) on   other sites' pages cannot show this site's uploads"
+  else
+    echo "  Hotlink protection (CORP) off  other sites can show this site's uploaded images"
+    echo "                                 turn on: doas wp-hardening.sh headers hotlink on"
+  fi
+  echo ""
+  _mr=0; _hdr_match || _mr=$?
+  case "$_mr" in
+    0) echo "  The site serves exactly this. ✔" ;;
+    3) echo "  Could not read the live headers (is WordPress running?)." ;;
+    *) echo "  ⚠  The site serves something else:"
+       { _hdr_live /; _hdr_live /wp-content/uploads/; } | grep -i '^Cross-Origin' | sed 's/^/       /'
+       grep -q '^# BEGIN WASP managed headers' "$APACHE_CONF" 2>/dev/null \
+         || echo "     This VM's header file predates them."
+       echo "     Apply the settings:  doas wp-hardening.sh headers apply" ;;
+  esac
+}
+_headers() {
+  _HDR_NO_RESTART=0
+  _a=""; for _x in "$@"; do case "$_x" in --no-restart) _HDR_NO_RESTART=1 ;; *) _a="${_a} ${_x}" ;; esac; done
+  # shellcheck disable=SC2086
+  set -- $_a
+  case "${1:-status}" in
+    status) _hdr_status ;;
+    coop|hotlink)
+      case "${2:-}" in on|off) : ;; *) echo "Usage: wp-hardening.sh headers ${1} on|off" >&2; return 1 ;; esac
+      _hdr_set "$1" "$2"
+      if [ "$1" = hotlink ] && [ "$2" = on ]; then
+        _dom=$(sed -n 's/^WP_DOMAIN=//p' "${WASP_VARS:-/etc/wp-install/vars.sh}" 2>/dev/null | tr -d "\"'" | sed 's/^www\.//')
+        echo "  Hotlink protection: browsers will refuse this site's uploads on any page outside"
+        echo "  ${_dom:-this domain} and its subdomains. A newsletter or another of the client's"
+        echo "  sites, on a different domain, that shows these images will show them broken."
+      fi
+      _hdr_apply ;;
+    apply) _hdr_apply ;;
+    # For validate-wordpress.sh: 0 match, 1 differ, 3 unreadable.
+    check)
+      _what="COOP $(_hdr_get coop on), hotlink protection $(_hdr_get hotlink off)"
+      _mr=0; _hdr_match || _mr=$?
+      case "$_mr" in
+        0) echo "${_what}"; return 0 ;;
+        3) echo "could not read the live headers"; return 3 ;;
+        *) echo "${_what}; the live headers differ"; return 1 ;;
+      esac ;;
+    *) echo "Usage: wp-hardening.sh headers [status|coop on|off|hotlink on|off|apply|check] [--no-restart]" >&2; return 1 ;;
+  esac
+}
+
 case "${1:-status}" in
   embeds) shift; _embeds "$@" ;;
+  headers) shift; _headers "$@" ;;
 
   smtp-repin)
     # Re-resolve the relay and rewrite the SMTP destination rule. Needed when a
@@ -1966,7 +2157,8 @@ SNIPPET2
         # mktemp, not a fixed /tmp name: this runs as root and a predictable
         # path is one a local user can pre-create as a symlink.
         _NFTERR=$(mktemp) || exit 1
-        cp "$_nft" "${_nft}.bak-$(date -u +%Y%m%d%H%M%S)"
+        _nbak="${_nft}.bak-$(date -u +%Y%m%d%H%M%S)-$$"   # restored by name below (10.29)
+        cp "$_nft" "$_nbak"
         # Both places: the input rule and the forward rule. Editing only one
         # leaves the two disagreeing, and the forward rule is the one that
         # actually decides for a published container port.
@@ -1980,7 +2172,7 @@ SNIPPET2
         else
           echo "✗ The edited ruleset does NOT parse — nothing was applied." >&2
           sed 's/^/    /' "$_NFTERR" >&2
-          cp "$(ls -1t ${_nft}.bak-* | head -1)" "$_nft"
+          cp "$_nbak" "$_nft"
           echo "  Restored the previous ruleset." >&2
           exit 1
         fi

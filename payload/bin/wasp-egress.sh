@@ -235,12 +235,19 @@ _squid_reload() {
     && podman exec squid squid -k reconfigure >/dev/null 2>&1
 }
 
+# The previous list, kept before a change. 10.29: restored from the copy this
+# run made, by name. It was "the newest .bak-* by time": two copies made either
+# side of a second boundary carry the same mtime second, and BusyBox's ls -t
+# could then hand back the older one -- restoring the wrong list.
+_BAK=""
+_keep_prev() { _BAK="${RUNTIME}.bak-$(date -u +%s)-$$"; cp "$RUNTIME" "$_BAK"; }
+
 _reload_or_restore() {
   if podman exec squid squid -k parse 2>/dev/null && podman exec squid squid -k reconfigure 2>/dev/null; then
     _ok "Squid reloaded"
   else
     _bad "Squid rejected the configuration — restoring the previous list"
-    cp "$(ls -1t "${RUNTIME}".bak-* | head -1)" "$RUNTIME"; exit 1
+    cp "${_BAK:-$(ls -1t "${RUNTIME}".bak-* | head -1)}" "$RUNTIME"; exit 1
   fi
 }
 
@@ -800,7 +807,7 @@ allow)
   fi
   # Allowed again on purpose: reconcile may keep it from now on.
   if [ -s "$DENIED" ]; then awk -v d="$_dom" '$2!=d' "$DENIED" > "${DENIED}.tmp" && cat "${DENIED}.tmp" > "$DENIED"; rm -f "${DENIED}.tmp"; fi
-  cp "$RUNTIME" "${RUNTIME}.bak-$(date -u +%s)"
+  _keep_prev
   grep -qxF "$_dom" "$RUNTIME" && { echo "Already allowed: ${_dom}"; exit 0; }
   printf '%s\n' "$_dom" >> "$RUNTIME"
   _ok "Allowed permanently: ${_dom}"
@@ -814,7 +821,7 @@ deny)
   _valid_domain "$_dom" || exit 1
   # Temporary entries for it go too: "deny" means not reachable, now.
   _temp_close '*' "$_dom"
-  cp "$RUNTIME" "${RUNTIME}.bak-$(date -u +%s)"
+  _keep_prev
   # BUG FIX (found on a live VM, 2026-10-20): this was
   #   grep -v … > tmp && mv -f tmp "$RUNTIME"
   # and `mv` REPLACES THE INODE. allowlist-runtime.txt is bind-mounted into
@@ -854,7 +861,7 @@ reconcile)
   done
   _adds=$(printf '%s\n' "$_plan" | grep '^add|')
   if [ -z "$_adds" ]; then _ok "Everything WordPress and its installed plugins need is on the allowlist."; exit 0; fi
-  cp "$RUNTIME" "${RUNTIME}.bak-$(date -u +%s)"
+  _keep_prev
   # Appended (>>): the file is bind-mounted into Squid as a single file, and
   # only an in-place write keeps the inode Squid reads.
   {

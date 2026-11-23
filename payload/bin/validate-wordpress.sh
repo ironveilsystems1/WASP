@@ -920,6 +920,21 @@ if [ -f /etc/wp-install/embeds ] && [ -x /usr/local/bin/wp-hardening.sh ]; then
 elif grep -qE 'www\.gstatic\.com|maps\.google\.com|fonts\.googleapis\.com' /home/wpuser/wp/apache-conf/wp-security.conf 2>/dev/null; then
   info "The security header was edited by hand to allow Google embeds; record it as a setting: wp-hardening.sh embeds status"
 fi
+# ── Cross-origin headers (wp-hardening.sh headers, 10.29) ─────────────────
+if [ -x /usr/local/bin/wp-hardening.sh ]; then
+  if grep -q '^# BEGIN WASP managed headers' /home/wpuser/wp/apache-conf/wp-security.conf 2>/dev/null; then
+    _hd_rc=0
+    _hd_out=$(/usr/local/bin/wp-hardening.sh headers check 2>/dev/null) || _hd_rc=$?
+    case "$_hd_rc" in
+      0) pass "Cross-origin headers match their settings (${_hd_out})" ;;
+      1) warn "The live cross-origin headers differ from their settings" "${_hd_out}" \
+              "wp-hardening.sh headers status ; wp-hardening.sh headers apply" ;;
+      *) info "Cross-origin headers not checked: ${_hd_out:-the site did not answer}" ;;
+    esac
+  else
+    info "No opener-isolation header (COOP) yet: wp-hardening.sh headers apply"
+  fi
+fi
 fi
 
 # ── UPDATES ────────────────────────────────────────────────────────────────

@@ -89,8 +89,10 @@ if [ "${1:-}" = "--digest" ]; then
       _attn="${_attn}the vulnerability scan is incomplete; "
     fi
     _vf=$(grep -cE '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\]' "$OUT") || _vf=0
+    _vx=$(grep -cE '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\].*ACTIVELY EXPLOITED' "$OUT") || _vx=0
+    [ "$_vx" -gt 0 ] && _attn="${_attn}${_vx} finding(s) actively exploited in the wild; "
     if [ "$_vf" -gt 0 ]; then
-      printf '  Findings : %s\n' "$_vf"
+      printf '  Findings : %s%s\n' "$_vf" "$([ "$_vx" -gt 0 ] && echo ", ${_vx} ACTIVELY EXPLOITED (CISA KEV)")"
       grep -E -A3 '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\]' "$OUT" | grep -vE '^--$|^  \[NOTICE\]' | sed 's/^/  /'
     else
       printf '  Findings : none matching a disclosed vulnerability\n'
@@ -201,6 +203,9 @@ fi
 if grep -qE '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\]' "$OUT"; then
     _n=$(grep -cE '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\]' "$OUT")
     _c=$(grep -cE '^  \[CRITICAL\]' "$OUT" || true)
+    # 10.29: on CISA's list of vulnerabilities exploited in the wild. They lead
+    # the subject and the body, whatever their severity.
+    _x=$(grep -cE '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\].*ACTIVELY EXPLOITED' "$OUT") || _x=0
     logger -t wp-vulns "vulnerability scan: ${_n} finding(s), ${_c} critical — run: wp-plugins.sh vulns"
     grep -E '^  \[(CRITICAL|HIGH)\]' "$OUT" | while IFS= read -r line; do
         logger -t wp-vulns "  ${line}"
@@ -213,12 +218,19 @@ if grep -qE '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\]' "$OUT"; then
         BODY=$(mktemp)
         {
           printf 'Vulnerable plugins/themes found on this site.\n\n'
+          if [ "$_x" -gt 0 ]; then
+            printf 'ACTIVELY EXPLOITED -- CISA has evidence of attacks using these. Update or\n'
+            printf 'remove them first:\n'
+            grep -E '^  \[(CRITICAL|HIGH|MEDIUM|LOW)\].*ACTIVELY EXPLOITED' "$OUT"
+            printf '\nAll findings:\n'
+          fi
           grep -E '^  \[(CRITICAL|HIGH|MEDIUM)\]' "$OUT"
           printf '\nFull report:  wp-plugins.sh vulns\n'
           printf 'Update:       wp-plugins.sh update-plugins <slug>\n'
         } > "$BODY"
-        /usr/local/bin/wp-notify.sh wp-vulns \
-          "${_c} critical, ${_n} total vulnerability finding(s)" "$BODY"
+        _vs="${_c} critical, ${_n} total vulnerability finding(s)"
+        [ "$_x" -gt 0 ] && _vs="ACTIVELY EXPLOITED: ${_x} -- ${_vs}"
+        /usr/local/bin/wp-notify.sh wp-vulns "$_vs" "$BODY"
         rm -f "$BODY"
     fi
 fi

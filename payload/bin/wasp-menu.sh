@@ -1129,6 +1129,51 @@ EOF
                  2026-11-21 by admin: encoded licence loader".
 EOF
     ;;
+  security.40) _card "40 — Cross-origin headers" <<'EOF'
+  WHAT IT DOES
+    Shows two headers the security header does not cover, whether each is
+    on, and whether the site serves them:
+      Opener isolation (Cross-Origin-Opener-Policy, on by default): another
+      site that opens this one in a window cannot reach into it. Popups this
+      site opens itself — a PayPal checkout, "sign in with Google" — still
+      work.
+      Hotlink protection (Cross-Origin-Resource-Policy on uploads, off by
+      default): see 41.
+
+  WHEN TO USE IT
+    After an upgrade to 10.29 (it adds opener isolation), or when a payment
+    or sign-in popup stops reporting back. To turn opener isolation off:
+      doas wp-hardening.sh headers coop off
+
+  WHAT IT ASKS YOU
+    Nothing. Changes nothing.
+
+  EXAMPLE
+    "Opener isolation (COOP) on … The site serves exactly this. ✔"
+EOF
+    ;;
+  security.41) _card "41 — Hotlink protection on/off" <<'EOF'
+  WHAT IT DOES
+    On: browsers refuse to show this site's uploaded images and files on
+    another site's pages. Its own www and bare names count as the same site.
+    Off: anyone can embed them. Rewrites the managed block of the header
+    file (Apache checks it first; the old file goes back if refused) and
+    restarts WordPress.
+
+  WHEN TO USE IT
+    Another site shows the client's photos straight from this server, using
+    its bandwidth. Search engines and link previews (Facebook, LinkedIn,
+    Slack) fetch from their own servers and are not affected.
+
+  WHAT IT ASKS YOU
+    on or off. Before turning it on: does a newsletter, or another of the
+    client's sites on a different domain, show images from this one? Those
+    would show broken.
+
+  EXAMPLE
+    "✔  Headers written … ✔  The site now serves them."
+EOF
+    ;;
   security.18) _card "18 — Report bans to a central LAPI" <<'EOF'
   WHAT IT DOES
     Points this VM's CrowdSec agent at a shared Local API on another host, so
@@ -1777,6 +1822,19 @@ EOF
     press Enter: the -db.gz and all the zips are taken as ONE site. The set
     is checked first: database present, nothing encrypted, no hostile zip.
 
+  FILES AND DATABASE IN TWO FILES
+    A host that exports site.tar.gz and site.sql.gz apart: put both in the
+    inbox and press Enter (the two are paired), or name the archive and give
+    the dump when asked. From the console:
+      doas wp-import.sh restore site.tar.gz --db site.sql.gz
+    Already extracted without it:  doas wp-import.sh add-db <id> site.sql.gz
+
+  PLUGINS WASP REPLACES
+    Wordfence, login-hiding plugins (WPS Hide Login and the like) and login
+    limiters (Limit Login Attempts) are not imported: WASP's scans, CrowdSec,
+    its login guard and its own login address cover them, and they conflict.
+    Import one anyway:  doas wp-import.sh restore <file> --keep-plugin <slug>
+
   AFTERWARDS
     The archives and the staging copy are deleted once the site is live.
     Quarantined files and the record of what was imported are kept.
@@ -2292,6 +2350,8 @@ menu_security() {
    37) What the header blocked       ${DIM}wp-hardening.sh embeds report${R}
    38) Accept a reviewed scan file   ${DIM}wp-malware-scan.sh accept <file> "why"${R}
    39) Files accepted from scans     ${DIM}wp-malware-scan.sh accepted${R}
+   40) Cross-origin headers          ${DIM}wp-hardening.sh headers status${R}
+   41) Hotlink protection on/off     ${DIM}wp-hardening.sh headers hotlink on|off${R}
     5) Plugin vulnerability scan     ${DIM}wp-plugins.sh vulns${R}
     6) Malware scan (quick)          ${DIM}wp-malware-scan.sh quick${R}
     7) Malware scan (full)           ${DIM}wp-malware-scan.sh full${R}
@@ -2373,6 +2433,19 @@ EOF
             fi
           else _missing wp-malware-scan.sh; fi ;;
       39) _have wp-malware-scan.sh && run "Files accepted from scans" 0 wp-malware-scan.sh accepted || _missing wp-malware-scan.sh ;;
+      40) _have wp-hardening.sh && run "Cross-origin headers" 0 wp-hardening.sh headers status || _missing wp-hardening.sh ;;
+      41) if _have wp-hardening.sh; then
+            echo ""
+            echo "  On: browsers refuse this site's uploads on other sites' pages. Search"
+            echo "  engines and link previews are not affected; a newsletter or another of"
+            echo "  the client's sites, on a different domain, that shows these images is."
+            if ask "Hotlink protection: on or off" _hl; then
+              case "$_hl" in
+                on|off) run "Hotlink protection ${_hl}" 1 wp-hardening.sh headers hotlink "$_hl" ;;
+                *) echo "  Type on or off." ;;
+              esac
+            fi
+          else _missing wp-hardening.sh; fi ;;
       22) _have wp-vuln-cron.sh && run "Weekly security report (sent now)" 0 wp-vuln-cron.sh --digest || _missing wp-vuln-cron.sh ;;
       23) _have wasp-hive-report.sh && run "WASP Hive reporting" 0 wasp-hive-report.sh status || _missing wasp-hive-report.sh ;;
       24) if _have wasp-hive-report.sh; then
@@ -2517,9 +2590,15 @@ EOF
       4) run "Scan staged" 0 wp-import.sh scan ;;
       5) run "Apply import" 1 wp-import.sh apply ;;
       6) echo ""
-         echo "  Blank = the one backup in the inbox (an UpdraftPlus set counts as one)."
+         echo "  Blank = the one backup in the inbox (an UpdraftPlus set counts as one,"
+         echo "  and so do a files archive and its separate .sql.gz)."
          printf '  Archive or set (blank = auto) : '; read -r _f || _f=""
-         if [ -n "$_f" ]; then run "Restore" 1 wp-import.sh restore "$_f"
+         _dbf=""
+         if [ -n "$_f" ]; then
+           printf '  Separate database dump, if any (.sql.gz, blank = none) : '; read -r _dbf || _dbf=""
+         fi
+         if [ -n "$_f" ] && [ -n "$_dbf" ]; then run "Restore" 1 wp-import.sh restore "$_f" --db "$_dbf"
+         elif [ -n "$_f" ]; then run "Restore" 1 wp-import.sh restore "$_f"
          else run "Restore" 1 wp-import.sh restore; fi ;;
       7) run "Import inbox" 0 wp-import.sh list ;;
       8) run "Staged imports" 0 wp-import.sh staged

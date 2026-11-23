@@ -124,6 +124,7 @@ _load_vuln_conf() {
       WORDFENCE_FEED=*)    WORDFENCE_FEED=$_vc_v ;;
       WPVULNERABILITY=*)   WPVULNERABILITY=$_vc_v ;;
       WPV_SKIP=*)          WPV_SKIP=$_vc_v ;;
+      KEV=*)               KEV=$_vc_v ;;
     esac
   done < "$VULN_CONF"
   unset _vc_l _vc_v
@@ -395,6 +396,62 @@ VULN_MAX_AGE_H=72
 
 _incomplete() { printf '%s\n' "$1" >> "$VULN_CACHE/.incomplete.$$"; }
 
+# ── Exploited in the wild: CISA's Known Exploited Vulnerabilities list ───────
+# 10.29. Neither feed above says whether anyone is exploiting a vulnerability,
+# and that is the fact that decides what to update first: a MEDIUM that is
+# being exploited today matters more than a CRITICAL nobody has a working
+# exploit for. CISA publishes the vulnerabilities it has evidence of being
+# exploited, free, as one file (about 1.5 MB, some 1,400 entries). It is
+# downloaded whole, once a day, and matched here, so nothing about this VM is
+# sent anywhere -- like the Wordfence feed. Few WordPress plugins are on it;
+# the ones that are, are the ones attackers are using.
+#
+# Enrichment, not a source: a list that cannot be fetched is said, and the
+# scan is not INCOMPLETE because of it. KEV=0 in vuln-sources.conf turns it off.
+KEV_URL="${KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
+KEV_HOURS=24
+_KEV_NOTE=""; _KEV_AGE=""
+_kev_refresh() {
+  [ "${KEV:-1}" = 1 ] || return 0
+  _kf="$VULN_CACHE/kev.txt"
+  _ka=""
+  if [ -s "$_kf" ]; then
+    _ka=$(( ( $(date +%s) - $(stat -c %Y "$_kf" 2>/dev/null || echo 0) ) / 3600 ))
+    [ "$_ka" -lt "$KEV_HOURS" ] && { _KEV_AGE="$_ka"; return 0; }
+  fi
+  _kc=$(curl -sS --max-time 60 -w '%{http_code}' -o "$VULN_CACHE/kev.json.tmp" "$KEV_URL" 2>/dev/null) || _kc=000
+  # Only an answer that is plainly the list replaces the copy: a portal page,
+  # a truncated download or an empty list would mark nothing, silently.
+  if [ "$_kc" = 200 ] \
+     && jq -e '(.vulnerabilities | type) == "array" and (.vulnerabilities | length) > 100' "$VULN_CACHE/kev.json.tmp" >/dev/null 2>&1 \
+     && jq -r '.vulnerabilities[]
+               | select((.cveID // "") | test("^CVE-[0-9]{4}-[0-9]{4,7}$"))
+               | "\(.cveID)|\(.dateAdded // "" | tostring | .[0:10])|\(.knownRansomwareCampaignUse // "" | tostring)"' \
+          "$VULN_CACHE/kev.json.tmp" > "$_kf.tmp" 2>/dev/null \
+     && [ -s "$_kf.tmp" ]; then
+    mv -f "$_kf.tmp" "$_kf"; _KEV_AGE=0
+  else
+    rm -f "$_kf.tmp"
+    if [ -s "$_kf" ]; then
+      _KEV_AGE="$_ka"
+      [ "$_ka" -gt 168 ] && _KEV_NOTE="CISA's list of exploited vulnerabilities could not be refreshed for ${_ka}h; marked against that copy"
+    else
+      _KEV_NOTE="CISA's list of exploited vulnerabilities could not be downloaded (HTTP ${_kc}); findings are not marked as exploited or not"
+    fi
+  fi
+  rm -f "$VULN_CACHE/kev.json.tmp"
+  return 0
+}
+# CVE text -> "date|ransomware" of the first listed CVE in it, or nothing.
+_kev_match() {
+  [ -s "$VULN_CACHE/kev.txt" ] || return 1
+  for _kid in $(printf '%s' "$1" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,7}'); do
+    _kl=$(grep -F "${_kid}|" "$VULN_CACHE/kev.txt" | head -1)
+    [ -n "$_kl" ] && { printf '%s\n' "${_kl#*|}"; return 0; }
+  done
+  return 1
+}
+
 # Severity unknown is not severity low: LOW is the one band the daily alert drops.
 _sev_label() {  # score letter
   case "${1%%.*}" in
@@ -423,9 +480,22 @@ _finding() {  # slug version title cve score letter unfixed fix
     MEDIUM)        _col="$C_YEL" ;;
     *)             _col="" ;;
   esac
-  printf '  [%s%s%s] %s %s\n' "$_col" "$_lab" "$C_OFF" "$1" "$2"
+  _kx=""; [ -n "$4" ] && _kx=$(_kev_match "$4") || _kx=""
+  if [ -n "$_kx" ]; then
+    # Same first line as every finding, so everything that reads findings
+    # still does; the marker follows it.
+    printf '  [%s%s%s] %s %s   %sACTIVELY EXPLOITED%s\n' "$_col" "$_lab" "$C_OFF" "$1" "$2" "$C_RED" "$C_OFF"
+  else
+    printf '  [%s%s%s] %s %s\n' "$_col" "$_lab" "$C_OFF" "$1" "$2"
+  fi
   printf '        %s\n' "$3"
   [ -n "$4" ] && printf '        %s   cvss %s\n' "$4" "${5:-n/a}"
+  if [ -n "$_kx" ]; then
+    _kd=${_kx%%|*}; _kr=${_kx#*|}
+    printf '        exploited in the wild: on CISA'"'"'s list since %s%s\n' "${_kd:-an unknown date}" \
+      "$([ "$_kr" = Known ] && echo ', used in ransomware campaigns')"
+    echo "$1" >> "$VULN_CACHE/.kev.$$"
+  fi
   if [ "$7" = 1 ]; then
     printf '        NO FIX PUBLISHED: deactivate and delete it, or record the risk\n'
   else
@@ -693,7 +763,7 @@ vuln_scan() {
   rm -f "$VULN_CACHE/.incomplete.$$" "$VULN_CACHE/.seen.$$" "$VULN_CACHE/.hits.$$" \
         "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$" \
         "$VULN_CACHE/.wpv-fetched.$$" "$VULN_CACHE/.wpv-deferred.$$" "$VULN_CACHE/.wpv-stale.$$" \
-        "$VULN_CACHE/.wpv-old.$$" "$VULN_CACHE/.upd.$$" "$VULN_CACHE/.fixable.$$"
+        "$VULN_CACHE/.wpv-old.$$" "$VULN_CACHE/.upd.$$" "$VULN_CACHE/.fixable.$$" "$VULN_CACHE/.kev.$$"
 
   _wf_ok=1
   _wf_refresh || _wf_ok=0
@@ -719,11 +789,14 @@ vuln_scan() {
   if [ "${WPVULNERABILITY:-1}" = 1 ]; then
     _src_list="${_src_list:+${_src_list}, }WPVulnerability (per-component lookups)"
   fi
+  _kev_refresh
+  [ -n "$_KEV_AGE" ] && _src_list="${_src_list:+${_src_list}, }CISA KEV, exploited in the wild (${_KEV_AGE}h old)"
 
   echo ""
   echo "Vulnerability scan — ${_inv_file:+staged }plugins and themes"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Sources: ${_src_list:-none}"
+  [ -n "$_KEV_NOTE" ] && echo "  Note: ${_KEV_NOTE}"
   echo ""
 
   if [ -n "$_inv_file" ]; then
@@ -814,6 +887,12 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
   echo ""
   if [ "${_hits:-0}" -gt 0 ]; then
     echo "  ${_hits} component(s) match a known vulnerability."
+    if [ -s "$VULN_CACHE/.kev.$$" ]; then
+      _kv=$(sort -u "$VULN_CACHE/.kev.$$" | tr '\n' ' ' | sed 's/ *$//')
+      echo "  ACTIVELY EXPLOITED, deal with these first: ${_kv}"
+      echo "    CISA has evidence of attacks using them. Update now, or deactivate and"
+      echo "    delete until a fix exists."
+    fi
     if [ -s "$VULN_CACHE/.fixable.$$" ]; then
       _fx=$(sort -u "$VULN_CACHE/.fixable.$$" | tr '\n' ' ' | sed 's/ *$//')
       echo "  An update available now fixes at least one of them for: ${_fx}"
@@ -849,7 +928,7 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
   rm -f "$VULN_CACHE/.incomplete.$$" "$VULN_CACHE/.seen.$$" "$VULN_CACHE/.hits.$$" \
         "$VULN_CACHE/.wpv-failed.$$" "$VULN_CACHE/.wpv-unknown.$$" "$VULN_CACHE/.wpv-stop.$$" \
         "$VULN_CACHE/.wpv-fetched.$$" "$VULN_CACHE/.wpv-deferred.$$" "$VULN_CACHE/.wpv-stale.$$" \
-        "$VULN_CACHE/.wpv-old.$$" "$VULN_CACHE/.upd.$$" "$VULN_CACHE/.fixable.$$"
+        "$VULN_CACHE/.wpv-old.$$" "$VULN_CACHE/.upd.$$" "$VULN_CACHE/.fixable.$$" "$VULN_CACHE/.kev.$$"
 
   # Licensing obligation of the Wordfence feed, not decoration: MITRE
   # copyright claims must be displayed for MITRE records shown to end users.
@@ -859,6 +938,7 @@ $(_wp theme list --fields=name,version,status --format=csv 2>/dev/null \
     echo "  sourced from MITRE remain (c) MITRE Corporation."
   fi
   [ "${WPVULNERABILITY:-1}" = 1 ] && echo "  Vulnerability data from WPVulnerability."
+  [ -n "$_KEV_AGE" ] && echo "  Exploitation data: CISA Known Exploited Vulnerabilities catalog."
   return "$_end"
 }
 
@@ -1656,6 +1736,7 @@ case "${1:-status}" in
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     printf '  Wordfence Intelligence : %s\n' "$([ -n "${WORDFENCE_API_KEY:-}" ] && echo 'ENABLED (free token, bulk feed v3)' || echo 'NO TOKEN — vulnerability scanning unavailable')"
     printf '  WPVulnerability        : %s\n' "$([ "${WPVULNERABILITY:-1}" = 1 ] && echo 'ENABLED (per-component lookups)' || echo 'off')"
+    printf '  CISA KEV (exploited)   : %s\n' "$([ "${KEV:-1}" = 1 ] && echo 'ENABLED (one list a day, matched here)' || echo 'off')"
     echo ""
     echo "  Wordfence is the primary source: free for personal and commercial"
     echo "  use, and fetched as ONE bulk feed queried locally — so your plugin"
@@ -1666,9 +1747,27 @@ case "${1:-status}" in
     echo "  queried per component, so the provider sees this VM's address and"
     echo "  everything it runs, which is a client's inventory. On by default:"
     echo "    wp-plugins.sh vuln-source wpvulnerability on|off"
-    echo "  Keep a slug on the VM:  WPV_SKIP=\"slug-one slug-two\" in ${VULN_CONF}" ;;
+    echo "  Keep a slug on the VM:  WPV_SKIP=\"slug-one slug-two\" in ${VULN_CONF}"
+    echo ""
+    echo "  CISA's Known Exploited Vulnerabilities list marks a finding that is being"
+    echo "  exploited in the wild. Downloaded whole once a day, so nothing about this"
+    echo "  VM is sent. Off:  wp-plugins.sh vuln-source kev off" ;;
   vuln-source)
-    [ "${2:-}" = wpvulnerability ] || { echo "Usage: wp-plugins.sh vuln-source wpvulnerability on|off" >&2; exit 1; }
+    case "${2:-}" in
+      wpvulnerability) : ;;
+      kev)
+        mkdir -p "$(dirname "$VULN_CONF")"; touch "$VULN_CONF"; chmod 600 "$VULN_CONF"
+        case "${3:-}" in
+          on)  sed -i '/^KEV=/d' "$VULN_CONF"; printf 'KEV=1\n' >> "$VULN_CONF"
+               echo "✔ Findings are marked when CISA lists them as exploited in the wild." ;;
+          off) sed -i '/^KEV=/d' "$VULN_CONF"; printf 'KEV=0\n' >> "$VULN_CONF"
+               rm -f "$VULN_CACHE/kev.txt"
+               echo "✔ CISA's exploited list off: findings are no longer marked." ;;
+          *)   echo "Usage: wp-plugins.sh vuln-source kev on|off" >&2; exit 1 ;;
+        esac
+        exit 0 ;;
+      *) echo "Usage: wp-plugins.sh vuln-source wpvulnerability|kev on|off" >&2; exit 1 ;;
+    esac
     mkdir -p "$(dirname "$VULN_CONF")"
     touch "$VULN_CONF"; chmod 600 "$VULN_CONF"
     case "${3:-}" in

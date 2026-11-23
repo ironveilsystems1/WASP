@@ -7,13 +7,16 @@
 #   wp-import.sh fetch url <url> [sha256]
 #   wp-import.sh list                  what has arrived
 #   wp-import.sh inspect <file>        what is inside it — NOTHING is extracted
-#   wp-import.sh extract <file>        unpack to staging, outside the docroot
+#   wp-import.sh extract <file> [--db <dump>] [--keep-plugin <slug>]
+#                                      unpack to staging, outside the docroot
+#   wp-import.sh add-db <id> <dump>    the database from a separate file
 #   wp-import.sh scan [id]             scan staged files AND the dump
 #   wp-import.sh report [id]           the saved scan report, every file named
 #   wp-import.sh staged                what is currently staged
 #   wp-import.sh apply [id]            normalise, import, re-harden, remediate
 #                [--accept-findings] [--force] [--no-remediate] [--keep-files]
-#   wp-import.sh restore [file|set]    extract, scan and apply in one go; cleans up
+#   wp-import.sh restore [file|set] [--db <dump>] [--keep-plugin <slug>]
+#                                      extract, scan and apply in one go; cleans up
 #   wp-import.sh clean <id> | --all | --stale <days>
 #                                      remove leftover copies of imported sites
 #
@@ -21,6 +24,15 @@
 # is the only thing in the inbox) and every part is taken together.
 #
 # Reads zip, tar.gz, gzip dumps and All-in-One WP Migration .wpress archives.
+#
+# The files and the database in two files (10.30): a host that exports the
+# site's files as site.tar.gz and the database separately as site.sql.gz.
+#   wp-import.sh restore site.tar.gz --db site.sql.gz
+# or, with just those two in the inbox, `wp-import.sh restore` pairs them.
+#
+# Plugins WASP replaces are not imported (10.30): Wordfence, login-hiding
+# plugins (WPS Hide Login and the like) and login limiters (Limit Login
+# Attempts). --keep-plugin <slug> imports one anyway. See _withhold_why.
 #
 # `inspect` is deliberately the first thing built. "Tell me what is in this
 # backup before I touch it" is useful on its own, and it is the only part of
@@ -227,6 +239,117 @@ _cleanup_set() {   # <id>
 # Links and special files in a tree that has already been written. This is the
 # check that does not depend on any listing. It prints a count, and returns
 # non-zero when it could not look, which callers treat as a refusal.
+# ── Plugins WASP replaces, withheld from an import (10.30) ───────────────────
+# Imported, each one either duplicates what the VM already does or works
+# against it: Wordfence's firewall wants an auto_prepend_file in the .user.ini
+# an import withholds, and its scanner and the WASP scans report the same
+# files twice; a login-hiding plugin moves the login to a second address that
+# fights WASP's own (WP_ADMIN_SLUG, reachable only from the admin networks);
+# a login limiter counts the same failures WASP's login guard and CrowdSec
+# already ban on. They are set aside in the staging set, not deleted, and
+# taken out of the imported active_plugins. --keep-plugin <slug> keeps one.
+IMPORT_WITHHOLD="wordfence wps-hide-login rename-wp-login hide-my-wp wp-hide-security-enhancer limit-login-attempts-reloaded limit-login-attempts"
+_withhold_why() {
+  case "$1" in
+    wordfence) echo "WASP's malware and vulnerability scans, CrowdSec and its login guard cover it; its firewall cannot install here" ;;
+    wps-hide-login|rename-wp-login|hide-my-wp|wp-hide-security-enhancer)
+      echo "WASP moves the login to its own address, reachable only from the admin networks; a second rewrite fights it" ;;
+    limit-login-attempts-reloaded|limit-login-attempts)
+      echo "WASP's login guard and CrowdSec already limit and ban failed logins" ;;
+  esac
+}
+# <staging dir> <slugs to keep> -> sets aside every withheld plugin present,
+# recording slug|reason in meta/withheld-plugins.txt
+_withhold_plugins() {
+  _wr=$(_site_root "$1/files")
+  [ -n "$_wr" ] && [ -d "${_wr}/wp-content/plugins" ] || return 0
+  for _ws in $IMPORT_WITHHOLD; do
+    [ -d "${_wr}/wp-content/plugins/${_ws}" ] || continue
+    case " $2 " in *" ${_ws} "*) _note "Kept as asked (--keep-plugin): ${_ws}"; continue ;; esac
+    mkdir -p "$1/withheld/plugins"
+    mv "${_wr}/wp-content/plugins/${_ws}" "$1/withheld/plugins/${_ws}" || continue
+    printf '%s|%s\n' "$_ws" "$(_withhold_why "$_ws")" >> "$1/meta/withheld-plugins.txt"
+  done
+  if [ -s "$1/meta/withheld-plugins.txt" ]; then
+    _hdr "Not imported: plugins WASP replaces"
+    while IFS='|' read -r _ws _ww; do
+      printf '  %-32s %s\n' "$_ws" "$_ww"
+    done < "$1/meta/withheld-plugins.txt"
+    _note "Set aside in $1/withheld/. Import one anyway: --keep-plugin <slug>"
+  fi
+  return 0
+}
+
+# ── The database from a separate file (10.30) ────────────────────────────────
+# <staging dir> <dump file, or its name in the inbox>
+# The archive's own dumps, if it had any, are set aside: a dump named on the
+# command line is the one wanted, and two staged dumps stop the import.
+_add_dump() {
+  _ad="$2"
+  [ -f "$_ad" ] || _ad="${INBOX}/${2}"
+  [ -f "$_ad" ] || { _bad "Database dump not found: $2"; return 1; }
+  _ad=$(_abs "$_ad")
+  case "$_ad" in
+    *.sql|*.sql.gz|*.gz) : ;;
+    *) _bad "$(basename "$_ad"): a database dump is .sql or .sql.gz"; return 1 ;;
+  esac
+  case "$_ad" in *.gz)
+    gzip -t "$_ad" 2>/dev/null || { _bad "$(basename "$_ad") is not a readable gzip. Re-download it."; return 1; }
+    if _is_tar_gz "$_ad"; then
+      _bad "$(basename "$_ad") is a tar archive, not a database dump."
+      _note "The files go first, the dump after --db:  wp-import.sh restore <files.tar.gz> --db <dump.sql.gz>"
+      return 1
+    fi ;;
+  esac
+  _adr() { case "$_ad" in *.gz) gzip -dc "$_ad" 2>/dev/null ;; *) cat "$_ad" ;; esac; }
+  # The first megabyte must read as SQL: mysqldump, mariadb-dump, phpMyAdmin,
+  # Adminer and the backup plugins all start with these.
+  _adn=$(_adr | head -c 1048576 | grep -ciE '^(CREATE TABLE|INSERT INTO|DROP TABLE|LOCK TABLES|SET NAMES|/\*![0-9]+ SET|-- (MySQL|MariaDB) dump|-- (phpMyAdmin|Adminer) SQL Dump)') || _adn=0
+  if [ "${_adn:-0}" = 0 ]; then
+    _bad "$(basename "$_ad") does not read as a SQL dump (no CREATE TABLE or INSERT INTO near the start)."
+    return 1
+  fi
+  _adr | grep -qiE "CREATE TABLE [\`\"']?[a-z0-9_]*options[\`\"']? " \
+    || _warn "$(basename "$_ad") has no options table: a partial export? Its site settings would be missing."
+  _adk=$(( $(stat -c %s "$_ad") / 1024 + 524288 ))
+  _adf=$(df -Pk / | awk 'NR==2{print $4}')
+  [ "${_adf:-0}" -lt "$_adk" ] && { _bad "Not enough disk for the dump."; return 1; }
+  if [ -n "$(ls -A "$1/db" 2>/dev/null)" ]; then
+    mkdir -p "$1/meta/archive-dumps"
+    for _ax in "$1/db"/*; do
+      mv "$_ax" "$1/meta/archive-dumps/" && _note "The archive's own dump set aside, not used: $(basename "$_ax")"
+    done
+  fi
+  cp "$_ad" "$1/db/" || { _bad "Could not copy the dump into staging."; return 1; }
+  printf '%s\n' "$_ad" >> "$1/meta/sources.txt"
+  : > "$1/meta/rescan-needed"
+  _adw=$(_adr | tail -c 4096 | sed -n 's/^-- Dump completed on *//p' | tail -1)
+  _ok "Database: $(basename "$_ad") ($(du -h "$_ad" | cut -f1))${_adw:+, dumped ${_adw}}"
+  _note "File date: $(date -u -r "$_ad" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo '?'). Check it is the backup you mean:"
+  _note "restoring an older dump silently reverts the site to that day."
+  return 0
+}
+
+# A gzipped tar, by its header (the "ustar" magic at byte 257) or, for an old
+# tar without one, by a member it lists. Not by tar's exit status: GNU tar,
+# which stage 08 installs, lists a small gzipped SQL dump as an empty archive
+# and exits 0, so a lone dump.sql.gz was "extracted" as a tar of nothing.
+_is_tar_gz() {
+  [ "$(gzip -dc "$1" 2>/dev/null | head -c 262 | tail -c 5)" = ustar ] && return 0
+  [ -n "$(tar -tzf "$1" 2>/dev/null | head -1)" ]
+}
+
+# A gzip that is a dump, not an archive: for pairing two files in the inbox.
+_is_dump_file() {
+  case "$1" in
+    *.sql) return 0 ;;
+    *.sql.gz) return 0 ;;
+    *.tar.gz|*.tgz) return 1 ;;
+    *.gz) gzip -t "$1" 2>/dev/null && ! _is_tar_gz "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
 _staged_special() {
   _ss=$(find "$1" \( ! -type f ! -type d \) -o \( -type f -links +1 \) 2>/dev/null) || return 1
   [ -n "$_ss" ] || { echo 0; return 0; }
@@ -612,7 +735,7 @@ inspect)
   fi
 
   _is_zip=0
-  if tar -tzf "$_f" >/dev/null 2>&1; then
+  if _is_tar_gz "$_f"; then
     [ "$_fmt" = "unknown" ] && _fmt="tar.gz"
     _listing=$(tar -tzf "$_f" 2>/dev/null)
   elif unzip -l "$_f" >/dev/null 2>&1; then
@@ -732,6 +855,20 @@ DUPEOF
       _ok "No PHP in uploads"
     fi
 
+    # Plugins WASP replaces (10.30): named here, set aside at extract.
+    _whn=""
+    for _ws in $IMPORT_WITHHOLD; do
+      printf '%s\n' "$_listing" | grep -q "wp-content/plugins/${_ws}/" && _whn="${_whn} ${_ws}"
+    done
+    if [ -n "$_whn" ]; then
+      _note "Not imported, WASP covers them:${_whn}  (keep one: --keep-plugin <slug>)"
+    fi
+    _dbin=$(printf '%s\n' "$_listing" | grep -ciE '\.sql(\.gz|\.bz2)?$|-db\.gz$') || _dbin=0
+    if [ "${_dbin:-0}" = 0 ] && ! printf '%s\n' "$_listing" | grep -q 'database\.sql$'; then
+      _note "No database dump inside. If it came as a separate .sql.gz:"
+      _note "  wp-import.sh restore $(basename "$_f") --db <dump.sql.gz>"
+    fi
+
     # PHP renamed so it no longer runs: _x7Qe2k.php -> _x7Qe2k.php.bak. That
     # is what someone does to a file they found and were afraid of. No build
     # process, plugin or backup tool produces names like this, and the one
@@ -810,14 +947,30 @@ DUPEOF
 
 # ── Extract ──────────────────────────────────────────────────────────────────
 extract)
-  _f="${2:-}"
-  [ -n "$_f" ] || { echo "Usage: wp-import.sh extract <file>" >&2; exit 1; }
+  shift
+  _f=""; _xdb=""; _xkeep=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --db) _xdb="${2:-}"; [ -n "$_xdb" ] || { echo "Usage: wp-import.sh extract <file> --db <dump.sql.gz>" >&2; exit 1; }; shift ;;
+      --keep-plugin) [ -n "${2:-}" ] || { echo "Usage: --keep-plugin <slug>" >&2; exit 1; }; _xkeep="${_xkeep} ${2}"; shift ;;
+      -*) _bad "Unknown option: $1"; exit 1 ;;
+      *) _f="$1" ;;
+    esac
+    shift
+  done
+  _arg="$_f"
+  [ -n "$_f" ] || { echo "Usage: wp-import.sh extract <file> [--db <dump>] [--keep-plugin <slug>]" >&2; exit 1; }
   [ -f "$_f" ] || _f="${INBOX}/${_f}"
   # An UpdraftPlus set may be named by its prefix alone.
-  if [ ! -f "$_f" ] && [ -n "$(_updraft_parts "$INBOX" "${2:-}")" ]; then
-    _f=$(_updraft_parts "$INBOX" "$2" | head -1)
+  if [ ! -f "$_f" ] && [ -n "$(_updraft_parts "$INBOX" "$_arg")" ]; then
+    _f=$(_updraft_parts "$INBOX" "$_arg" | head -1)
   fi
-  [ -f "$_f" ] || { _bad "Not found: ${2}"; exit 1; }
+  [ -f "$_f" ] || { _bad "Not found: ${_arg}"; exit 1; }
+  # A dump named with --db is checked before anything is unpacked.
+  if [ -n "$_xdb" ]; then
+    _xd="$_xdb"; [ -f "$_xd" ] || _xd="${INBOX}/${_xdb}"
+    [ -f "$_xd" ] || { _bad "Database dump not found: ${_xdb}"; exit 1; }
+  fi
   _f=$(_abs "$_f")
   _upx=$(_updraft_prefix "$_f")
   _is_wpress=0
@@ -871,7 +1024,7 @@ extract)
   # check that only fires when someone remembers to ask for it is not a
   # control.
   _listing=""; _is_zip=0
-  if tar -tzf "$_f" >/dev/null 2>&1; then
+  if _is_tar_gz "$_f"; then
     _listing=$(tar -tzf "$_f" 2>/dev/null)
   elif unzip -l "$_f" >/dev/null 2>&1; then
     _is_zip=1
@@ -1008,7 +1161,7 @@ extract)
   # inside a client's backup is not something to reproduce faithfully.
   if [ "$_is_wpress" = 1 ]; then
     :
-  elif tar -tzf "$_f" >/dev/null 2>&1; then
+  elif _is_tar_gz "$_f"; then
     tar -xzf "$_f" -C "${_st}/files" --no-same-owner --no-same-permissions 2>/dev/null \
       || { _bad "Extraction failed"; rm -rf "$_st"; exit 1; }
   elif unzip -l "$_f" >/dev/null 2>&1; then
@@ -1083,6 +1236,13 @@ extract)
     \( -name '*.sql' -o -name '*.sql.gz' -o -name '*-db.gz' -o -name '*.sql.bz2' \) \
     -exec mv {} "${_st}/db/" \; 2>/dev/null || true
 
+  _withhold_plugins "$_st" "$_xkeep"
+  [ -z "$_xkeep" ] || printf '%s\n' $_xkeep > "${_st}/meta/kept-plugins.txt"
+  if [ -n "$_xdb" ]; then
+    _hdr "Database from a separate file"
+    _add_dump "$_st" "$_xdb" || { _bad "Nothing staged."; rm -rf "$_st"; exit 1; }
+  fi
+
   _ndumps=$(ls -1 "${_st}/db" 2>/dev/null | grep -c .) || _ndumps=0
   if [ "${_ndumps:-0}" -gt 1 ]; then
     echo ""
@@ -1095,6 +1255,13 @@ extract)
     done
     _note "  Keep the one you want and remove the rest before importing:"
     _note "    rm ${_st}/db/<unwanted>"
+  fi
+  if [ "${_ndumps:-0}" = 0 ] && [ -z "$_xdb" ]; then
+    echo ""
+    _warn "No database dump in this archive: files only."
+    _note "  If the database came as a separate file (a .sql or .sql.gz), add it:"
+    _note "    wp-import.sh add-db ${_id} <dump.sql.gz>"
+    _note "  or start again with both:  wp-import.sh restore $(basename "$_f") --db <dump.sql.gz>"
   fi
 
   _nf=$(find "${_st}/files" -type f 2>/dev/null | grep -c .) || _nf=0
@@ -1175,6 +1342,10 @@ __scan)
   [ -d "$_st" ] || { _bad "No staging directory ${_id}"; exit 1; }
 
   _hdr "Scanning ${_id}"
+  rm -f "${_st}/meta/rescan-needed"
+  if [ -s "${_st}/meta/withheld-plugins.txt" ]; then
+    _note "Not imported, so not scanned: $(cut -d'|' -f1 "${_st}/meta/withheld-plugins.txt" | tr '\n' ' ')(plugins WASP replaces)"
+  fi
   _crit=0; _high=0; _susp=0
   # The verdict at the end is built from these rows: severity, how many, what
   # it is in plain words, and what happens to it.
@@ -1574,6 +1745,11 @@ apply)
   # Refusing outright is wrong: people import compromised sites deliberately,
   # in order to clean them. Proceeding silently defeats the tool. So the gate
   # is graded, and every override is recorded.
+  if [ -e "${_st}/meta/rescan-needed" ]; then
+    _bad "A database dump was added after this set was scanned (or it was never scanned)."
+    _note "wp-import.sh scan ${_id}"
+    exit 1
+  fi
   _last=$(grep "id=${_id}" "${STAGING}/scan-log.txt" 2>/dev/null | tail -1)
   if [ -z "$_last" ]; then
     _bad "This staging set has not been scanned."
@@ -1967,6 +2143,44 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
     done
   fi
 
+  # ── Plugins WASP replaces: out of the imported active_plugins (10.30) ────
+  # Their files were set aside at extract; the imported database still lists
+  # them as active. WordPress would skip a missing plugin quietly, but its
+  # settings screen would say it was deactivated "because of an error".
+  if [ -s "${_st}/meta/withheld-plugins.txt" ] && [ -n "$_dump" ]; then
+    _whs=$(cut -d'|' -f1 "${_st}/meta/withheld-plugins.txt" | tr '\n' ' ')
+    _ap=$(_wp option get active_plugins --format=json --skip-plugins --skip-themes 2>/dev/null)
+    if [ -n "$_ap" ] && command -v jq >/dev/null 2>&1; then
+      _apn=$(printf '%s' "$_ap" | jq -c --arg w "$_whs" \
+               '($w | split(" ") | map(select(length > 0))) as $ws
+                | (if type == "object" then [.[]] else . end)
+                | map(select((split("/")[0]) as $d | ($ws | index($d)) == null))' 2>/dev/null)
+      if [ -n "$_apn" ] && [ "$_apn" != "$(printf '%s' "$_ap" | jq -c 'if type == "object" then [.[]] else . end' 2>/dev/null)" ]; then
+        _wp option update active_plugins "$_apn" --format=json --skip-plugins --skip-themes >/dev/null \
+          && _ok "Not active: ${_whs}(not imported; WASP covers them)" \
+          || _warn "Could not update active_plugins; WordPress will deactivate them itself"
+      fi
+    fi
+    # Wordfence's own tables: its live-traffic and scan tables can be hundreds
+    # of megabytes, and nothing reads them once the plugin is gone. By name,
+    # never by pattern: another plugin's table may also begin "wf".
+    case " $_whs " in *" wordfence "*)
+      _wft=""; _bq=$(printf '\140')   # a backtick, to quote each table name
+      for _t in wfauditevents wfblockediplog wfblocks7 wfconfig wfcrawlers wffilechanges wffilemods \
+                wfhits wfhoover wfissues wfknownfilelist wflivetraffichuman wflocs wflogins \
+                wfls_2fa_secrets wfls_role_counts wfls_settings wfnotifications wfpendingissues \
+                wfreversecache wfsecurityevents wfsnipcache wfstatus wftrafficrates wfwaffailures; do
+        _wft="${_wft}${_wft:+, }${_bq}${_ourpfx}${_t}${_bq}"
+      done
+      if printf 'DROP TABLE IF EXISTS %s;\n' "$_wft" | podman exec -i mariadb sh -c \
+           'exec mariadb -u root -p"$MARIADB_ROOT_PASSWORD" "${WORDPRESS_DB_NAME:-wordpress}"' >/dev/null 2>&1; then
+        _ok "Wordfence's tables removed"
+      else
+        _warn "Wordfence's tables could not be removed (harmless; nothing reads them)"
+      fi ;;
+    esac
+  fi
+
   # ── Two Factor, whatever the source format ───────────────────────────────
   # Any imported database replaces active_plugins, and the enforcement mu-plugin
   # no-ops unless the provider is loaded -- so an import that does not say
@@ -2059,15 +2273,38 @@ SELECT CONCAT('stranded-remaining:', (SELECT COUNT(*) FROM ${_ourpfx}options WHE
 # extract → scan → apply → clean up, stopping where a person has to decide.
 # With nothing named, the one thing in the inbox is used: a single UpdraftPlus
 # set (however many parts) or a single archive. Two or more, and it asks which.
+add-db)
+  _id="${2:-}"; _dbf="${3:-}"
+  [ -n "$_id" ] && [ -n "$_dbf" ] || { echo "Usage: wp-import.sh add-db <id> <dump.sql.gz>   (wp-import.sh staged)" >&2; exit 1; }
+  _st="${STAGING}/${_id}"
+  [ -d "$_st" ] || { _bad "No staging directory ${_id}"; _note "wp-import.sh staged"; exit 1; }
+  if grep -q "id=${_id} " "${STAGING}/import-log.txt" 2>/dev/null; then
+    _bad "${_id} has already been imported. Stage it again with the dump:"
+    _note "  wp-import.sh restore <files archive> --db <dump.sql.gz>"
+    exit 1
+  fi
+  _hdr "Database for ${_id}"
+  _add_dump "$_st" "$_dbf" || exit 1
+  echo ""
+  _note "The dump has not been scanned. Next:  wp-import.sh scan ${_id}"
+  ;;
+
+# The files archive and, with --db, the dump that came separately.
 restore)
   shift
-  _tgt=""; _pass=""
-  for _a in "$@"; do
-    case "$_a" in
-      --accept-findings|--force|--no-remediate|--keep-files) _pass="${_pass} ${_a}" ;;
-      -*) _bad "Unknown option: ${_a}"; exit 1 ;;
-      *) _tgt="$_a" ;;
+  _tgt=""; _pass=""; _xargs=""; _rdb=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --accept-findings|--force|--no-remediate|--keep-files) _pass="${_pass} ${1}" ;;
+      --db) [ -n "${2:-}" ] || { echo "Usage: wp-import.sh restore <files> --db <dump.sql.gz>" >&2; exit 1; }
+            _rdb="$2"; shift ;;
+      --keep-plugin) [ -n "${2:-}" ] || { echo "Usage: --keep-plugin <slug>" >&2; exit 1; }
+            case "$2" in *[!a-z0-9._-]*) _bad "Not a plugin slug: $2"; exit 1 ;; esac
+            _xargs="${_xargs} --keep-plugin ${2}"; shift ;;
+      -*) _bad "Unknown option: ${1}"; exit 1 ;;
+      *) _tgt="$1" ;;
     esac
+    shift
   done
   if [ -z "$_tgt" ]; then
     _cands=$( { _updraft_sets "$INBOX"
@@ -2081,16 +2318,36 @@ restore)
       _bad "Nothing in ${INBOX} to restore."
       _note "  wp-import.sh where     how to get a backup here"
       exit 1
+    elif [ "$_ncand" = 2 ] && [ -z "$_rdb" ]; then
+      # A files archive and a separate dump: the usual export from a host that
+      # does them apart. Paired only when it is unambiguous: one of each.
+      _pa=""; _pd=""
+      for _c in $_cands; do
+        if _is_dump_file "${INBOX}/${_c}"; then _pd="${_pd}${_pd:+ }${_c}"
+        else case "$_c" in *.tar.gz|*.tgz|*.zip) _pa="${_pa}${_pa:+ }${_c}" ;; esac; fi
+      done
+      if [ -n "$_pa" ] && [ -n "$_pd" ] && [ "${_pa#* }" = "$_pa" ] && [ "${_pd#* }" = "$_pd" ]; then
+        _note "Two files in the inbox: ${_pa} (the site's files) and ${_pd} (its database)."
+        _tgt="$_pa"; _rdb="$_pd"
+      else
+        _bad "More than one backup in the inbox — name the one to restore:"
+        printf '%s\n' "$_cands" | sed 's/^/       wp-import.sh restore /'
+        _note "Files and database in two files:  wp-import.sh restore <files> --db <dump.sql.gz>"
+        exit 1
+      fi
     elif [ "$_ncand" -gt 1 ]; then
       _bad "More than one backup in the inbox — name the one to restore:"
       printf '%s\n' "$_cands" | sed 's/^/       wp-import.sh restore /'
+      _note "Files and database in two files:  wp-import.sh restore <files> --db <dump.sql.gz>"
       exit 1
+    else
+      _tgt="$_cands"
     fi
-    _tgt="$_cands"
   fi
 
-  _hdr "Restore: ${_tgt}"
-  sh "$0" extract "$_tgt" || exit $?
+  _hdr "Restore: ${_tgt}${_rdb:+ + ${_rdb}}"
+  # shellcheck disable=SC2086
+  sh "$0" extract "$_tgt" ${_rdb:+--db "$_rdb"} $_xargs || exit $?
   _id=$(cat "${STAGING}/.latest" 2>/dev/null)
   [ -n "$_id" ] || { _bad "Extract did not record a staging set."; exit 1; }
 
@@ -2173,5 +2430,5 @@ clean)
   esac
   ;;
 
-*) sed -n '4,18p' "$0" ;;
+*) sed -n '4,21p' "$0" ;;
 esac
