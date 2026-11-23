@@ -39,6 +39,9 @@ case "\$url" in
   *wordfence.com*)
     [ -f "$T/wf.json" ] || { printf 000; exit 7; }
     cp "$T/wf.json" "\$out"; printf 200; exit 0 ;;
+  *cisa.gov*)
+    [ -f "$T/kev.json" ] || { printf 404; exit 0; }
+    cp "$T/kev.json" "\$out"; printf 200; exit 0 ;;
 esac
 key=\$(printf '%s' "\$url" | sed 's|.*wpvulnerability.net/||; s|/\$||; s|/|-|')
 # A sequence of answers, one per attempt: lets a test say "429, then 200".
@@ -95,7 +98,7 @@ chmod +x "$T/notify.sh" "$T/wp-plugins.sh"
 
 _scan() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/wp-plugins.sh" vulns "$@" 2>&1; }
 _cron() { PATH="$T/bin:${WASP_TEST_TOOLS:+$WASP_TEST_TOOLS:}$PATH" ${WASP_TEST_SH:-sh} "$T/cron.sh" 2>&1; }
-_reset() { rm -rf "$T/cache"/* "$T/cache"/.[a-z]* "$T/wf.json" "$T/api"/* "$T/plugin-updates.csv" "$T/theme-updates.csv"; : > "$T/requests"; : > "$T/notify"; : > "$T/sleeps"; rm -f "$T/syslog" "$T/etc/vuln-sources.conf"; }
+_reset() { rm -rf "$T/cache"/* "$T/cache"/.[a-z]* "$T/wf.json" "$T/kev.json" "$T/api"/* "$T/plugin-updates.csv" "$T/theme-updates.csv"; : > "$T/requests"; : > "$T/notify"; : > "$T/sleeps"; rm -f "$T/syslog" "$T/etc/vuln-sources.conf"; }
 _conf() { printf '%s\n' "$@" > "$T/etc/vuln-sources.conf"; }
 wf() { printf '%s' "$1" > "$T/wf.json"; }
 
@@ -386,6 +389,71 @@ printf '%s\n' "$o" | grep -A4 'WF not fixed' | grep -q 'does NOT fix this one' \
   && _p "...including an inclusive upper bound equal to the update" || _f "wf inclusive" "$o"
 o=$(_scan --inventory "$T/inv.csv" 2>/dev/null)
 _hasnt "a staged inventory does not ask the live site for updates" "$o" "update available now"
+
+echo ""
+echo "── 10.29: exploited in the wild (CISA KEV)"
+# A list of 150 entries, two of them the CVEs below.
+_kev() {  # extra entries as JSON objects
+  {
+    printf '{"title":"CISA Catalog of Known Exploited Vulnerabilities","count":150,"vulnerabilities":['
+    _i=1; while [ "$_i" -le 148 ]; do printf '{"cveID":"CVE-2020-%05d","dateAdded":"2021-11-03","knownRansomwareCampaignUse":"Unknown"},' "$_i"; _i=$((_i+1)); done
+    printf '%s]}' "$1"
+  } > "$T/kev.json"
+}
+_reset; _conf 'WPVULNERABILITY=1'
+_kev '{"cveID":"CVE-2026-7100","dateAdded":"2026-10-01","knownRansomwareCampaignUse":"Known"},{"cveID":"CVE-2026-7300","dateAdded":"2026-09-12","knownRansomwareCampaignUse":"Unknown"}'
+api plugin-elementor 0 "$(vuln 'Exploited RCE' ge 1.0.0 lt 3.5.0 0 CVE-2026-7100 6.4 m),$(vuln 'Not exploited' ge 1.0.0 lt 3.5.0 0 CVE-2026-7200 9.8 c)"
+api plugin-contact-form 0 "$(vuln 'Exploited low' ge 1.0 lt 3.0 0 CVE-2026-7300 3.1 l)"
+o=$(_scan); rc=$?
+printf '%s\n' "$o" | grep -E '^  \[MEDIUM\] elementor 3.0.0 +ACTIVELY EXPLOITED$' >/dev/null \
+  && _p "a MEDIUM on CISA's list: the finding line says ACTIVELY EXPLOITED" || _f "marked" "$o"
+printf '%s\n' "$o" | grep -A4 'Exploited RCE' | grep -q "on CISA's list since 2026-10-01, used in ransomware campaigns" \
+  && _p "with the date it was listed, and ransomware use" || _f "detail" "$o"
+printf '%s\n' "$o" | grep -E '^  \[CRITICAL\] elementor 3.0.0$' >/dev/null && _p "a CRITICAL not on the list is not marked" || _f "unmarked" "$o"
+printf '%s\n' "$o" | grep -A3 'Exploited low' | grep -q 'since 2026-09-12$' && _p "the date alone when no ransomware use is known" || _f "no ransomware" "$o"
+_has "the summary names them first" "$o" "ACTIVELY EXPLOITED, deal with these first: contact-form elementor"
+_has "Sources names the list and its age" "$o" "CISA KEV, exploited in the wild (0h old)"
+[ "$rc" = 0 ] && _p "a complete scan" || _f "rc" "$rc"
+: > "$T/requests"; _scan >/dev/null
+grep -q cisa.gov "$T/requests" && _f "kev cache" "fetched again within a day" || _p "the list is fetched once a day"
+: > "$T/notify"; _cron >/dev/null
+grep -q '^ACTIVELY EXPLOITED: 2 -- 1 critical, 3 total vulnerability finding(s)$' "$T/notify" \
+  && _p "the daily mail's subject leads with them" || _f "subject" "$(head -3 "$T/notify")"
+awk '/^ACTIVELY EXPLOITED -- CISA/ {a=NR} /^All findings:/ {b=NR} END {exit !(a && b && a < b)}' "$T/notify" \
+  && grep -q '^  \[LOW\] contact-form 2.5 *ACTIVELY EXPLOITED' "$T/notify" \
+  && _p "and the body, before all findings, including a LOW one" || _f "body" "$(cat "$T/notify")"
+o=$(_dig --print)
+_has "the weekly report counts them" "$o" "2 ACTIVELY EXPLOITED (CISA KEV)"
+: > "$T/notify"; _dig >/dev/null
+grep -q '^Weekly security report: ATTENTION -- .*2 finding(s) actively exploited in the wild' "$T/notify" \
+  && _p "and says so in its subject" || _f "digest subject" "$(head -2 "$T/notify")"
+
+_reset; _conf 'WPVULNERABILITY=1'
+api plugin-elementor 0 "$(vuln 'Exploited RCE' ge 1.0.0 lt 3.5.0 0 CVE-2026-7100 6.4 m)"
+printf '<html>Service unavailable</html>' > "$T/kev.json"
+o=$(_scan); rc=$?
+[ "$rc" = 0 ] && _p "the list cannot be downloaded: the scan is still complete (it is not a source)" || _f "kev down rc" "exit $rc"
+_has "and says findings are not marked either way" "$o" "findings are not marked as exploited or not"
+_hasnt "nothing is marked" "$o" "ACTIVELY EXPLOITED"
+_kev ''; printf '{"vulnerabilities":[{"cveID":"CVE-2026-7100","dateAdded":"2026-10-01"}]}' > "$T/kev.json"
+o=$(_scan)
+[ ! -s "$T/cache/kev.txt" ] && _p "a list of a handful of entries is refused (a truncated or wrong file)" || _f "short list" "$(cat "$T/cache/kev.txt")"
+_kev '{"cveID":"CVE-2026-7100","dateAdded":"2026-10-01","knownRansomwareCampaignUse":"Unknown"}'; _scan >/dev/null
+touch -d "@$(( $(date +%s) - 30 * 3600 ))" "$T/cache/kev.txt"; printf 'x' > "$T/kev.json"
+o=$(_scan)
+_has "a refresh that fails keeps the day-old copy" "$o" "ACTIVELY EXPLOITED"
+_hasnt "...without a note while it is under a week old" "$o" "could not be refreshed"
+touch -d "@$(( $(date +%s) - 200 * 3600 ))" "$T/cache/kev.txt"
+o=$(_scan)
+_has "over a week old: said" "$o" "could not be refreshed for 200h"
+_reset; _conf 'WPVULNERABILITY=1' 'KEV=0'
+_kev '{"cveID":"CVE-2026-7100","dateAdded":"2026-10-01","knownRansomwareCampaignUse":"Unknown"}'
+api plugin-elementor 0 "$(vuln 'Exploited RCE' ge 1.0.0 lt 3.5.0 0 CVE-2026-7100 6.4 m)"
+o=$(_scan)
+grep -q cisa.gov "$T/requests" && _f "KEV=0" "fetched anyway" || _p "KEV=0: the list is not fetched"
+_hasnt "and nothing is marked" "$o" "ACTIVELY EXPLOITED"
+o=$(PATH="$T/bin:$PATH" ${WASP_TEST_SH:-sh} "$T/wp-plugins.sh" vuln-source kev on 2>&1)
+grep -q '^KEV=1$' "$T/etc/vuln-sources.conf" && ! grep -q '^KEV=0$' "$T/etc/vuln-sources.conf" && _p "vuln-source kev on|off sets it" || _f "vuln-source" "$o"
 
 echo ""
 printf '  passed %d   failed %d\n' "$PASS" "$FAIL"

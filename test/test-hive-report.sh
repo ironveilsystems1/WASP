@@ -56,7 +56,7 @@ printf 'at=%s\nresult=fail\nmodified=2\n' "$((NOW - 86400))" > "$T/vulns/.last-v
 cat > "$T/vulns/last-report.txt" <<'EOF'
 WordPress vulnerability scan
   Sources: Wordfence + WPVulnerability
-  [HIGH] contact-form-x 5.2.1
+  [HIGH] contact-form-x 5.2.1   ACTIVELY EXPLOITED
         Unauthenticated stored XSS
         CVE-2026-10001   cvss 7.2
         fix: 5.2.2
@@ -114,6 +114,8 @@ else
     && _p "WordPress, PHP and MariaDB versions" || _f "versions" "$(_q .versions)"
   [ "$(_q '.vulns.findings | length') $(_q '.vulns.findings[0].severity') $(_q '.vulns.findings[0].cve') $(_q '.vulns.findings[1].cve')" = "2 HIGH CVE-2026-10001 " ] \
     && _p "vulnerabilities parsed from the daily scan's report (with and without a CVE)" || _f "vulns" "$(_q .vulns.findings)"
+  [ "$(_q '.vulns.findings[0].component') $(_q '.vulns.findings[0].exploited') $(_q '.vulns.findings[1].exploited')" = "contact-form-x 5.2.1 true false" ] \
+    && _p "a finding on CISA's exploited list is flagged, and its component kept clean" || _f "exploited" "$(_q .vulns.findings)"
   [ "$(_q '.vulns.result') $(_q '.vulns.sources')" = "complete Wordfence + WPVulnerability" ] \
     && _p "scan result and sources" || _f "vuln meta" "$(_q .vulns)"
   [ "$(_q '[.malware.findings[].severity] | join(",")')" = "CRITICAL,SUSPICIOUS" ] && [ "$(_q '.malware.at')" -gt $((NOW - 1900)) ] \

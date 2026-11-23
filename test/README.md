@@ -52,6 +52,21 @@ which does what:
   `test/test-boot-wait.sh` covers `mariadb-health-check.sh --wait` and the
   service that runs it at boot, new and as the 10.28 upgrade step rewrites an
   older one.
+  `test/test-headers.sh` drives `wp-hardening.sh headers` and the 10.29
+  upgrade step against WASP's own header file under the host shell and
+  BusyBox: the managed block placed, rewritten in place and checked live, each
+  setting adding exactly its lines, a refused configtest or damaged block
+  changing nothing, and `embeds` and `headers` leaving each other's lines
+  alone. `test/check-no-signing-tool.py` fails if the release-signing tool,
+  which stays with the key, is anywhere in the repository. The CISA exploited
+  list is covered in `test/test-vuln-scan.sh`.
+  `test/test-import-separate-db.sh` drives the real `wp-import.sh` with a
+  host-style `site.tar.gz` and `site.sql.gz`, under the host shell and
+  BusyBox: `add-db`, `restore --db`, pairing the two in the inbox, the
+  archive's own dump set aside, the refusals (a tar as the dump, a gzip that
+  is not SQL, a missing file), and Wordfence, WPS Hide Login and Limit Login
+  Attempts set aside, kept out of `active_plugins` and, for Wordfence, its
+  tables dropped; `--keep-plugin` keeps one.
   `test/test-notify.sh` runs the real `--passwordeval` command against a real
   `smtp.ini`, so it checks the password the relay would actually receive.
   `test/test-hive.py` tests the WASP Hive server: TOTP, sessions, throttling,
