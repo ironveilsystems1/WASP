@@ -100,6 +100,8 @@ check was written after a specific defect reached hardware:
 - `test-tls-check.sh` — written after a client certificate without `www` was found by the link checker, and the certificate check turned out to fail silently on any VM with the loopback hosts entry
 - `test-offsite-hypervisor.sh` — written for VMs backed up off-host by Proxmox, which reported a failed off-VM copy after every backup
 - `test-boot-wait.sh` — written when "Error establishing a database connection" after a reboot was still being explained away as expected
+- `test-import-separate-db.sh` — written for hosts that export a site's files and database as two files, which the import could only take by copying the dump into staging by hand
+- `check-no-signing-tool.py` — written so the release-signing tool, which stays with the key, cannot be uploaded with a tree it was run from
 
 Several caught their own class again within days of being written, including
 two mistakes made while writing the fix for the original.

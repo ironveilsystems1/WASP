@@ -7,11 +7,44 @@ value in this document you cannot change without telling every client.
 Everything here runs on your **build machine**. The secret key never goes on a
 Proxmox host and never on a provisioned VM.
 
-**The signing tool is not in this repository.** `wasp-sign-release.sh` only
-ever runs on the machine holding the secret key, so shipping it to every
-deployment added a root-run script nobody there could use. It lives with the
-key. Everything it does is plain `minisign` and `sha256sum`, written out below,
-so a release can be signed and checked without it:
+**The signing tool is not in this repository.** `wasp-sign-release.sh` is the
+operator's tool. It lives with the key and is handed over with a release that
+changes it, never committed or shipped in a release package. A copy dropped
+into a tree to run it would be uploaded with that tree, so:
+
+- the tool refuses to sign or check a tree that contains a copy of itself;
+- `.gitignore` lists its name;
+- `test/check-no-signing-tool.py` fails CI on any file of that name, because
+  a browser upload does not read `.gitignore`.
+
+Run it from the tree's top, from wherever you keep it:
+
+```sh
+~/bin/wasp-sign-release.sh --key ~/.minisign/wasp.key    # build, sign, verify
+~/bin/wasp-sign-release.sh --check                       # before every upload
+```
+
+It needs no root, touches nothing outside the tree, and passes the key file to
+`minisign` without reading it. It refuses:
+
+- a tree with editor backups or compiled Python in it;
+- a manifest that misses any shipped file, `hive/` included;
+- a signature that does not verify against the key pinned in `install.sh`.
+  It then removes the unusable signature.
+
+`--check` signs nothing: it says whether a tree, including one you are about
+to upload, is ready.
+
+The copy used to sign 10.28 predated the WASP Hive. It built its manifest from
+`lib/` and `payload/`, so the signed manifest left out every file under
+`hive/`. VMs upgraded normally, because they check `payload/`, but
+`install-hive.sh` refused the release and CI failed. Because the tool lives
+outside the tree, the set is enforced from inside it as well:
+`check-manifest-coverage.py` on every push, and the signature job on main,
+which compares the signed manifest with the tree.
+
+Everything it does is plain `minisign` and `sha256sum`, written out below, so a
+release can be signed and checked without it:
 
 ```sh
 minisign -G -p ~/.minisign/wasp.pub -s ~/.minisign/wasp.key    # once, ever
@@ -133,7 +166,7 @@ BUSYBOX=/path/to/busybox test/run-all-checks.sh     # 2.
 { printf '%s\n' install.sh; find lib payload hive -type f ! -path '*/__pycache__/*' | LC_ALL=C sort; } \
   | xargs sha256sum > MANIFEST.sha256   # 4.
 minisign -Sm MANIFEST.sha256 -s ~/.minisign/wasp.key \
-  -t "WASP 10.28 — signed $(date -u +%Y-%m-%dT%H:%M:%SZ) — $(git rev-parse --short HEAD)"   # 5.
+  -t "WASP 10.30 — signed $(date -u +%Y-%m-%dT%H:%M:%SZ) — $(git rev-parse --short HEAD)"   # 5.
 ```
 
 In order, and the order is the point:
@@ -147,13 +180,15 @@ In order, and the order is the point:
 3. **The public key is already in `install.sh`**, as the default of
    `WASP_PUBKEY`. Only a key rotation changes it, and then it must change
    *before* step 4.
-4. **`MANIFEST.sha256`** over `install.sh` and every file under `lib/` and
-   `payload/`, sorted, with no extension filter. That is the set
-   `check-manifest-coverage.py` enforces.
+4. **`MANIFEST.sha256`** over `install.sh` and every file under `lib/`,
+   `payload/` and `hive/`, sorted, with no extension filter. That is the set
+   `check-manifest-coverage.py` enforces, and the one
+   `wasp-sign-release.sh` builds. Leave out `hive/` and the Hive
+   installer refuses the release.
 5. **The signature**, with a trusted comment naming the version and commit.
 6. **Verify exactly as `install.sh` does** — the next section.
 
-Any change to `install.sh`, `lib/` or `payload/` after step 4 — a version
+Any change to `install.sh`, `lib/`, `payload/` or `hive/` after step 4 — a version
 bump, a comment — means steps 4 and 5 again. A web upload of new files without
 a new `.minisig` publishes a release that every install refuses, which is the
 check working.

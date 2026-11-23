@@ -146,7 +146,7 @@ existing clones keep working, but new installs should use the current URL rather
 than rely on a redirect that is a courtesy and not a guarantee.
 
 **There is one version number.** `WASP_RELEASE` and `WASP_VERSION` carry the
-same value — currently `10.28` — and both exist only because the codebase
+same value — currently `10.30` — and both exist only because the codebase
 references each. It appears in the install banner and in
 `/etc/wp-install/vars.sh`, and it is what you quote on a change ticket.
 
@@ -231,6 +231,54 @@ inbox. An UpdraftPlus set counts as one backup however many files it has. With
 two or more backups there, it lists them and asks which. Once the site is
 live, the archives and the staging copy are deleted (see *Cleaning up*). The
 sections below are the same pipeline one step at a time.
+
+### Files and database in two files
+
+Many hosts and control panels export a site as two files: the files as
+`site.tar.gz` (or `.zip`) and the database as `site.sql.gz` (or `.sql`).
+`restore` takes both (10.30):
+
+```sh
+doas wp-import.sh restore site.tar.gz --db site.sql.gz
+doas wp-import.sh restore              # with just those two in the inbox: paired, and said
+doas wp-import.sh add-db <id> site.sql.gz   # a set already extracted without its database
+```
+
+- The dump is checked before anything is unpacked. It must be a readable
+  gzip or plain `.sql`, must not be a tar archive, and its first megabyte must
+  read as SQL (`CREATE TABLE`, `INSERT INTO`, a mysqldump or phpMyAdmin
+  header). A dump with no options table is warned about, since the site's
+  settings would be missing.
+- The dump's own "Dump completed on" date and the file's date are shown,
+  because restoring an older dump silently reverts the site to that day.
+- If the archive held dumps of its own, they are set aside in
+  `meta/archive-dumps/`. The one named with `--db` is the one used, and the
+  several-dumps refusal does not fire.
+- A dump added with `add-db` makes the set unscanned again: `apply` refuses
+  until `scan` has read it.
+- Both files leave the inbox after a successful import, as one backup does.
+- `extract` and `inspect` say when an archive holds no dump, and print the
+  `--db` command.
+
+Two archives and one dump in the inbox are not guessed between: name them.
+
+### Plugins WASP replaces are not imported
+
+An import leaves these out (10.30), because WASP already does their job, and
+imported they work against it:
+
+| Plugin | Slugs | What covers it on WASP |
+|---|---|---|
+| Wordfence | `wordfence` | The malware and vulnerability scans, CrowdSec (with optional AppSec) and the login guard. Its firewall needs an `auto_prepend_file` in the `.user.ini` an import withholds, and its scanner reports the same files the WASP scans do. |
+| Login-hiding plugins | `wps-hide-login`, `rename-wp-login`, `hide-my-wp`, `wp-hide-security-enhancer` | WASP's own login address (`WP_ADMIN_SLUG`), reachable only from the admin networks. A second login rewrite fights it. |
+| Login limiters | `limit-login-attempts-reloaded`, `limit-login-attempts` | The login guard and CrowdSec, which already limit and ban failed logins. |
+
+At extract they are set aside in the staging set's `withheld/`, not deleted,
+and the reason is printed. They are not scanned and not copied. After the
+database is imported they are taken out of `active_plugins`, and Wordfence's
+own tables (its live traffic and scan records, which can be hundreds of MB) are
+dropped by name, never by pattern. `inspect` names them too. To import one
+anyway: `--keep-plugin <slug>` on `extract` or `restore`.
 
 ### UpdraftPlus backups
 
@@ -2135,6 +2183,7 @@ Without a token, `wp-plugins.sh status` (update availability) still works — yo
 - **No answer, and no earlier one,** makes the scan **INCOMPLETE**, which is never shown as clean. A rate limit (429), a timeout or a 5xx is retried twice — after `Retry-After` when the server sends one, otherwise after 5 and then 15 seconds, capped at 60 — before it counts. Only a 429 that survives every try stops the run asking.
 - **No answer this run, but an earlier one** (10.28): the component is checked against the cached answer and the scan says how old it is ("checked against WPVulnerability's answer from up to 20h ago"). Up to 72 hours old this is not a gap, and the scan stays complete. Older than that, the answer is still checked, since old bugs are still bugs, and the scan is INCOMPLETE ("has not answered for over 72h"). Before 10.28 a refusal made the component failed even with yesterday's answer on disk, so a busy service turned into an INCOMPLETE mail.
 - **Answers expire at different times.** Each is refreshed after 12 to 17 hours, the extra fixed per component by its name, and at most 15 are refreshed in one run (`WPV_REFRESH_MAX`). The rest are used as they are and refreshed on a later run; a component with no answer at all is always asked. Every answer used to be fetched in the same minute and expire in the same minute, so the daily run asked for all of them at once, which is what a rate limit refuses.
+- **Exploited in the wild** (10.29). CISA publishes the vulnerabilities it has evidence of attackers using, the Known Exploited Vulnerabilities catalog, as one free file. It is downloaded whole once a day and matched on the VM, so nothing about the VM is sent. A finding whose CVE is on it carries `ACTIVELY EXPLOITED` on its first line, with the date it was listed and whether it is used in ransomware. The scan's summary names those components first, the daily mail's subject leads with them ("ACTIVELY EXPLOITED: 1 -- 0 critical, 3 total…"), its body lists them before everything else whatever their severity, the weekly report counts them in its subject, and the WASP Hive marks them. A list that cannot be downloaded is said, and is not a gap in the scan: it marks findings, it does not find them. Turn it off with `wp-plugins.sh vuln-source kev off`.
 - **Does the update on offer fix it?** On the live site each finding says, from the version WordPress would install: "update available now: 3.6.0 fixes this", or "the update available now (3.6.0) does NOT fix this one". The summary names the plugins an update fixes now. That was "update" for every finding, including the ones the newest release still has.
 
 ```sh
@@ -2978,6 +3027,24 @@ Each change rewrites the public and wp-admin lines of `wp-security.conf` togethe
 **Not sure what a site needs?** `embeds mode report` sends the policy as `Content-Security-Policy-Report-Only`. Nothing is blocked, and each page view that would have been blocked sends a report to the `08-wasp-csp-report.php` mu-plugin. That logs one line per report: the directive, the blocked origin (scheme and host only) and the page's path. It logs no visitor address, no query string and none of the code sample a browser may send, at most 300 lines an hour. `embeds report` groups those lines by host, names the service to allow, or prints the exact `embeds add` line. Browse the site, read the report, allow what it names, then `embeds mode enforce`. The enforcing header carries the same report address, so a later blocked embed shows up there as well.
 
 `validate-wordpress.sh` checks that the live header matches the setting, warns while report-only mode is on, and says so when a Google embed was added by hand without the setting. Menu: Security, 35 to 37.
+
+#### Opener isolation and hotlink protection
+
+Two headers the security header does not cover, kept in `/etc/wp-install/headers` and written into one marked block of `wp-security.conf` (10.29):
+
+| Header | Default | What it does |
+|---|---|---|
+| `Cross-Origin-Opener-Policy: same-origin-allow-popups` | on | Another site that opens this one in a window or tab loses its handle on it, so it cannot steer or probe the page. Popups this site opens itself keep theirs, so a PayPal checkout or a "sign in with Google" window still reports back. `same-origin` would break those. |
+| `Cross-Origin-Resource-Policy: same-site`, on `/wp-content/uploads/` only | off | **Hotlink protection.** Browsers refuse to show the site's uploaded images and files on another site's pages; the site's own www and bare names are the same site. Search engines and link previews (Facebook, LinkedIn, Slack) fetch from their own servers, so they are not affected. A newsletter, or another of the client's sites on a different domain, that shows these images is, which is why it is a setting. |
+
+```sh
+doas wp-hardening.sh headers                 # what is on, and does the site serve it?
+doas wp-hardening.sh headers hotlink on|off
+doas wp-hardening.sh headers coop on|off
+doas wp-hardening.sh headers apply           # rewrite the block from the settings
+```
+
+Each change rewrites only that block, in place, and keeps the previous file. Apache must accept it or the old file goes back. Then WordPress restarts and the live headers are read back. `embeds` leaves the block alone, and `headers` leaves the CSP lines alone. New builds have the block with opener isolation on; the 10.29 upgrade step adds it to older VMs. `validate-wordpress.sh` checks the live headers against the settings. Menu: Security, 40 and 41.
 
 #### `security.txt`
 
@@ -4029,6 +4096,8 @@ Full notes for every fix live in **`CHANGELOG.md`** (this used to be the script'
 
 | Version(s) | Theme |
 |---|---|
+| 10.30 | **Imports from two files; no redundant security plugins.** `wp-import.sh restore site.tar.gz --db site.sql.gz` (or both in the inbox, paired), and `add-db` for a set already extracted; Wordfence, login-hiding plugins and login limiters are not imported (`--keep-plugin` keeps one), are taken out of `active_plugins`, and Wordfence's tables are dropped; a small gzipped dump is no longer taken for an empty tar archive; the release-signing tool stays out of the repository, and refuses to sign a tree that contains a copy of itself |
+| 10.29 | **Exploited first; a signed release that covers the Hive.** Findings on CISA's list of vulnerabilities exploited in the wild are marked and lead the scan, the daily mail, the weekly report and the Hive; opener isolation (COOP) on by default and hotlink protection as a setting (`wp-hardening.sh headers`); the release-signing tool (kept with the key, not in this repository) builds a manifest that covers `hive/`, and the signature job on main checks that it does |
 | 10.28 | **Fewer false alarms, more of the real ones.** Maps, reCAPTCHA, fonts and videos are allowed in the security header as a setting, with a report-only mode that says what a site needs (`wp-hardening.sh embeds`); a reviewed file is accepted by checksum and reported again the moment it changes (`wp-malware-scan.sh accept`); a busy WPVulnerability means yesterday's answer, said, not INCOMPLETE, and findings say whether the update on offer fixes them; the HTTPS check covers www, the chain and an unreachable site, and asks DNS; WordPress waits at boot until it could connect; offsite copies can be recorded as the hypervisor's; the Hive's log is rotated |
 | 10.27 | **The site's mail through the client's own server.** WASP's alerts stay on the operator relay; contact forms, password resets and notifications can go through the client's Microsoft 365 (Graph over HTTPS, no SMTP AUTH, no port 25) or their SMTP server on 587/465 (`wp-mail.sh client setup`). If the client's path fails, the message goes through the relay instead, Reply-To kept, and the reason is logged. `wp-mail.sh setup` now re-pins the firewall to a new relay, and `wp-mail.sh log` reads the right folder |
 | 10.26 | **Upgrades add the egress a VM needs.** `wasp-upgrade.sh apply` adds WordPress's update servers and the licence server of each commercial plugin or theme installed on the VM when the allowlist lacks them (`wasp-egress reconcile`), only adding, never re-adding what `deny` removed; `check` lists them. One spam word in ordinary writing (an article naming a casino once) is no longer spam; short, hidden or Sheets-pasted wording still is |

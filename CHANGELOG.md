@@ -6,6 +6,74 @@ this restructuring keeps that scheme rather than switching to SemVer, so
 existing references in the field (support tickets, internal docs) still
 resolve.
 
+## 10.30 — Imports from two files; no redundant security plugins
+
+- **The files and the database in two files.** Many hosts and control panels export a site as `site.tar.gz` (or `.zip`) and `site.sql.gz` (or `.sql`). The import only took one file, so the dump had to be copied into the staging set by hand.
+  - `wp-import.sh restore site.tar.gz --db site.sql.gz` and `extract … --db …` take both.
+  - `restore` with just those two in the inbox pairs them, and says so. It does not guess between two archives and one dump.
+  - `wp-import.sh add-db <id> <dump>` adds the database to a set already extracted. The set then counts as unscanned until `scan` reads it again, and `apply` refuses in between.
+  - The dump is checked before anything is unpacked: a readable gzip or plain `.sql`, not a tar archive, and SQL in its first megabyte. A dump with no options table is warned about.
+  - The dump's "Dump completed on" date and the file's date are shown.
+  - An archive's own dumps are set aside in `meta/archive-dumps/`, so the one named is used and the several-dumps refusal does not fire.
+  - The dump is recorded as a source of the set, so clean-up removes it from the inbox with the archive.
+  - `extract` and `inspect` say when an archive holds no dump, with the `--db` command.
+  - The Import menu's Restore asks for a separate dump when an archive is named.
+- **Plugins WASP replaces are not imported.** Wordfence (`wordfence`), login-hiding plugins (`wps-hide-login`, `rename-wp-login`, `hide-my-wp`, `wp-hide-security-enhancer`) and login limiters (`limit-login-attempts-reloaded`, `limit-login-attempts`):
+  - WASP's scans, CrowdSec, its login guard and its own admin-only login address cover them. Imported, they conflict: Wordfence's firewall wants the `.user.ini` an import withholds, and a second login rewrite fights WASP's.
+  - They are set aside at extract in `withheld/`, with the reason printed, so they are not scanned and not copied.
+  - After the database is imported they are taken out of `active_plugins`. Wordfence's own tables are dropped, by name and never by pattern: its live-traffic and scan tables can be hundreds of MB.
+  - `inspect` names them. `--keep-plugin <slug>` on `extract` or `restore` imports one anyway, and is checked to be a slug.
+- **A small gzipped dump is no longer taken for an empty tar archive.** GNU tar, which stage 08 installs on every VM, lists a gzipped SQL file under a few kilobytes as an empty archive and exits 0. So `extract dump.sql.gz` "extracted" nothing and found no database. Archives are now recognised by the tar header (`ustar` at byte 257), or a member listed, in extract, inspect and the new dump checks.
+- **The release-signing tool stays out of the public repository.** It is the operator's tool and lives with the key. It is handed over separately and never committed or shipped in a release package.
+  - It refuses to sign or check a tree that contains a copy of itself, anywhere. That is the copy dropped into a tree to run it, which a browser upload would publish.
+  - `.gitignore` lists its name, and `check-no-signing-tool.py` fails CI on any file of that name.
+  - With no directory named, it uses the current directory (it had looked above its own folder, which only suited `tools/`).
+  - The CI signature job checks the manifest's coverage inline instead of through the tool.
+- **Tests.** New: `test-import-separate-db.sh` (26 cases, host shell and BusyBox). The UpdraftPlus, `.wpress`, findings and source import tests pass unchanged.
+
+### Bringing a VM to 10.30
+
+`doas wasp-upgrade.sh apply`. Nothing changes until the next import.
+
+## 10.29 — Exploited first; a signed release that covers the Hive
+
+- **The 10.28 release manifest left out `hive/`.** It was signed with a manifest built from `lib/` and `payload/` only, by a copy of the signing script that lived with the key and predated the Hive. VMs upgraded normally, because `wasp-upgrade.sh` checks `payload/`. `install-hive.sh` refused the release ("The signed manifest does not cover hive/"), and both CI jobs failed on `check-manifest-coverage.py`. Nothing on a VM was affected.
+  - **A new release-signing tool, `wasp-sign-release.sh`**, handed over with this release and kept with the key, not in the repository (see 10.30). It builds `MANIFEST.sha256` from `install.sh`, `lib/`, `payload/` and `hive/`, signs it, and verifies it as a VM does against the key pinned in `install.sh`. It removes a signature that does not verify.
+  - It refuses a tree with editor backups or compiled Python in it, and a manifest that misses a shipped file. It says what changed against the previous manifest ("9 file(s) added").
+  - `--check` signs nothing and says whether a tree is ready to upload. `--manifest-only` builds the manifest without a key. It needs no root and passes the key file to `minisign` without reading it.
+  - CI's signature job on main now also compares the signed manifest with the tree, so a signed manifest that misses files fails there by name.
+  - SIGNING.md and STACK-DESIGN.md now name `hive/` in the signed set.
+- **Exploited in the wild** (CISA's Known Exploited Vulnerabilities catalog):
+  - The catalog is one free file, downloaded whole once a day (about 1.5 MB) and matched on the VM, so nothing about the VM is sent. Only an answer that is plainly the list (over 100 entries) replaces the copy.
+  - A finding whose CVE is on it says `ACTIVELY EXPLOITED` on its first line, with the date it was listed and any known ransomware use. The first line keeps its shape, so everything that reads findings still does.
+  - The scan's summary names those components first. The daily mail's subject leads with them ("ACTIVELY EXPLOITED: 2 -- 1 critical, 3 total vulnerability finding(s)"), and its body lists them before all findings, a LOW one included.
+  - The weekly report counts them and puts them in its ATTENTION subject. The WASP Hive receives `exploited` per finding and marks it.
+  - A list that cannot be downloaded is said and does not make the scan INCOMPLETE: it marks findings, it does not find them. A copy over a week old is said.
+  - `KEV=0` in `vuln-sources.conf`, or `wp-plugins.sh vuln-source kev off`, turns it off. `vuln-sources` lists it.
+- **Opener isolation and hotlink protection** (`wp-hardening.sh headers`):
+  - Two headers written into one marked block of `wp-security.conf` from `/etc/wp-install/headers`.
+  - `Cross-Origin-Opener-Policy: same-origin-allow-popups` is on by default. Another site that opens this one cannot reach into it, while popups this site opens (payment, sign-in) still work.
+  - `Cross-Origin-Resource-Policy: same-site` on `/wp-content/uploads/` is hotlink protection, off by default. Browsers refuse the site's uploads on other sites' pages; search engines and link previews are not affected. Turning it on says what it breaks, naming the domain.
+  - Each change rewrites only the block, in place, keeping five copies. Apache must accept it, then WordPress restarts and the live headers are read back.
+  - `embeds` and `headers` leave each other's lines alone. `validate-wordpress.sh` checks the live headers. New builds have the block with COOP on.
+  - The **10.29 upgrade step** adds the block to an older VM's file, which restarts WordPress once (10 to 20 seconds). Menu: Security, 40 and 41.
+- **A failed change restores the right file.** `wasp-egress.sh` (allow, deny, reconcile) and `wp-hardening.sh web-allow` put the previous file back when Squid or nft refuses a change. They restored "the newest backup by time", and two backups made either side of a second boundary carry the same mtime second, so BusyBox's `ls -t` could pick the older one. That restored the wrong list. Each run now restores the copy it made, by name. Found by one flaky run of `test-egress-reconcile.sh` under BusyBox.
+- **Tests.**
+  - New: `test-headers.sh` (54 cases, host shell and BusyBox, the upgrade step included). The signing tool's own test (real minisign with a throwaway key, including the 10.28 manifest refused by `--check`) is kept with the tool.
+  - `test-vuln-scan.sh` is now 114 cases (the exploited list: marking, mail, digest, a failed or truncated download, a stale copy, turned off). `test-hive-report.sh` is now 35.
+
+### Bringing a VM to 10.29
+
+`doas wasp-upgrade.sh apply`. The upgrade step adds opener isolation to the site's headers and restarts WordPress once. Then:
+
+- check the headers with `doas wp-hardening.sh headers`;
+- if a site's images are being shown elsewhere, turn on hotlink protection with `doas wp-hardening.sh headers hotlink on`;
+- the first `wp-plugins.sh vulns` downloads CISA's list. It goes out from the VM itself on 443 to www.cisa.gov, like the Wordfence feed, so it needs no egress entry.
+
+### Signing this release
+
+`wasp-sign-release.sh --key ~/.minisign/wasp.key` from the tree's top (the tool kept outside the tree), then `--check`, then upload the tree, including `MANIFEST.sha256`, `MANIFEST.sha256.minisig`, `.github/workflows/checks.yml` and `.gitignore`.
+
 ## 10.28 — Fewer false alarms, more of the real ones
 
 Field work after 10.27 kept finding the same two problems. Some alarms were false and repeated until nobody read them: a reviewed file was CRITICAL every day, a busy vulnerability service made the scan INCOMPLETE, and a VM backed up by Proxmox reported a failed off-VM copy after every backup. Some real problems raised no alarm at all: a footer map and a contact form broken by the security header, a certificate without `www`, and a certificate check that could not connect and said nothing.

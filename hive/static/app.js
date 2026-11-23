@@ -310,7 +310,11 @@
       ["Result", h("span", { class: v.result === "complete" ? "good" : "bad", text: v.result || "unknown" })],
       ["Sources", v.sources || "–"]]);
     return [top, h("div", { class: "spacer" }), table(["Severity", "Component", "Vulnerability", "CVE"],
-      f.map(function (x) { return [sevSpan(x.severity), x.component, x.title, x.cve]; }), "No known vulnerability in installed versions.")];
+      f.map(function (x) {
+        // 10.29: on CISA's list of vulnerabilities exploited in the wild.
+        var c = x.exploited ? h("span", { class: "bad", text: x.component + " — actively exploited" }) : x.component;
+        return [sevSpan(x.severity), c, x.title, x.cve];
+      }), "No known vulnerability in installed versions.")];
   }
   function malwarePanel(m) {
     var f = m.findings || [];

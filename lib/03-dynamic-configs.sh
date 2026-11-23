@@ -986,6 +986,9 @@ Header always unset X-Powered-By
 # (inline critical CSS, small inline scripts) than eval() is.
 Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; frame-ancestors 'self'"
 Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+# BEGIN WASP managed headers -- written by wp-hardening.sh headers; change the setting, not these lines
+Header always set Cross-Origin-Opener-Policy "same-origin-allow-popups"
+# END WASP managed headers
 <LocationMatch "^/(wp-admin/|wp-login\.php)">
     Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; frame-ancestors 'self'"
 </LocationMatch>

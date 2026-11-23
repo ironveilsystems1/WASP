@@ -1,6 +1,6 @@
 # WASP — status and open work
 
-*As of 10.28 (2026-11-21).*
+*As of 10.30 (2026-11-22).*
 
 Everything WASP claims sits in one of three evidence categories. They are kept
 apart because they are different promises: a mechanism proven once on hardware
@@ -42,6 +42,11 @@ What changed in each release is in [`CHANGELOG.md`](CHANGELOG.md).
 | CrowdSec AppSec request inspection (10.13) | `test/test-appsec.sh` | `wasp-appsec.sh on` and `test` on a real VM; its memory recorded over a week; the upstream-LAPI key path, which has never run |
 | WASP Hive installer and install.sh's Hive role | `test/test-hive.py`, `test/test-hive-role.sh` | `install-hive.sh` on a real Alpine VM (community packages resolve, `supervise-daemon` restarts, 443 redirect answers); the Hive role on a real Proxmox host; the Wazuh connector against a real manager |
 | `.wpress` archives in the 7.x format | `test/test-wpress-reader.php` (the plugin's 4.5 archiver and a third-party 7.x builder) | A real 7.x export |
+| Imports from two files, a files archive and a separate `.sql.gz` (10.30) | `test/test-import-separate-db.sh` (podman, wp-cli and the database stood in) | A real host's two-file export imported on a field VM, the site coming up with its content |
+| Wordfence, login-hiding plugins and login limiters not imported (10.30) | `test/test-import-separate-db.sh` | An import of a site that ran them: the site and its login working, `active_plugins` without them, Wordfence's tables gone |
+| Findings marked when CISA lists them as exploited in the wild, leading the scan, the daily mail, the weekly report and the Hive (10.29) | `test/test-vuln-scan.sh` (the list stood in), `test/test-hive-report.sh` | The real catalog downloaded on a field VM, and one real finding on it |
+| Opener isolation and hotlink protection (10.29) | `test/test-headers.sh` (WASP's own header file, Apache and the live headers stood in), including the 10.29 upgrade step | The upgrade step on a field VM; a PayPal or Google sign-in popup still working with COOP on; an image on another domain refused with hotlink protection on |
+| A release manifest that covers `hive/`, signed and checked by the release-signing tool (10.29; the tool and its test are kept with the key, not here) | `check-manifest-coverage.py` and the signature job on main here; the tool's own test (real minisign, a throwaway key) where it is kept | The 10.29 release signed with it, CI's signature job green, and `install-hive.sh` accepting it |
 | Security-header exceptions for embeds, with a report-only mode (10.28) | `test/test-embeds.sh` (WASP's own header file, Apache and the live header stood in), `test/test-csp-report.php` | On a field VM whose footer map and reCAPTCHA were fixed by hand: `embeds status` adopts the edit, `embeds report` shows nothing blocked, and `validate-wordpress.sh` passes |
 | Accepting a reviewed file in the malware scan (10.28) | `test/test-malware-accept.sh` (structural and YARA passes) | The first accepted file on a field VM, and the daily mail quiet until it changes |
 | The vulnerability scan using an older answer when WPVulnerability is busy, refreshing at most 15 per run, and saying whether the update on offer fixes a finding (10.28) | `test/test-vuln-scan.sh` | A week of daily scans on a VM with 30+ plugins and no INCOMPLETE mail from a rate limit |
